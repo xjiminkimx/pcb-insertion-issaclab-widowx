@@ -1,0 +1,32 @@
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments / IDE
+.venv/
+venv/
+.env
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Training / logs (regenerate locally)
+logs/
+runs/
+*.pt
+*.pth
+wandb/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Vendored full clone with its own Git history (add as submodule if you need it tracked here)
+trossen_ai_isaac/
