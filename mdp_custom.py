@@ -1,42 +1,16 @@
-"""Custom MDP terms for the WidowX PCB insertion task.
+"""Custom MDP terms for the WidowX PCB on-rail task.
 
-This module contains:
-- observation helpers (e.g., end-effector position),
-- reward helpers (distance/height/regularization),
-- reset helpers (spawn PCB in a stable in-gripper pose),
-- termination helpers (detect dropped PCB),
-- target-slot geometry helpers.
-
-Design note:
-The insertion target is represented as a local offset from the magazine root.
-At runtime we rotate this offset by magazine orientation so the slot target stays
-correct even if the magazine rotates.
+Observation helpers, push/grasp shaping, regularization, rail reset, and drop detection.
 """
 
 import torch
 import isaaclab.utils.math as math_utils
-from isaaclab.envs import ManagerBasedRLEnv
+from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
-
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
 
 # ---------------------------------------------------------
 # 관측 (Observations)
 # ---------------------------------------------------------
-def ee_position_env(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Return selected end-effector body position in env-local coordinates.
-
-    Why env-local:
-    - This subtracts `env_origins` so each parallel environment has a consistent
-      coordinate frame regardless of tiling offset in the world.
-    """
-    asset = env.scene[asset_cfg.name]
-    return asset.data.body_pos_w[:, asset_cfg.body_ids[0]] - env.scene.env_origins
-
-
 def gripper_midpoint_position_env(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
@@ -57,47 +31,107 @@ def gripper_midpoint_position_env(
 # ---------------------------------------------------------
 # 보상 (Rewards - Task)
 # ---------------------------------------------------------
-def object_ee_distance(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, ee_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Distance between PCB center and selected end-effector body."""
-    pcb = env.scene[asset_cfg.name]
-    robot = env.scene[ee_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    ee_pos = robot.data.body_pos_w[:, ee_cfg.body_ids[0]]
-    return torch.norm(pcb_pos - ee_pos, dim=-1)
+def pcb_body_axis_x_world(env: ManagerBasedRLEnv, pcb_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Unit vector of PCB body +X (long edge) in world frame."""
+    pcb = env.scene[pcb_cfg.name]
+    q = pcb.data.root_quat_w
+    local_x = torch.tensor([1.0, 0.0, 0.0], device=env.device, dtype=q.dtype).unsqueeze(0).repeat(q.shape[0], 1)
+    x_w = math_utils.quat_apply(q, local_x)
+    return x_w / torch.norm(x_w, dim=-1, keepdim=True).clamp_min(1e-6)
 
 
-def object_gripper_midpoint_distance(
+def pcb_body_axis_y_world(env: ManagerBasedRLEnv, pcb_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Unit vector of PCB body +Y (short in-plane axis) in world frame."""
+    pcb = env.scene[pcb_cfg.name]
+    q = pcb.data.root_quat_w
+    local_y = torch.tensor([0.0, 1.0, 0.0], device=env.device, dtype=q.dtype).unsqueeze(0).repeat(q.shape[0], 1)
+    y_w = math_utils.quat_apply(q, local_y)
+    return y_w / torch.norm(y_w, dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def pcb_body_axis_z_world(env: ManagerBasedRLEnv, pcb_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Unit vector of PCB body +Z (thickness / face normal) in world frame."""
+    pcb = env.scene[pcb_cfg.name]
+    q = pcb.data.root_quat_w
+    local_z = torch.tensor([0.0, 0.0, 1.0], device=env.device, dtype=q.dtype).unsqueeze(0).repeat(q.shape[0], 1)
+    z_w = math_utils.quat_apply(q, local_z)
+    return z_w / torch.norm(z_w, dim=-1, keepdim=True).clamp_min(1e-6)
+
+
+def gripper_mid_central_face_contact_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    half_extent_x_m: float,
+    half_extent_y_m: float,
+    half_extent_z_m: float,
+    edge_fraction: float = 0.2,
+    surface_band_m: float = 0.022,
+    soft_sharpness: float = 40.0,
+    linear_gate_blend: float = 0.92,
 ) -> torch.Tensor:
-    """Distance from PCB root to the midpoint between fingertip bodies (matches grasp-centric resets)."""
+    """Penalty when the gripper midpoint is near the **top/bottom faces** over the **inner** board area.
+
+    The large faces are normal to body ±Z. Each in-plane axis (X, Y) keeps an ``edge_fraction``
+    strip at both ends (20 % of board length from each end along that axis); the remaining inner
+    rectangle is the “central surface” where contact is discouraged (top/bottom crush onto the
+    board instead of grasping the perimeter / short edge).
+
+    Uses mostly **linear** gates so that dead-center pressing yields ~1.0 (not ~0.5–0.8 from
+    sigmoid products). A small **sigmoid** blend keeps gradients usable just outside the band.
+    """
     pcb = env.scene[pcb_cfg.name]
+    if edge_fraction >= 0.5:
+        return torch.zeros(env.num_envs, device=env.device, dtype=pcb.data.root_pos_w.dtype)
+
     robot = env.scene[left_finger_cfg.name]
     pcb_pos = pcb.data.root_pos_w
     left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
     right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
     mid = 0.5 * (left + right)
-    return torch.norm(pcb_pos - mid, dim=-1)
+
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    d = mid - pcb_pos
+    u = torch.sum(d * x_w, dim=-1)
+    v = torch.sum(d * y_w, dim=-1)
+    w = torch.sum(d * z_w, dim=-1)
+
+    # Inner half-extents: forbidden when |coord| < limit (central 60 % × 60 % for edge_fraction=0.2).
+    u_lim = half_extent_x_m * (1.0 - 2.0 * edge_fraction)
+    v_lim = half_extent_y_m * (1.0 - 2.0 * edge_fraction)
+    eps = 1e-5
+    gu_lin = torch.clamp((u_lim - torch.abs(u)) / (u_lim + eps), 0.0, 1.0)
+    gv_lin = torch.clamp((v_lim - torch.abs(v)) / (v_lim + eps), 0.0, 1.0)
+    gu_soft = torch.sigmoid(soft_sharpness * (u_lim - torch.abs(u)))
+    gv_soft = torch.sigmoid(soft_sharpness * (v_lim - torch.abs(v)))
+    b = linear_gate_blend
+    gu = b * gu_lin + (1.0 - b) * gu_soft
+    gv = b * gv_lin + (1.0 - b) * gv_soft
+
+    # Near top or bottom face: distance of |w| to the outer face offset hz.
+    dist_from_face_plane = torch.abs(torch.abs(w) - half_extent_z_m)
+    gw_lin = torch.clamp((surface_band_m - dist_from_face_plane) / (surface_band_m + eps), 0.0, 1.0)
+    gw_soft = torch.sigmoid(soft_sharpness * (surface_band_m - dist_from_face_plane))
+    gw = b * gw_lin + (1.0 - b) * gw_soft
+
+    return gu * gv * gw
 
 
-def pcb_grasp_deviation(
+def gripper_mid_to_pcb_trailing_edge_distance(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    expected_distance: float | None = None,
-    expected_offset_world: tuple[float, float, float] | None = None,
+    half_length_m: float,
 ) -> torch.Tensor:
-    """Penalize deviation from the nominal grasp pose (PCB center relative to jaw midpoint).
+    """Distance from jaw midpoint to the **push-face center** (robot-side end of the board).
 
-    Prefer ``expected_offset_world``: vector from jaw midpoint to PCB center in **world** frame
-    (e.g. ``(0, PCB_X/2, dz)`` for trailing grasp with a vertical correction ``dz`` when link COMs
-    sit above the real pads).
-
-    If only ``expected_distance`` is set (scalar), falls back to ``|‖pcb−mid‖ − expected_distance|``
-    (1D radius — wrong when a Z correction is needed).
+    The push face is perpendicular to body +X (long axis). Its center lies on the **short edge**
+    (length = cuboid local Y / ``PCB_Y``): the narrow end cap you grasp before sliding toward the
+    magazine. Target: ``pcb_center - half_length * body_x_world``.
     """
     pcb = env.scene[pcb_cfg.name]
     robot = env.scene[left_finger_cfg.name]
@@ -105,19 +139,281 @@ def pcb_grasp_deviation(
     left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
     right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
     mid = 0.5 * (left + right)
-    if expected_offset_world is not None:
-        off = torch.tensor(expected_offset_world, device=env.device, dtype=pcb_pos.dtype).unsqueeze(0).expand_as(pcb_pos)
-        expected_pos = mid + off
-        return torch.norm(pcb_pos - expected_pos, dim=-1)
-    actual = torch.norm(pcb_pos - mid, dim=-1)
-    exp = expected_distance if expected_distance is not None else 0.12
-    return torch.abs(actual - exp)
+    long_axis = pcb_body_axis_x_world(env, pcb_cfg)
+    trailing = pcb_pos - half_length_m * long_axis
+    return torch.norm(mid - trailing, dim=-1)
 
 
-def object_height(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Return PCB height above per-env origin (z-axis)."""
-    pcb = env.scene[asset_cfg.name]
-    return pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+def grasp_short_edge_closure_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    open_width_m: float = 0.044,
+    gate_dist_m: float = 0.07,
+) -> torch.Tensor:
+    """Encourage **closing** the parallel gripper when the EE is near the short-edge / push-face target.
+
+    Returns ``closure * gate`` in ``[0, 1]``: ``closure = 1 - q/open`` (closed=1), ``gate = exp(-d / gate_dist)``
+    from distance ``d`` to the same target as ``gripper_mid_to_pcb_trailing_edge_distance``.
+    """
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    closure = torch.clamp(1.0 - gq / open_width_m, 0.0, 1.0)
+    gate = torch.exp(-dist / gate_dist_m)
+    return closure * gate
+
+
+def gripper_mid_thickness_plane_alignment_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    sigma_m: float = 0.012,
+) -> torch.Tensor:
+    """Shaping: 1 when jaw midpoint lies on the PCB **mid-thickness** plane (ideal top/bottom pinch).
+
+    Parallel jaws should straddle the thin board; ``dot(mid - pcb_center, body+Z)`` should be ~0.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    return torch.exp(-torch.abs(w) / sigma_m)
+
+
+def gripper_open_push_face_rub_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    open_width_m: float = 0.044,
+    plane_band_m: float = 0.032,
+    thickness_band_m: float = 0.004,
+) -> torch.Tensor:
+    """Penalty proxy for **open** gripper hugging the push face at rail height (side rub, no pinch).
+
+    High when: large opening, near the push-face plane in X, and near PCB mid-plane in thickness (Z).
+    """
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w_coord = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    d_plane = torch.abs(torch.sum((mid - pcb_pos) * x_w, dim=-1) + half_length_m)
+    gq = env.scene[gripper_joint_cfg.name].data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
+    rub_plane = torch.exp(-d_plane / plane_band_m)
+    rub_thick = torch.exp(-torch.abs(w_coord) / (thickness_band_m + 1e-6))
+    return open_norm * rub_plane * rub_thick
+
+
+def gripper_mid_thickness_offset_obs(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    scale_m: float = 0.012,
+) -> torch.Tensor:
+    """Obs: signed offset along PCB thickness axis (jaw mid vs board center), scaled to ~[-1, 1]."""
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    return torch.clamp(w / (scale_m + 1e-6), -1.0, 1.0).unsqueeze(-1)
+
+
+def gripper_pinch_orientation_flat_edge_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float = 0.12,
+    min_finger_sep_m: float = 0.006,
+) -> torch.Tensor:
+    """Near the short-edge / push-face target, reward a **rail-parallel pinch** pose (top/bottom grasp).
+
+    Ideal geometry (board flat, long axis ∥ rail / body +X):
+    - **Finger span** ``normalize(right - left)`` ∥ PCB **short edge** (body +Y) so pads straddle the
+      thin board in thickness.
+    - **Opening direction** estimated as ``normalize(cross(body+X, finger_span))`` ∥ body +Z so jaws
+      open along thickness (same as ``pcb_body_axis_z_world``).
+
+    Gated by distance to the push-face center so the whole-arm approach is not over-constrained early.
+    """
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    robot = env.scene[left_finger_cfg.name]
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    v = right - left
+    n = torch.norm(v, dim=-1)
+    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
+    u_lr = v / safe_n
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    open_est = torch.cross(x_w, u_lr, dim=-1)
+    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
+    open_est = open_est / no
+    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
+    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
+    sep_ok = (n > min_finger_sep_m).to(dtype=v.dtype)
+    gate = torch.exp(-dist / gate_dist_m)
+    return align_open * align_finger * sep_ok * gate
+
+
+def gripper_pinch_orientation_cos_obs(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    min_finger_sep_m: float = 0.006,
+) -> torch.Tensor:
+    """Two cosines in [0, 1]: opening∥thickness, finger-span∥short-edge (zeroed if fingers coincide)."""
+    robot = env.scene[left_finger_cfg.name]
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    v = right - left
+    n = torch.norm(v, dim=-1)
+    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
+    u_lr = v / safe_n
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    open_est = torch.cross(x_w, u_lr, dim=-1)
+    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
+    open_est = open_est / no
+    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
+    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
+    m = (n > min_finger_sep_m).to(dtype=v.dtype)
+    return torch.stack([align_open * m, align_finger * m], dim=-1)
+
+
+def gripper_opening_normalized(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    open_width_m: float = 0.044,
+) -> torch.Tensor:
+    """Scalar opening in ``[0, 1]`` (0 = closed, 1 = fully open) for the left carriage joint."""
+    robot = env.scene[asset_cfg.name]
+    q = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
+    return torch.clamp(q / open_width_m, 0.0, 1.0).unsqueeze(-1)
+
+
+def pcb_linear_velocity_along_world_axis(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """Scalar: PCB linear velocity projected onto a **world-frame** push direction (unit vector).
+
+    Use this when the fixture is an ``AssetBaseCfg`` / Xform without ``.data`` (no rigid root state).
+    Set ``axis_world`` to the direction you want the board to move (e.g. ``(0, 1, 0)`` toward +Y).
+    """
+    pcb = env.scene[pcb_cfg.name]
+    v = pcb.data.root_lin_vel_w
+    ax = torch.tensor(axis_world, device=env.device, dtype=v.dtype)
+    ax = ax / torch.norm(ax).clamp_min(1e-9)
+    ax = ax.unsqueeze(0).expand(v.shape[0], -1)
+    return torch.sum(v * ax, dim=-1)
+
+
+def pcb_forward_velocity_along_world_axis(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """Same projection as ``pcb_linear_velocity_along_world_axis``, but **only forward** (relu).
+
+    Backward motion along the push axis contributes **0** instead of a negative reward. That avoids the
+    push term fighting the approach phase and makes small forward slides strictly preferable to
+    standing still when the policy has already reached the trailing edge.
+    """
+    v = pcb_linear_velocity_along_world_axis(env, pcb_cfg, axis_world)
+    return torch.relu(v)
+
+
+def pcb_long_axis_parallel_to_push_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """Shaped in ``[0, 1]``: PCB body +X (long edge) aligned with the insertion direction.
+
+    1.0 when the long axis is parallel to ``axis_world`` (same or opposite direction).
+    """
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    a = torch.tensor(axis_world, device=env.device, dtype=x_w.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    c = torch.abs(torch.sum(x_w * a.unsqueeze(0).expand_as(x_w), dim=-1))
+    return torch.square(torch.clamp(c, max=1.0))
+
+
+def pcb_leading_edge_insertion_proximity_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_xyz_env: tuple[float, float, float],
+    sigma_m: float = 0.12,
+) -> torch.Tensor:
+    """Dense reward: PCB **leading** point near a fixed slot-mouth pose in env-local frame.
+
+    Leading point: ``pcb_center_w + half_length * body+X_world`` (same convention as insertion tasks).
+    ``target_lead_xyz_env`` is the env-local position (relative to ``env_origins``) for that point —
+    typically the **slot entrance center** you measured in Isaac Sim.
+
+    Returns ``exp(-‖lead_env - target‖ / sigma_m)`` (L2 distance, tunable kernel width ``sigma_m``).
+    """
+    pcb = env.scene[pcb_cfg.name]
+    p_w = pcb.data.root_pos_w
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    lead_w = p_w + float(half_length_m) * x_w
+    lead_env = lead_w - env.scene.env_origins[:, :3]
+    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0).expand(
+        env.num_envs, -1
+    )
+    dist = torch.norm(lead_env - tgt, dim=-1)
+    return torch.exp(-dist / (float(sigma_m) + 1e-9))
+
+
+def pcb_horizontal_velocity_perpendicular_to_axis_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
+) -> torch.Tensor:
+    """Squared horizontal speed **orthogonal** to the insertion axis (lateral skidding off-axis)."""
+    pcb = env.scene[pcb_cfg.name]
+    v = pcb.data.root_lin_vel_w.clone()
+    v[:, 2] = 0.0
+    a = torch.tensor(axis_world, device=env.device, dtype=v.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    a3 = a.unsqueeze(0).expand(v.shape[0], -1)
+    v_para = torch.sum(v * a3, dim=-1, keepdim=True) * a3
+    v_perp = v - v_para
+    return torch.sum(torch.square(v_perp), dim=-1)
+
 
 # ---------------------------------------------------------
 # 보상 (Penalties - Regularization)
@@ -131,187 +427,6 @@ def action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     # Penalize abrupt action changes: smoother control -> less jitter at grasp/insert.
     return torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
 
-def joint_vel_l2(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> torch.Tensor:
-    """
-    조인트 속도 패널티: 
-    관절이 너무 빠른 속도로 회전하는 것을 방지하여 에너지를 절약하고 
-    실제 하드웨어(WidowX)의 모터 마모를 줄입니다.
-    """
-    asset = env.scene[asset_cfg.name]  # robot articulation
-    return torch.sum(torch.square(asset.data.joint_vel), dim=1)
-
-def pcb_to_slot_distance(env: ManagerBasedRLEnv, pcb_cfg: SceneEntityCfg, magazine_cfg: SceneEntityCfg) -> torch.Tensor:
-    """Legacy helper: distance from PCB to magazine root + fixed offset.
-
-    Note:
-    - Kept for compatibility/reference.
-    - Prefer `pcb_to_target_slot_distance()` for current training terms.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    magazine = env.scene[magazine_cfg.name]
-    
-    pcb_pos = pcb.data.root_pos_w
-    mag_pos = magazine.data.root_pos_w
-    
-    # ✅ 핵심: 매거진 중심(Root)에서 슬롯 중심까지의 거리를 입력합니다. (단위: 미터)
-    # GUI의 Slot_01 Translate 값이 만약 (X: 0, Y: 0, Z: 5cm) 라면 [0.0, 0.0, 0.05] 로 적습니다.
-    # (GUI 값이 0, 0, 0 이라면 그냥 [0.0, 0.0, 0.0] 으로 두시면 됩니다.)
-    slot_offset = torch.tensor([0.0, 0.0, 0.0], device=env.device)
-    
-    # 환경(64개)의 모든 매거진 좌표에 오프셋을 일괄적으로 더해 최종 목표 좌표를 만듭니다.
-    target_slot_pos = mag_pos + slot_offset
-    
-    return torch.norm(target_slot_pos - pcb_pos, dim=-1)
-
-
-def target_slot_position(
-    env: ManagerBasedRLEnv,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> torch.Tensor:
-    """Compute world-frame slot center from magazine root + local slot offset.
-
-    Args:
-        target_cfg: The target asset (magazine root body).
-        slot_offset: Slot center offset in target asset *local frame* (meters).
-    """
-    target_asset = env.scene[target_cfg.name]  # magazine rigid object
-    target_pos = target_asset.data.root_pos_w
-    target_quat = target_asset.data.root_quat_w
-    offset_local = torch.tensor(slot_offset, device=env.device, dtype=target_pos.dtype).unsqueeze(0).repeat(target_pos.shape[0], 1)
-    return target_pos + math_utils.quat_apply(target_quat, offset_local)
-
-
-def pcb_to_target_slot_distance(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> torch.Tensor:
-    """Distance between PCB center and configured slot center (L2 norm)."""
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    return torch.norm(slot_pos - pcb_pos, dim=-1)
-
-
-def pcb_vertical_gap_to_slot(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> torch.Tensor:
-    """Absolute vertical (world Z) gap between PCB center and slot target.
-
-    Use with a *negative* reward weight so the policy is pushed to match slot height
-    (reduces "hover above magazine" local optima from 3D distance alone).
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    return torch.abs(pcb_pos[:, 2] - slot_pos[:, 2])
-
-
-def pcb_xy_distance_to_slot(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-) -> torch.Tensor:
-    """Horizontal (XY) distance from PCB to slot — encourages plan-view alignment before / during insert."""
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    delta = pcb_pos - slot_pos
-    return torch.norm(delta[:, :2], dim=-1)
-
-
-def _magazine_insertion_axis_w(
-    env: ManagerBasedRLEnv,
-    target_cfg: SceneEntityCfg,
-    insertion_axis_local: tuple[float, float, float],
-) -> torch.Tensor:
-    """World-frame unit vector along insertion direction from magazine orientation."""
-    target_asset = env.scene[target_cfg.name]
-    q = target_asset.data.root_quat_w
-    axis_local = torch.tensor(insertion_axis_local, device=env.device, dtype=q.dtype).unsqueeze(0).repeat(q.shape[0], 1)
-    axis_w = math_utils.quat_apply(q, axis_local)
-    return axis_w / torch.norm(axis_w, dim=-1, keepdim=True).clamp_min(1e-6)
-
-
-def pcb_perpendicular_distance_to_insertion_axis(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    insertion_axis_local: tuple[float, float, float] = (0.0, 1.0, 0.0),
-) -> torch.Tensor:
-    """Lateral error: norm of PCB-to-slot vector projected onto plane perpendicular to insertion axis.
-
-    Use with **negative** reward weight. Minimizing this aligns the PCB with the slot opening when the
-    magazine is tilted or rotated — unlike world-Z or XY-only terms, which assume a vertical slot.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    delta = pcb_pos - slot_pos
-    axis_w = _magazine_insertion_axis_w(env, target_cfg, insertion_axis_local)
-    parallel = torch.sum(delta * axis_w, dim=-1, keepdim=True) * axis_w
-    perp = delta - parallel
-    return torch.norm(perp, dim=-1)
-
-
-def pcb_parallel_distance_along_insertion_axis(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    insertion_axis_local: tuple[float, float, float] = (0.0, 1.0, 0.0),
-) -> torch.Tensor:
-    """Depth along insertion axis: |dot(pcb - slot, axis_w)| — distance to slot center measured along insert direction.
-
-    Use with **negative** weight to reward sliding in along the pocket axis (reduces hovering off-axis).
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    delta = pcb_pos - slot_pos
-    axis_w = _magazine_insertion_axis_w(env, target_cfg, insertion_axis_local)
-    return torch.abs(torch.sum(delta * axis_w, dim=-1))
-
-
-def pcb_insertion_wrong_side_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    insertion_axis_local: tuple[float, float, float] = (1.0, 0.0, 0.0),
-    lateral_scale: float = 8.0,
-) -> torch.Tensor:
-    """Penalize PCB on the *wrong* side of the slot along the insertion axis.
-
-    Convention (matches scene comments in ``widowx_pcb_env_cfg``):
-    - ``insertion_axis_local`` is rotated to world ``axis_w`` = direction the PCB **travels to enter**
-      the magazine (into the slot).
-    - While approaching correctly, ``dot(pcb - slot, axis_w) < 0`` (PCB still "before" the slot).
-    - ``dot(pcb - slot, axis_w) > 0`` can mean past the opening **or** past the slot *center* when
-      fully inserted; we scale by lateral misalignment so on-axis insertion is not over-penalized.
-
-    Returns ``relu(axial) * (1 + lateral_scale * perp)`` with ``perp`` = perpendicular distance to
-    the insertion line — use a **negative** reward weight.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    delta = pcb_pos - slot_pos
-    axis_w = _magazine_insertion_axis_w(env, target_cfg, insertion_axis_local)
-    axial = torch.sum(delta * axis_w, dim=-1)
-    parallel = torch.sum(delta * axis_w, dim=-1, keepdim=True) * axis_w
-    perp = delta - parallel
-    perp_norm = torch.norm(perp, dim=-1)
-    wrong = torch.clamp(axial, min=0.0)
-    return wrong * (1.0 + lateral_scale * perp_norm)
-
 
 def pcb_height_below_reference(
     env: ManagerBasedRLEnv,
@@ -320,14 +435,30 @@ def pcb_height_below_reference(
 ) -> torch.Tensor:
     """Penalty when PCB center is below a reference height (env-local Z).
 
-    Fights dragging the board on the floor / magazine base to minimize 3D distance.
-    Same height convention as ``object_height``: ``pcb_z - env_origin_z``.
+    Fights dragging the board on the floor / rail plane.
+    Uses env-local height: ``pcb_z - env_origin_z``.
 
     Returns ``relu(min_height - pcb_height_env)`` — use a **negative** weight.
     """
     pcb = env.scene[pcb_cfg.name]
     h = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
     return torch.clamp(min_height - h, min=0.0)
+
+
+def pcb_root_height_below_env_minimum(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    min_height_env: float,
+) -> torch.Tensor:
+    """Episode done when PCB root height (env-local Z) is below ``min_height_env``.
+
+    Same convention as ``pcb_height_below_reference`` (``root_pos_w[:,2] - env_origins[:,2]``).
+    Set ``min_height_env`` just below the guide-rail top so resting on the rail is OK, but falling to
+    the table / floor ends the episode.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    h = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    return h < min_height_env
 
 
 def pcb_thickness_axis_tilt_penalty(
@@ -352,220 +483,164 @@ def pcb_thickness_axis_tilt_penalty(
     return 1.0 - torch.clamp(align, max=1.0)
 
 
-def pcb_horizontal_offset_perpendicular_to_insertion(
+def pcb_tilt_beyond_limit(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    insertion_axis_local: tuple[float, float, float] = (1.0, 0.0, 0.0),
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    max_tilt_penalty: float = 0.2,
 ) -> torch.Tensor:
-    """Plan-view lateral error: in-plane distance perpendicular to insertion axis only.
+    """Terminate when the board is too far from flat (same metric as ``pcb_thickness_axis_tilt_penalty``).
 
-    Unlike ``pcb_xy_distance_to_slot``, this does **not** penalize offset *along* the insertion
-    direction in the horizontal plane (e.g. world +Y when ``axis_w`` has no Z). That avoids
-    fighting the depth term while the PCB slides into the slot.
-
-    Projects ``(pcb - slot)`` onto the horizontal plane (Z=0 in world), removes the component
-    along the insertion axis, and returns the norm of the remainder.
+    A tilted / edge-on PCB can keep its **root height** near the rail plane, so height-only
+    terminations never fire; this catches wedged-on-rail and floor-leaning failures.
     """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    delta = pcb_pos - slot_pos
-    delta_h = delta.clone()
-    delta_h[:, 2] = 0.0
-    axis_w = _magazine_insertion_axis_w(env, target_cfg, insertion_axis_local)
-    axis_h = axis_w.clone()
-    axis_h[:, 2] = 0.0
-    axis_h_norm = torch.norm(axis_h, dim=-1, keepdim=True).clamp_min(1e-6)
-    axis_h = axis_h / axis_h_norm
-    parallel_h = torch.sum(delta_h * axis_h, dim=-1, keepdim=True) * axis_h
-    perp_h = delta_h - parallel_h
-    return torch.norm(perp_h, dim=-1)
+    t = pcb_thickness_axis_tilt_penalty(env, pcb_cfg, world_up)
+    return t > max_tilt_penalty
 
 
-def is_success_and_stable(
-    env: "ManagerBasedRLEnv",
+def pcb_long_axis_vertical_component_exceeds(
+    env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    dist_threshold: float = 0.015,  # 1.5cm 이내
-    vel_threshold: float = 0.05,    # 0.05 m/s 이하 (정지 상태)
+    max_abs_z: float = 0.17,
 ) -> torch.Tensor:
+    """True when body +X (long / insertion axis) has too much world-Z component.
+
+    On a flat board in the horizontal plane, ``x_w`` lies in the XY plane. Wedged / slipped boards pick
+    up a significant Z component before thickness-axis tilt alone crosses its limit.
     """
-    Check whether PCB is inserted and stable.
-    
-    Args:
-        env: Isaac Lab 환경 객체
-        pcb_cfg: PCB 자산(Asset) 설정
-        target_cfg: 목표 매거진(Magazine) 자산 설정
-        dist_threshold: 삽입 성공으로 간주할 최대 거리 (미터 단위)
-        vel_threshold: 정지 상태로 간주할 최대 선속도 (m/s)
-        
-    Returns:
-        torch.Tensor: 각 환경별 성공 여부 (Boolean Tensor)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    return torch.abs(x_w[:, 2]) > max_abs_z
+
+
+# Counts consecutive env steps with near-zero arm joint velocity (one buffer per training process).
+_ARM_VEL_IDLE_COUNT: torch.Tensor | None = None
+
+
+def arm_joints_velocity_idle_termination(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    max_abs_vel_rad_s: float = 0.03,
+    min_idle_steps: int = 100,
+) -> torch.Tensor:
+    """Terminate when monitored joints stay essentially still for ``min_idle_steps`` control steps.
+
+    Uses ``episode_length_buf == 1`` to reset the counter at each new episode, and resets whenever
+    ``max |qdot|`` exceeds ``max_abs_vel_rad_s``. Restrict ``asset_cfg`` to **arm joints only** so a
+    closing gripper alone does not count as "moving the arm" if you want pure arm-idle detection.
+
+    Note:
+        If you add a **success** state where the policy legitimately holds still, increase
+        ``min_idle_steps`` or disable this term for those envs.
     """
-    # 1) Read current PCB state.
-    pcb_asset = env.scene[pcb_cfg.name]
-    # PCB의 월드 좌표와 속도
-    pcb_pos = pcb_asset.data.root_pos_w  # [num_envs, 3]
-    pcb_vel = pcb_asset.data.root_lin_vel_w  # [num_envs, 3]
+    global _ARM_VEL_IDLE_COUNT
+    robot = env.scene[asset_cfg.name]
+    if asset_cfg.joint_ids is None:
+        j_vel = robot.data.joint_vel
+    else:
+        j_vel = robot.data.joint_vel[:, asset_cfg.joint_ids]
+    max_v = torch.max(torch.abs(j_vel), dim=1).values
+    moving = max_v > max_abs_vel_rad_s
+    first_step = env.episode_length_buf == 1
+    if (
+        _ARM_VEL_IDLE_COUNT is None
+        or _ARM_VEL_IDLE_COUNT.shape[0] != env.num_envs
+        or _ARM_VEL_IDLE_COUNT.device != env.device
+    ):
+        _ARM_VEL_IDLE_COUNT = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    _ARM_VEL_IDLE_COUNT = torch.where(
+        first_step | moving,
+        torch.zeros_like(_ARM_VEL_IDLE_COUNT),
+        _ARM_VEL_IDLE_COUNT + 1,
+    )
+    return _ARM_VEL_IDLE_COUNT >= min_idle_steps
 
-    # 매거진 슬롯의 월드 좌표 (Target)
-    target_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
 
-    # 2) Compute insertion distance to designated slot center.
-    distance = torch.norm(pcb_pos - target_pos, dim=-1)
+def reset_robot_joints_to_values(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    joint_positions: dict[str, float],
+    velocity_scale: float = 0.0,
+    use_current_joint_pos: bool = False,
+) -> None:
+    """Set listed articulation joints to fixed positions.
 
-    # 3) Compute translational speed magnitude.
-    velocity_mag = torch.norm(pcb_vel, dim=-1)
+    If ``use_current_joint_pos`` is False, other joints keep scene defaults. If True, starts from
+    current sim joint positions (for tightening gripper after snap without moving the arm).
+    """
+    robot = env.scene[asset_cfg.name]
+    if use_current_joint_pos:
+        joint_pos = robot.data.joint_pos[env_ids].clone()
+    else:
+        joint_pos = robot.data.default_joint_pos[env_ids].clone()
+    joint_vel = robot.data.default_joint_vel[env_ids].clone() * velocity_scale
+    name_to_idx = {n: i for i, n in enumerate(robot.joint_names)}
+    for name, val in joint_positions.items():
+        joint_pos[:, name_to_idx[name]] = val
+    lim = robot.data.soft_joint_pos_limits[env_ids]
+    joint_pos = joint_pos.clamp(lim[..., 0], lim[..., 1])
+    vlim = robot.data.soft_joint_vel_limits[env_ids]
+    joint_vel = joint_vel.clamp(-vlim, vlim)
+    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+    # Refresh link poses so a following reset term reads current FK (same reset cycle, no physics step yet).
+    robot.update(0.0)
 
-    # 4) Success requires both near-slot and low-speed conditions.
-    is_near = distance < dist_threshold
-    is_static = velocity_mag < vel_threshold
 
-    # 두 조건이 모두 만족될 때 True 반환
-    return is_near & is_static
-
-
-def reset_pcb_in_gripper(
-    env: "ManagerBasedRLEnv",
+def snap_pcb_root_to_short_edge_grasp(
+    env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
     pcb_cfg: SceneEntityCfg,
-    ee_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    pos_offset: tuple[float, float, float] = (0.0, 0.0, 0.01),
-    edge_to_center_offset: float = 0.0,
-    edge_sign: float = 1.0,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    rot_wxyz: tuple[float, float, float, float],
     velocity_scale: float = 0.0,
-    # --- Fixed-orientation mode (recommended for on-rail grasps) ---
-    # When set, the PCB is always spawned with this exact world-frame quaternion (w,x,y,z).
-    # The gripper closing axis is then IGNORED for orientation; only EE XY is used for position.
-    # PCB local +X = long edge (PCB_X), local +Z = thickness.
-    # For a flat board with long axis along world +Y: (0.7071068, 0, 0, 0.7071068).
-    fixed_world_quat_wxyz: tuple[float, float, float, float] | None = None,
-    # World Z of PCB *center* to snap to after XY placement (= rail_top + PCB_Z/2).
-    # Prevents the board from floating or burying because the EE is at a wrong height.
-    snap_center_z: float | None = None,
-    # Added in world frame after XY/long-axis placement (and after optional snap_center_z on Z).
-    # Finger-link origins in USD are often above the real jaw pads → use negative Z to drop the PCB onto the pads.
-    world_position_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    # --- Legacy / insertion-axis alignment (only used when fixed_world_quat_wxyz is None) ---
-    insertion_axis_local: tuple[float, float, float] = (1.0, 0.0, 0.0),
-    insertion_target_cfg: SceneEntityCfg | None = None,
+    center_offset_body_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    min_center_z_env_local: float | None = None,
 ) -> None:
-    """Reset PCB to a pose at the gripper with configurable orientation.
+    """Place PCB root so the push-face center matches the jaw midpoint (kinematic grasp contact).
 
-    **Recommended path (fixed-orientation)**:
-    Pass ``fixed_world_quat_wxyz`` (e.g. flat board, long axis along insertion) and
-    ``snap_center_z`` (= rail top + PCB_Z/2).  The board will always be flat and at the
-    correct height; only the gripper XY is used to place the leading edge.
+    Uses the same geometry as ``gripper_mid_to_pcb_trailing_edge_distance``: trailing center is
+    ``pcb_center - half_length * body+X``. Solving ``trailing = jaw_mid`` gives
+    ``pcb_center = jaw_mid + half_length * body+X_world``.
 
-    **Legacy path** (``fixed_world_quat_wxyz is None``):
-    Derives PCB orientation from the gripper closing axis.  The result depends on
-    arm joint angles — if the gripper axis is not world +Z the board stands on its edge.
+    ``center_offset_body_m`` nudges the root in **PCB body** axes (tune if the USD finger origins
+    sit on carriage housing so the analytic mid misses the actual pad gap).
+
+    Vertical alignment: PCB center Z is set to the jaw midpoint Z (top/bottom pinch). If
+    ``min_center_z_env_local`` is set, Z is floored to ``env_origin_z + min`` so the board is not
+    spawned below the analytic rail plane when the arm pose is too low.
     """
     pcb = env.scene[pcb_cfg.name]
-    robot = env.scene[ee_cfg.name]
-
-    ee_pos = robot.data.body_pos_w[env_ids, ee_cfg.body_ids[0]]
-    ee_quat = robot.data.body_quat_w[env_ids, ee_cfg.body_ids[0]]
-
-    if fixed_world_quat_wxyz is not None:
-        # ---- Fixed-orientation path ----------------------------------------
-        # Orientation is fully specified; only EE XY position feeds placement.
-        N = len(env_ids)
-        q = torch.tensor(fixed_world_quat_wxyz, device=env.device, dtype=ee_pos.dtype)
-        target_quat = q.unsqueeze(0).expand(N, -1)
-
-        # Use gripper midpoint if fingers provided (better XY accuracy), else EE link.
-        if left_finger_cfg is not None and right_finger_cfg is not None:
-            left_pos = robot.data.body_pos_w[env_ids, left_finger_cfg.body_ids[0]]
-            right_pos = robot.data.body_pos_w[env_ids, right_finger_cfg.body_ids[0]]
-            ee_pos = 0.5 * (left_pos + right_pos)
-
-        # PCB long axis in world = local +X rotated by fixed_world_quat_wxyz.
-        local_x = torch.tensor([1.0, 0.0, 0.0], device=env.device, dtype=ee_pos.dtype)
-        local_x = local_x.unsqueeze(0).expand(N, -1)
-        pcb_long_axis_w = math_utils.quat_apply(target_quat, local_x)
-        pcb_long_axis_w = pcb_long_axis_w / torch.norm(pcb_long_axis_w, dim=-1, keepdim=True).clamp_min(1e-6)
-
-        # Leading edge at EE, shift center back along the long axis.
-        target_pos = ee_pos.clone()
-        if edge_to_center_offset != 0.0:
-            target_pos = target_pos - edge_sign * edge_to_center_offset * pcb_long_axis_w
-
-        # Snap PCB center to exact rail height if provided.
-        if snap_center_z is not None:
-            target_pos = target_pos.clone()
-            target_pos[:, 2] = snap_center_z
-
-        ox, oy, oz = world_position_offset
-        if abs(ox) + abs(oy) + abs(oz) > 1e-9:
-            woff = torch.tensor(world_position_offset, device=env.device, dtype=target_pos.dtype).unsqueeze(0).expand(N, -1)
-            target_pos = target_pos + woff
-
-    else:
-        # ---- Legacy / grip-axis path ----------------------------------------
-        grip_axis_w = None
-        pcb_long_axis_w = None
-
-        if left_finger_cfg is not None and right_finger_cfg is not None:
-            left_pos = robot.data.body_pos_w[env_ids, left_finger_cfg.body_ids[0]]
-            right_pos = robot.data.body_pos_w[env_ids, right_finger_cfg.body_ids[0]]
-            ee_pos = 0.5 * (left_pos + right_pos)
-            grip_axis_w = right_pos - left_pos
-            grip_axis_w = grip_axis_w / torch.norm(grip_axis_w, dim=-1, keepdim=True).clamp_min(1e-6)
-
-            ee_forward_w = math_utils.quat_apply(
-                ee_quat,
-                torch.tensor([0.0, 0.0, 1.0], device=env.device, dtype=ee_pos.dtype).unsqueeze(0).repeat(len(env_ids), 1),
-            )
-            pcb_long_axis_w = ee_forward_w - torch.sum(ee_forward_w * grip_axis_w, dim=-1, keepdim=True) * grip_axis_w
-            fallback = math_utils.quat_apply(
-                ee_quat,
-                torch.tensor([1.0, 0.0, 0.0], device=env.device, dtype=ee_pos.dtype).unsqueeze(0).repeat(len(env_ids), 1),
-            )
-            fallback = fallback - torch.sum(fallback * grip_axis_w, dim=-1, keepdim=True) * grip_axis_w
-            use_fallback = torch.norm(pcb_long_axis_w, dim=-1, keepdim=True) < 1e-6
-            pcb_long_axis_w = torch.where(use_fallback, fallback, pcb_long_axis_w)
-            pcb_long_axis_w = pcb_long_axis_w / torch.norm(pcb_long_axis_w, dim=-1, keepdim=True).clamp_min(1e-6)
-
-            if insertion_target_cfg is not None:
-                insert_axis_w = _magazine_insertion_axis_w(env, insertion_target_cfg, insertion_axis_local)[env_ids]
-                projected = insert_axis_w - torch.sum(insert_axis_w * grip_axis_w, dim=-1, keepdim=True) * grip_axis_w
-                proj_len = torch.norm(projected, dim=-1, keepdim=True)
-                projected = projected / proj_len.clamp_min(1e-6)
-                pcb_long_axis_w = torch.where(proj_len < 1e-5, pcb_long_axis_w, projected)
-
-        offset = torch.tensor(pos_offset, device=env.device, dtype=ee_pos.dtype).unsqueeze(0).repeat(len(env_ids), 1)
-        target_pos = ee_pos + math_utils.quat_apply(ee_quat, offset)
-        if pcb_long_axis_w is not None and edge_to_center_offset != 0.0:
-            target_pos = target_pos - edge_sign * edge_to_center_offset * pcb_long_axis_w
-
-        if snap_center_z is not None:
-            target_pos = target_pos.clone()
-            target_pos[:, 2] = snap_center_z
-
-        if grip_axis_w is not None and pcb_long_axis_w is not None:
-            pcb_width_axis_w = torch.linalg.cross(grip_axis_w, pcb_long_axis_w)
-            pcb_width_axis_w = pcb_width_axis_w / torch.norm(pcb_width_axis_w, dim=-1, keepdim=True).clamp_min(1e-6)
-            rot_mats = torch.stack([pcb_long_axis_w, pcb_width_axis_w, grip_axis_w], dim=-1)
-            target_quat = math_utils.quat_from_matrix(rot_mats)
-        else:
-            target_quat = ee_quat
+    robot = env.scene[left_finger_cfg.name]
+    robot.update(0.0)
+    left = robot.data.body_pos_w[env_ids][:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[env_ids][:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    n = len(env_ids)
+    dtype = mid.dtype
+    device = env.device
+    q = torch.tensor(rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    local_x = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    x_w = math_utils.quat_apply(q, local_x)
+    ob = torch.tensor(center_offset_body_m, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    off_w = math_utils.quat_apply(q, ob)
+    center_w = mid + float(half_length_m) * x_w + off_w
+    center_w[:, 2] = mid[:, 2]
+    if min_center_z_env_local is not None:
+        min_cz = env.scene.env_origins[env_ids, 2] + float(min_center_z_env_local)
+        center_w[:, 2] = torch.maximum(center_w[:, 2], min_cz)
+    root_pose = torch.cat([center_w, q], dim=-1)
 
     default_root_state = pcb.data.default_root_state[env_ids].clone()
-    root_pose = torch.cat([target_pos, target_quat], dim=-1)
     root_vel = default_root_state[:, 7:13] * velocity_scale
-
     pcb.write_root_pose_to_sim(root_pose, env_ids=env_ids)
     pcb.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+    pcb.update(0.0)
 
 
 def reset_pcb_on_guide_rails(
-    env: "ManagerBasedRLEnv",
+    env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,
     pcb_cfg: SceneEntityCfg,
     pos_env_local: tuple[float, float, float],
@@ -593,7 +668,7 @@ def reset_pcb_on_guide_rails(
 
 
 def pcb_dropped_from_gripper(
-    env: "ManagerBasedRLEnv",
+    env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
@@ -635,38 +710,3 @@ def pcb_dropped_from_gripper(
         geom_error = torch.abs(dist_to_gripper - expected_center_distance)
         is_far = geom_error > distance_tolerance
     return is_far | is_low
-
-
-def no_progress_termination(
-    env: "ManagerBasedRLEnv",
-    pcb_cfg: SceneEntityCfg,
-    ee_cfg: SceneEntityCfg,
-    target_cfg: SceneEntityCfg,
-    slot_offset: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    min_target_distance: float = 0.08,
-    ee_speed_threshold: float = 0.01,
-    pcb_speed_threshold: float = 0.01,
-    min_episode_steps: int = 60,
-) -> torch.Tensor:
-    """Terminate episodes that are effectively dead/stuck.
-
-    Condition (all must hold simultaneously):
-    - at least ``min_episode_steps`` have elapsed since reset — prevents firing at t=0
-      when the robot and PCB are both stationary immediately after initialization;
-    - still far from target slot; and
-    - both EE and PCB speeds are near zero.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    robot = env.scene[ee_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    slot_pos = target_slot_position(env, target_cfg=target_cfg, slot_offset=slot_offset)
-    dist_to_target = torch.norm(pcb_pos - slot_pos, dim=-1)
-
-    ee_vel = robot.data.body_lin_vel_w[:, ee_cfg.body_ids[0]]
-    ee_speed = torch.norm(ee_vel, dim=-1)
-    pcb_speed = torch.norm(pcb.data.root_lin_vel_w, dim=-1)
-
-    # episode_length_buf counts policy steps since last reset (incremented before termination check).
-    past_warmup = env.episode_length_buf >= min_episode_steps
-
-    return past_warmup & (dist_to_target > min_target_distance) & (ee_speed < ee_speed_threshold) & (pcb_speed < pcb_speed_threshold)
