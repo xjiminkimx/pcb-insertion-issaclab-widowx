@@ -1,0 +1,10 @@
+# Reference paths for archived Viola URDF → USD conversion (re-run when the URDF or meshes change).
+# From the Isaac Lab repo root, with an activated Isaac / Isaac Lab environment:
+#   ./isaaclab.sh -p scripts/tools/convert_urdf.py \
+#     source/isaaclab_tasks/isaaclab_tasks/manager_based/widowx_pcb/starai_viola/urdf/viola_isaac.urdf \
+#     source/isaaclab_tasks/isaaclab_tasks/manager_based/widowx_pcb/usd_model/usd_robot/viola/viola_isaac.usd \
+#     --headless --fix-base
+#
+# Place all STL files next to the URDF (see viola_isaac.urdf: ../meshes/*.STL) before converting.
+asset_path: /home/jimin/Documents/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/widowx_pcb/starai_viola/urdf/viola_isaac.urdf
+usd_dir: /home/jimin/Documents/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/widowx_pcb/usd_model/usd_robot/viola

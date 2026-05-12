@@ -1,8 +1,14 @@
-# WidowX PCB on-rail task (Isaac Lab)
+# PCB on-rail task — WidowX (Isaac Lab)
 
-This package is an **Isaac Lab** manager-based RL task: a **WidowX** arm interacts with a **PCB** on a **magazine + guide rail** assembly (single aligned USD). **Target-slot distance rewards and slot observations have been removed** so you can add forward-push / rail objectives separately. Training uses **rl-games** (PPO).
+This package is an **Isaac Lab** manager-based RL task: a robot arm interacts with a **PCB** on a **magazine + guide rail** assembly (single aligned USD). **Target-slot distance rewards and slot observations have been removed** so you can add forward-push / rail objectives separately. Training uses **rl-games** (PPO).
 
-**Task ID:** `Isaac-WidowX-PCB-v0`
+One simulation variant is registered:
+
+| Robot | Task ID | Env config |
+|--------|---------|------------|
+| **WidowX** (Trossen `usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-v0` | `widowx_pcb_env_cfg.py` → `WidowXPcbEnvCfg` |
+
+Robot runtime assets now live under `usd_model/usd_robot/`, and environment fixtures plus conversion sources live under `usd_model/usd_env/`.
 
 **High-level episode flow:**
 
@@ -16,11 +22,12 @@ This package is an **Isaac Lab** manager-based RL task: a **WidowX** arm interac
 
 | Path | Role |
 |------|------|
-| `__init__.py` | Registers `Isaac-WidowX-PCB-v0` and applies rl-games log-std safety patch. |
-| `widowx_pcb_env_cfg.py` | Scene, actions, observations, rewards, events, terminations, magazine/rail geometry. |
-| `mdp_custom.py` | Custom MDP terms (regularization, rail reset, drop detection; optional in-gripper reset). |
-| `agents/` | PPO config (`rl_games_ppo_cfg.py`), log-std safety helper, TensorBoard monitor script. |
-| `jetcobot_assets/` | URDF/USD/meshes used by the task (robot-related assets). |
+| `__init__.py` | Registers `Isaac-WidowX-PCB-v0` and applies the rl-games log-std safety patch. |
+| `widowx_pcb_env_cfg.py` | WidowX scene, actions, observations, rewards, events, terminations, magazine/rail geometry. |
+| `usd_model/` | Unified asset root: `usd_env/` contains fixture USDs and conversion sources, and `usd_robot/` contains robot USD bundles. |
+| `mdp_custom.py` | Custom MDP terms (regularization, rail reset, drop detection). |
+| `agents/` | PPO config (`WidowXPcbPPOCfg` in `rl_games_ppo_cfg.py`), log-std safety helper, TensorBoard monitor script. |
+| `jetcobot_assets/` | URDF/USD/meshes (legacy / alternate robot assets). |
 
 A local `trossen_ai_isaac/` directory (if present) is intentionally **not** tracked: it is a separate clone with its own `.git`. Track it as a **submodule** or symlink if your workflow depends on it.
 
@@ -51,19 +58,26 @@ Both branches are created from the same initial commit when the repository is fi
 
 Commands below assume you run training from the **Isaac Lab repository root** (the directory that contains `scripts/`).
 
----
-
 ## Train (rl-games PPO)
+
+**WidowX:**
 
 ```bash
 conda activate isaac-sim   # or your env name
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless
+cd /path/to/IsaacLab   # repository root (contains scripts/)
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0
 ```
 
-Variants:
+If Isaac Sim startup is unstable on newer GPUs or drivers, prefer **headless** mode with safer renderer flags:
 
 ```bash
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless --rendering_mode performance \
+  --kit_args "--/renderer/multiGpu/enabled=false --/renderer/multiGpu/autoEnable=false --/rtx/raytracing/cached/enabled=false"
+```
+
+Variant:
+
+```bash
 python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --video
 ```
 
@@ -85,7 +99,7 @@ Open <http://127.0.0.1:6006> and watch policy/value loss, entropy, KL, and episo
 
 ### Fixture pose vs USD
 
-Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with your imported **magazine + rail** asset in world frame. Analytic `_GUIDE_RAIL_*` may not match `usd_model/magazine.usd` collision—if the **green PCB clips into white rails**, raise **`_PCB_SPAWN_Z_BIAS`** (and optionally `collision_props.contact_offset` / `rest_offset` on PCB + magazine) until the board sits on the rail tops in the contact view.
+Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with your imported **magazine + rail** asset in world frame. Analytic `_GUIDE_RAIL_*` may not match `usd_model/usd_env/magazine.usd` collision—if the **green PCB clips into white rails**, raise **`_PCB_SPAWN_Z_BIAS`** (and optionally `collision_props.contact_offset` / `rest_offset` on PCB + magazine) until the board sits on the rail tops in the contact view.
 
 ### Physics and collision
 
@@ -93,15 +107,15 @@ If the PCB intersects the fixture: tune CCD and contact offsets in the env confi
 
 ### Reset pose and drop termination
 
-Tune **`pcb_tilt_excessive`**, **`pcb_long_axis_not_horizontal`**, **`pcb_off_rail_xy`**, **`pcb_fallen_below_rail`**, **`pcb_dropped`**, and **`arm_idle`** (`_ARM_IDLE_MIN_STEPS`, `_ARM_IDLE_MAX_ABS_VEL_RAD_S`) if episodes reset too aggressively—or not enough when the PCB slips / the policy freezes.
+Tune **`pcb_tilt_excessive`**, **`pcb_long_axis_not_horizontal`**, **`pcb_fallen_below_rail`**, **`pcb_dropped`**, and **`arm_idle`** (`_ARM_IDLE_MIN_STEPS`, `_ARM_IDLE_MAX_ABS_VEL_RAD_S`) if episodes reset too aggressively—or not enough when the PCB slips / the policy freezes.
 
-### Adding forward-push rewards
+### Grippers and observations
 
-`RewardsCfg` includes approach to the **push-face / short-edge** center, **`grasp_short_edge`**, **forward-only** slide, **`no_central_top_bottom_face`** (penalty for tool midpoint near top/bottom over the inner ~60 %×60 % of the face, leaving a 20 % edge band per side), and regularizers. Observations include **`gripper_opening`**, **`ee_thickness_offset`**, and **`pinch_orientation_cos`** (|cos| for opening∥thickness and finger-line∥short edge). Rewards add **`pinch_thickness_align`**, **`pinch_orientation_flat_edge`** (gated near 단변), and **`no_open_side_rub`**. If the fingertip geometry in your USD differs, tune ``gripper_left``/``right`` or the cross-product convention in ``mdp_custom.gripper_pinch_orientation_flat_edge_reward``.
+- **WidowX:** fingertip bodies `gripper_left` / `gripper_right`, drive joint `left_carriage_joint`.
 
 ### If mean reward plateaus (policy idles near the edge)
 
-1. In `RewardsCfg`, balance **`approach_trailing_edge`** vs **`push_velocity`** vs **`action_rate_penalty`** (defaults are tuned so slide reward can compete with a small residual distance).
+1. In `RewardsCfg`, balance insertion / push terms vs **`action_rate_penalty`**.
 2. In PPO (`agents/rl_games_ppo_cfg.py`), raise **entropy** slightly or decay it more slowly if the policy collapses early.
 3. Log **per-term rewards** in TensorBoard if available, to see which term is flat.
 
@@ -109,13 +123,20 @@ Tune **`pcb_tilt_excessive`**, **`pcb_long_axis_not_horizontal`**, **`pcb_off_ra
 
 ## Troubleshooting
 
-- **Body name errors:** Match `SceneEntityCfg("robot", body_names=...)` to link names in your loaded robot USD (e.g. `link_6`, `gripper_left`, `gripper_right`).
+- **GPU / RTX Blackwell (RTX 5080, 5090, 5060 Ti, …) — segfault at startup (`librtx.scenedb.plugin`, `libcarb.scenerenderer-rtx`, ~2–4 s):** This is usually **Kit + Vulkan + RTX** on a **driver or GPU generation** combination Isaac Sim was not validated against yet — not a broken CUDA install if `nvidia-smi` works.
+  1. Train **headless** and use the direct `train.py` command with the `--kit_args` line in the Train section above.
+  2. Install the **NVIDIA driver branch** listed for your **Isaac Sim version** in NVIDIA’s release notes / download page. Community reports often show **580.x** working when **595+** crashes on Blackwell; pick the validated branch before chasing application bugs.
+  3. Avoid the **GUI** path while debugging (`./isaac-sim.sh` without headless); it pulls a heavier RTX path.
+  4. If it still crashes, try **Isaac Sim / Isaac Lab updates** (patch releases often add Blackwell fixes) or ask on [NVIDIA Isaac Sim forums](https://forums.developer.nvidia.com/c/omniverse/simulation/69) with your **Kit log**, **driver version**, and **GPU model**.
+
+- **Body name errors:** Match `SceneEntityCfg("robot", body_names=...)` to link names in your robot asset — **WidowX:** `gripper_left`, `gripper_right`.
 - **Penetration at reset:** Slightly increase vertical `pos_offset`, soften edge offsets, or check gripper initial opening.
+
 ---
 
 ## Quick workflow
 
-1. Match `_MAG_*` / `_PCB_INIT_*` to your combined USD.
+1. Match `_MAG_*` / `_PCB_INIT_*` to your combined USD (in the env cfg for the task you train).
 2. Add rail-forward rewards and success criteria as needed.
-3. Train and monitor TensorBoard.
+3. Train `Isaac-WidowX-PCB-v0` and monitor TensorBoard.
 4. Tune reset and termination thresholds if needed.

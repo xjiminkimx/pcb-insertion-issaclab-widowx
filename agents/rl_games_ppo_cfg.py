@@ -88,7 +88,7 @@ WidowXPcbPPOCfg = {
             "e_clip": 0.2,
             "horizon_length": 16,
             # Rollout size = 2048 * 16 = 32768; 4096 divides evenly (8 minibatches × mini_epochs).
-            "minibatch_size": 1024,
+            "minibatch_size": 2048,
             "mini_epochs": 8,
             "critic_coef": 2,
             "clip_value": True,
