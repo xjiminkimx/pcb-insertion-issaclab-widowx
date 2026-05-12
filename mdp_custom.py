@@ -315,11 +315,44 @@ def gripper_opening_normalized(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     open_width_m: float = 0.044,
+    gripper_joint_sign: float = 1.0,
 ) -> torch.Tensor:
-    """Scalar opening in ``[0, 1]`` (0 = closed, 1 = fully open) for the left carriage joint."""
+    """Scalar opening in ``[0, 1]`` (0 = closed, 1 = fully open) for the gripper drive joint.
+
+    Use ``gripper_joint_sign=-1`` when larger joint values mean *more closed* (e.g. Viola ``joint7_left``
+    open toward negative limits).
+    """
     robot = env.scene[asset_cfg.name]
     q = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    return torch.clamp(q / open_width_m, 0.0, 1.0).unsqueeze(-1)
+    eff = gripper_joint_sign * q
+    return torch.clamp(eff / open_width_m, 0.0, 1.0).unsqueeze(-1)
+
+
+def gripper_closure_early_episode_shaping(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    open_width_m: float = 0.044,
+    max_episode_length_steps: int = 120,
+    min_gate: float = 0.0,
+    gripper_joint_sign: float = 1.0,
+) -> torch.Tensor:
+    """Keep the gripper **closed** (or near the reset opening) at the **start** of the episode.
+
+    This task often resets with the PCB already pinched on the short edge. Nothing in insertion /
+    push reward explicitly discourages the first action from **opening** the tool and dropping the
+    board. Returns ``closure * gate`` with ``closure = 1 - (sign * q)/open_max`` and ``gate`` linearly
+    decaying from 1 to ``min_gate`` over the first ``max_episode_length_steps`` **env** (control)
+    steps so the policy can re-open later for re-grasps if needed.
+    """
+    robot = env.scene[asset_cfg.name]
+    q = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
+    eff = gripper_joint_sign * q
+    closure = torch.clamp(1.0 - eff / open_width_m, 0.0, 1.0)
+    t = env.episode_length_buf.to(dtype=closure.dtype)
+    m = float(max(1, max_episode_length_steps))
+    progress = torch.clamp(t / m, 0.0, 1.0)
+    gate = 1.0 - (1.0 - min_gate) * progress
+    return closure * gate
 
 
 def pcb_linear_velocity_along_world_axis(
@@ -353,6 +386,28 @@ def pcb_forward_velocity_along_world_axis(
     """
     v = pcb_linear_velocity_along_world_axis(env, pcb_cfg, axis_world)
     return torch.relu(v)
+
+
+def pcb_lin_vel_y_toward_lead_target_y(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_y_env: float,
+) -> torch.Tensor:
+    """``relu((y_target - lead_y) * v_y)`` with lead = root + half_length * body +X in env frame.
+
+    Rewards world-Y linear velocity only when it **reduces** the Y gap to the slot (push into +Y if
+    the mouth is still ahead, or -Y if the board has overshot). Complements a flat ``relu(v_y)`` term
+    by not paying for +Y motion after the lead has passed the target Y.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    p_w = pcb.data.root_pos_w
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    lead_w = p_w + float(half_length_m) * x_w
+    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
+    err_y = float(target_lead_y_env) - lead_y
+    v_y = pcb.data.root_lin_vel_w[:, 1]
+    return torch.relu(err_y * v_y)
 
 
 def pcb_long_axis_parallel_to_push_reward(

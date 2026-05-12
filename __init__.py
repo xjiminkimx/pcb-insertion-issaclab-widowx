@@ -11,7 +11,6 @@ gym.register(
     entry_point="isaaclab.envs:ManagerBasedRLEnv",
     kwargs={
         "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbEnvCfg,
-        # ⚠️ 수정 포인트: .py를 제거하고, 콜론(:) 뒤에 실제 클래스 이름을 적습니다.
         "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbPPOCfg",
     },
 )
