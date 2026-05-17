@@ -65,7 +65,7 @@ Commands below assume you run training from the **Isaac Lab repository root** (t
 ```bash
 conda activate isaac-sim   # or your env name
 cd /path/to/IsaacLab   # repository root (contains scripts/)
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless --num_envs 4096
 ```
 
 If Isaac Sim startup is unstable on newer GPUs or drivers, prefer **headless** mode with safer renderer flags:
@@ -83,7 +83,48 @@ python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-
 
 ---
 
-## Monitor training (TensorBoard)
+## Evaluate / play a trained policy
+
+Checkpoints are saved to `logs/rl_games/WidowX_PCB_RL/widowx_pcb/nn/` during training.
+
+### Load the best checkpoint automatically
+
+```bash
+cd /path/to/IsaacLab
+python scripts/reinforcement_learning/rl_games/play.py \
+    --task Isaac-WidowX-PCB-v0 \
+    --num_envs 16
+```
+
+The script finds `WidowX_PCB_RL.pth` (the best saved model) automatically from the log directory.
+Use `--use_last_checkpoint` to load the most-recent epoch checkpoint instead.
+Use `--real-time` to throttle stepping to wall-clock speed.
+
+### Load a specific checkpoint
+
+```bash
+python scripts/reinforcement_learning/rl_games/play.py \
+    --task Isaac-WidowX-PCB-v0 \
+    --num_envs 16 \
+    --checkpoint logs/rl_games/WidowX_PCB_RL/widowx_pcb/nn/last_WidowX_PCB_RL_ep_75_rew_0.51598245.pth
+```
+
+### Record a video of the rollout
+
+```bash
+python scripts/reinforcement_learning/rl_games/play.py \
+    --task Isaac-WidowX-PCB-v0 \
+    --num_envs 4 \
+    --video \
+    --video_length 500
+```
+
+Video is saved to `logs/rl_games/WidowX_PCB_RL/widowx_pcb/videos/play/`.
+Add `--headless` to render off-screen without the Isaac Sim GUI window.
+
+---
+
+
 
 From the Isaac Lab repo (adjust path if your checkout differs):
 

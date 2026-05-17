@@ -369,8 +369,8 @@ STATIC_LINKS = {
     "part_1_11",
 }
 
-# Links that use the magazine material (light blue plastic)
-MAGAZINE_LINKS = {"magazine", "part_1"}
+# Magazine body only; every other static link uses RailMaterial (identical guide-rail look).
+MAGAZINE_LINKS = {"magazine"}
 
 # Collision approximation per group
 APPROX_MAP = {
@@ -480,9 +480,10 @@ def create_pcb_insertion_env_usd(urdf_path: str, meshes_dir: str, output_path: s
     mag_mat = MATERIAL_TEMPLATE.format(
         name="MagazineMaterial", root=root_path,
         r=0.615686, g=0.811765, b=0.929412, roughness=0.55, metallic=0.05)
+    # One shared rail look for every guide-rail mesh (matte hard plastic).
     rail_mat = MATERIAL_TEMPLATE.format(
         name="RailMaterial", root=root_path,
-        r=0.720, g=0.720, b=0.750, roughness=0.30, metallic=0.85)
+        r=0.16, g=0.17, b=0.19, roughness=0.78, metallic=0.0)
 
     meshes_joined = "\n".join(mesh_blocks)
 

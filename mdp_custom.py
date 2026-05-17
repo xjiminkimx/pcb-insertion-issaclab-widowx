@@ -453,6 +453,97 @@ def pcb_leading_edge_insertion_proximity_reward(
     return torch.exp(-dist / (float(sigma_m) + 1e-9))
 
 
+def ee_approach_pcb_trailing_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    sigma_m: float = 0.08,
+) -> torch.Tensor:
+    """Approach shaping: reward EE getting close to the PCB **trailing (push-face) edge**.
+
+    Returns ``exp(-d / sigma_m)`` in (0, 1]. Pulls the arm toward the board in the early
+    phase before grasp and insertion rewards dominate. Set a modest positive weight
+    (e.g. 4.0) so it does not compete with the grasp/push terms.
+
+    .. warning::
+        This Gaussian form gives reward for *being* near the PCB, which can be
+        exploited by hovering. Prefer :func:`ee_approach_progress_reward` to prevent
+        the hover-exploit cycle.
+    """
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    return torch.exp(-dist / (float(sigma_m) + 1e-9))
+
+
+# Per-env previous EE distance used by the progress reward (reset each episode).
+_EE_APPROACH_PREV_DIST: torch.Tensor | None = None
+
+
+def ee_approach_progress_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    max_step_m: float = 0.05,
+) -> torch.Tensor:
+    """**Progress-only** approach reward: fires only when the EE is getting *closer* to the PCB.
+
+    Returns ``clamp(prev_dist - curr_dist, 0, max_step_m) / max_step_m`` ∈ [0, 1].
+    When hovering (distance unchanged) or moving away the reward is exactly 0, which
+    prevents the hover-exploit cycle that the Gaussian form is susceptible to.
+
+    The previous distance is reset to the current distance on the first step of each
+    episode (``episode_length_buf == 1``), so resets are handled cleanly.
+    """
+    global _EE_APPROACH_PREV_DIST
+
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+
+    if (
+        _EE_APPROACH_PREV_DIST is None
+        or _EE_APPROACH_PREV_DIST.shape[0] != dist.shape[0]
+        or _EE_APPROACH_PREV_DIST.device != dist.device
+    ):
+        _EE_APPROACH_PREV_DIST = dist.clone()
+        return torch.zeros_like(dist)
+
+    first_step = env.episode_length_buf == 1
+    # On the first step of an episode, reset prev_dist so we don't reward the teleport.
+    _EE_APPROACH_PREV_DIST = torch.where(first_step, dist, _EE_APPROACH_PREV_DIST)
+
+    progress = (_EE_APPROACH_PREV_DIST - dist).clamp(0.0, float(max_step_m))
+    _EE_APPROACH_PREV_DIST = dist.clone()
+    return progress / float(max_step_m)
+
+
+def pcb_insertion_depth_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_mouth_y_env: float,
+    max_depth_m: float = 0.20,
+) -> torch.Tensor:
+    """Reward for **PCB depth inside the slot**: leading edge past the slot mouth in +Y.
+
+    Zero while the leading edge has not yet crossed ``slot_mouth_y_env``.
+    Linearly increases up to ``max_depth_m`` of penetration (returns 1.0 at full insertion).
+    Use a positive weight; combine with ``push_y_toward_slot`` which only fires before the mouth.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    p_w = pcb.data.root_pos_w
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    lead_w = p_w + float(half_length_m) * x_w
+    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
+    depth = torch.clamp(lead_y - float(slot_mouth_y_env), min=0.0, max=float(max_depth_m))
+    return depth / float(max_depth_m)
+
+
 def pcb_horizontal_velocity_perpendicular_to_axis_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -569,6 +660,8 @@ def pcb_long_axis_vertical_component_exceeds(
 
 # Counts consecutive env steps with near-zero arm joint velocity (one buffer per training process).
 _ARM_VEL_IDLE_COUNT: torch.Tensor | None = None
+# Counts consecutive env steps where the PCB moves backward (−Y).
+_PCB_BACKWARD_COUNT: torch.Tensor | None = None
 
 
 def arm_joints_velocity_idle_termination(
@@ -720,6 +813,37 @@ def reset_pcb_on_guide_rails(
 
     pcb.write_root_pose_to_sim(root_pose, env_ids=env_ids)
     pcb.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+
+
+def pcb_moving_backward_termination(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    backward_vel_threshold: float = -0.03,
+    min_steps: int = 20,
+) -> torch.Tensor:
+    """Terminate when the PCB sustains **−Y (backward) linear velocity** for too long.
+
+    Counts consecutive env steps where ``v_y < backward_vel_threshold`` (negative = moving away from
+    the slot). Resets the counter whenever the PCB moves forward or the episode restarts.
+    Fires after ``min_steps`` consecutive backward-moving steps to avoid cutting on transient bounces.
+    """
+    global _PCB_BACKWARD_COUNT
+    pcb = env.scene[pcb_cfg.name]
+    v_y = pcb.data.root_lin_vel_w[:, 1]          # world +Y is toward the slot
+    moving_backward = v_y < float(backward_vel_threshold)
+    first_step = env.episode_length_buf == 1
+    if (
+        _PCB_BACKWARD_COUNT is None
+        or _PCB_BACKWARD_COUNT.shape[0] != env.num_envs
+        or _PCB_BACKWARD_COUNT.device != env.device
+    ):
+        _PCB_BACKWARD_COUNT = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    _PCB_BACKWARD_COUNT = torch.where(
+        first_step | (~moving_backward),
+        torch.zeros_like(_PCB_BACKWARD_COUNT),
+        _PCB_BACKWARD_COUNT + 1,
+    )
+    return _PCB_BACKWARD_COUNT >= int(min_steps)
 
 
 def pcb_dropped_from_gripper(

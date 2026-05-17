@@ -23,8 +23,8 @@ WidowXPcbPPOCfg = {
                     "mu_activation": "None",
                     "sigma_activation": "None",
                     "mu_init": {"name": "default"},
-                    "sigma_init": {"name": "const_initializer", "val": 0.0},
-                    "fixed_sigma": True,
+                    "sigma_init": {"name": "const_initializer", "val": -1.0},
+                    "fixed_sigma": False,
                 }
             },
             "mlp": {
@@ -40,7 +40,7 @@ WidowXPcbPPOCfg = {
             "name": "rlgpu",
             "env_name": "rlgpu",
             "clip_observations": 10.0,
-            "clip_actions": 1.0,
+            "clip_actions": 0.3,
         },
         
         "config": {
@@ -64,8 +64,8 @@ WidowXPcbPPOCfg = {
             # ✅ 추가: 에러의 원인인 어드밴티지 정규화 설정 추가
             "normalize_advantage": True,
             
-            # Must match WidowXPcbEnvCfg.scene.num_envs (2048).
-            "num_actors": 2048,
+            # Must match --num_envs argument passed to train.py.
+            "num_actors": 4096,
             "reward_shaper": {"scale_value": 0.1},
             
             # PPO 학습 하이퍼파라미터
@@ -82,13 +82,13 @@ WidowXPcbPPOCfg = {
             
             # 미니배치 및 최적화 설정
             "grad_norm": 0.5,
-            # Small entropy improves exploration and reduces variance collapse / bad sigma dynamics.
-            "entropy_coef": 1e-3,
+            # Raised from 1e-3 to 5e-3 to encourage exploration toward the PCB.
+            "entropy_coef": 2e-3,
             "truncate_grads": True,
             "e_clip": 0.2,
-            "horizon_length": 16,
-            # Rollout size = 2048 * 16 = 32768; 4096 divides evenly (8 minibatches × mini_epochs).
-            "minibatch_size": 2048,
+            "horizon_length": 64,
+            # Rollout size = 1024 * 64 = 65536; 4096 divides evenly (16 minibatches × mini_epochs).
+            "minibatch_size": 4096,
             "mini_epochs": 8,
             "critic_coef": 2,
             "clip_value": True,
