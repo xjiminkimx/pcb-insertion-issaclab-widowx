@@ -144,6 +144,83 @@ def gripper_mid_to_pcb_trailing_edge_distance(
     return torch.norm(mid - trailing, dim=-1)
 
 
+def gripper_mid_to_pcb_hover_distance(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    hover_height_m: float = 0.05,
+) -> torch.Tensor:
+    """Distance from jaw midpoint to a **pre-grasp hover point** above the PCB trailing edge.
+
+    The hover point is the trailing-edge face center offset upward by ``hover_height_m`` along the
+    world Z axis. The approach reward should first pull the EE to this hover point (from any
+    direction without rail obstruction), then a separate descent reward brings it down to the face.
+
+    This enables a **top-down grasp** trajectory:
+    1. EE moves to hover point (above the trailing edge).
+    2. EE descends vertically onto the 2.5 mm board face.
+    3. Gripper closes on the board thickness from above/below.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    long_axis = pcb_body_axis_x_world(env, pcb_cfg)
+    trailing = pcb_pos - half_length_m * long_axis
+    # Offset upward in world Z (hover point above the edge)
+    hover_offset = torch.zeros_like(trailing)
+    hover_offset[:, 2] = float(hover_height_m)
+    hover_point = trailing + hover_offset
+    return torch.norm(mid - hover_point, dim=-1)
+
+
+# Per-env previous EE distance for hover approach (reset each episode).
+_EE_HOVER_PREV_DIST: torch.Tensor | None = None
+
+
+def ee_hover_approach_progress_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    hover_height_m: float = 0.05,
+    max_step_m: float = 0.05,
+) -> torch.Tensor:
+    """Progress reward for the **hover-approach phase** of a top-down grasp.
+
+    Rewards the EE moving closer to the pre-grasp hover point above the PCB trailing edge.
+    Returns ``clamp(prev_dist - curr_dist, 0, max_step_m) / max_step_m`` ∈ [0, 1].
+    Hovering or moving away returns exactly 0 — no hover-exploit.
+
+    Pair this with ``ee_descent_progress_reward`` (or ``grasp_short_edge_closure_reward``) so the
+    arm is first drawn above the board then rewarded for descending and closing.
+    """
+    global _EE_HOVER_PREV_DIST
+
+    dist = gripper_mid_to_pcb_hover_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, hover_height_m
+    )
+
+    if (
+        _EE_HOVER_PREV_DIST is None
+        or _EE_HOVER_PREV_DIST.shape[0] != dist.shape[0]
+        or _EE_HOVER_PREV_DIST.device != dist.device
+    ):
+        _EE_HOVER_PREV_DIST = dist.clone()
+        return torch.zeros_like(dist)
+
+    first_step = env.episode_length_buf == 1
+    _EE_HOVER_PREV_DIST = torch.where(first_step, dist, _EE_HOVER_PREV_DIST)
+    progress = (_EE_HOVER_PREV_DIST - dist).clamp(0.0, float(max_step_m))
+    _EE_HOVER_PREV_DIST = dist.clone()
+    return progress / float(max_step_m)
+
+
 def grasp_short_edge_closure_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -520,6 +597,48 @@ def ee_approach_progress_reward(
     progress = (_EE_APPROACH_PREV_DIST - dist).clamp(0.0, float(max_step_m))
     _EE_APPROACH_PREV_DIST = dist.clone()
     return progress / float(max_step_m)
+
+
+def grasp_and_push_bonus(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    open_width_m: float,
+    closed_threshold: float = 0.3,
+    gate_dist_m: float = 0.08,
+) -> torch.Tensor:
+    """Combined bonus: fires **only** when the gripper is closed AND the PCB is moving in +Y.
+
+    This breaks the "descend + partial-close + stay" local optimum by rewarding the
+    transition from grasping to pushing. The policy must commit to both actions simultaneously
+    to earn this reward.
+
+    Returns ``closure_gate × velocity_relu`` where:
+    - ``closure_gate = 1`` when gripper joint < ``closed_threshold × open_width_m``
+      (i.e. gripper is actually closed, not just partially closed)
+    - ``velocity_relu = relu(v_y)`` — world +Y velocity of the PCB
+
+    Result is in [0, ∞) proportional to how fast the PCB moves while grasped.
+    """
+    # Closure gate: 1 when closed enough, 0 when open
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    is_closed = (gq < float(closed_threshold) * float(open_width_m)).to(dtype=gq.dtype)
+
+    # Distance gate: only fire when near the push face
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    dist_gate = torch.exp(-dist / float(gate_dist_m))
+
+    # PCB +Y velocity (toward slot)
+    pcb = env.scene[pcb_cfg.name]
+    v_y = torch.relu(pcb.data.root_lin_vel_w[:, 1])
+
+    return is_closed * dist_gate * v_y
 
 
 def pcb_insertion_depth_reward(
