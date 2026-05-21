@@ -221,6 +221,41 @@ def ee_hover_approach_progress_reward(
     return progress / float(max_step_m)
 
 
+def gripper_pinch_readiness(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+) -> torch.Tensor:
+    """Soft readiness in ``[0, 1]`` for closing: thickness alignment × pinch orientation."""
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    thickness_ok = torch.exp(-torch.abs(w) / thickness_sigma_m)
+
+    v = right - left
+    n = torch.norm(v, dim=-1)
+    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
+    u_lr = v / safe_n
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    open_est = torch.cross(x_w, u_lr, dim=-1)
+    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
+    open_est = open_est / no
+    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
+    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
+    sep_ok = (n > min_finger_sep_m).to(dtype=v.dtype)
+    return thickness_ok * align_open * align_finger * sep_ok
+
+
 def grasp_short_edge_closure_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -230,11 +265,16 @@ def grasp_short_edge_closure_reward(
     half_length_m: float,
     open_width_m: float = 0.044,
     gate_dist_m: float = 0.07,
+    pcb_half_thickness_m: float = 0.00125,
+    above_sigma_m: float = 0.004,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
 ) -> torch.Tensor:
-    """Encourage **closing** the parallel gripper when the EE is near the short-edge / push-face target.
+    """Reward **closing** only when near the trailing edge, above the board, and pinch-ready.
 
-    Returns ``closure * gate`` in ``[0, 1]``: ``closure = 1 - q/open`` (closed=1), ``gate = exp(-d / gate_dist)``
-    from distance ``d`` to the same target as ``gripper_mid_to_pcb_trailing_edge_distance``.
+    Returns ``closure * gate * above_gate * pinch_ready`` in ``[0, 1]``.
+    Closure is not rewarded until jaws are aligned to straddle the short edge — this prevents
+    closing while still approaching or digging under the PCB.
     """
     dist = gripper_mid_to_pcb_trailing_edge_distance(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
@@ -243,7 +283,27 @@ def grasp_short_edge_closure_reward(
     gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
     closure = torch.clamp(1.0 - gq / open_width_m, 0.0, 1.0)
     gate = torch.exp(-dist / gate_dist_m)
-    return closure * gate
+
+    pcb = env.scene[pcb_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    above_gate = torch.sigmoid((w + pcb_half_thickness_m) / above_sigma_m)
+
+    pinch_ready = gripper_pinch_readiness(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+    )
+
+    return closure * gate * above_gate * pinch_ready
 
 
 def gripper_mid_thickness_plane_alignment_shaping(
@@ -252,10 +312,17 @@ def gripper_mid_thickness_plane_alignment_shaping(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     sigma_m: float = 0.012,
+    half_length_m: float | None = None,
+    gate_dist_m: float | None = None,
 ) -> torch.Tensor:
     """Shaping: 1 when jaw midpoint lies on the PCB **mid-thickness** plane (ideal top/bottom pinch).
 
     Parallel jaws should straddle the thin board; ``dot(mid - pcb_center, body+Z)`` should be ~0.
+
+    Optional trailing-edge gate: when ``half_length_m`` and ``gate_dist_m`` are provided the
+    reward is multiplied by ``exp(-d / gate_dist_m)`` where ``d`` is the distance to the trailing
+    edge face center.  This prevents the large PCB top surface from becoming an attractive well —
+    thickness alignment only pays off near the short edge where we actually want to pinch.
     """
     pcb = env.scene[pcb_cfg.name]
     robot = env.scene[left_finger_cfg.name]
@@ -265,7 +332,15 @@ def gripper_mid_thickness_plane_alignment_shaping(
     mid = 0.5 * (left + right)
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
     w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
-    return torch.exp(-torch.abs(w) / sigma_m)
+    alignment = torch.exp(-torch.abs(w) / sigma_m)
+
+    if half_length_m is not None and gate_dist_m is not None:
+        dist = gripper_mid_to_pcb_trailing_edge_distance(
+            env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+        )
+        alignment = alignment * torch.exp(-dist / gate_dist_m)
+
+    return alignment
 
 
 def gripper_open_push_face_rub_penalty(
@@ -278,10 +353,13 @@ def gripper_open_push_face_rub_penalty(
     open_width_m: float = 0.044,
     plane_band_m: float = 0.032,
     thickness_band_m: float = 0.004,
+    pcb_half_thickness_m: float = 0.00125,
+    above_sigma_m: float = 0.003,
 ) -> torch.Tensor:
-    """Penalty proxy for **open** gripper hugging the push face at rail height (side rub, no pinch).
+    """Penalty for **open** gripper side-rubbing the push face at rail height (not top-down descent).
 
-    High when: large opening, near the push-face plane in X, and near PCB mid-plane in thickness (Z).
+    Suppressed when the jaw midpoint is above the PCB top face so top-down open approach is not
+    penalised.  High when: open, near push-face plane, near mid-thickness, and not above the board.
     """
     pcb = env.scene[pcb_cfg.name]
     robot = env.scene[left_finger_cfg.name]
@@ -297,7 +375,123 @@ def gripper_open_push_face_rub_penalty(
     open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
     rub_plane = torch.exp(-d_plane / plane_band_m)
     rub_thick = torch.exp(-torch.abs(w_coord) / (thickness_band_m + 1e-6))
-    return open_norm * rub_plane * rub_thick
+    # No side-rub penalty while descending from above the board top.
+    not_top_down = 1.0 - torch.sigmoid((w_coord - pcb_half_thickness_m) / above_sigma_m)
+    return open_norm * rub_plane * rub_thick * not_top_down
+
+
+def gripper_open_above_edge_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    open_width_m: float = 0.010,
+    gate_dist_m: float = 0.10,
+    pcb_half_thickness_m: float = 0.00125,
+    above_margin_m: float = 0.002,
+    above_sigma_m: float = 0.004,
+    min_open_fraction: float = 0.65,
+) -> torch.Tensor:
+    """Reward a **wide-open** gripper while approaching the trailing edge from above the PCB.
+
+    Returns ``open_norm * near_gate * above_gate`` in ``[0, 1]``.
+    ``above_gate`` requires the jaw midpoint to sit above the board top (top-down pre-grasp).
+    """
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
+    # Soft preference for fully open (not just slightly open).
+    open_ok = torch.clamp((open_norm - min_open_fraction) / (1.0 - min_open_fraction + 1e-6), 0.0, 1.0)
+    near_gate = torch.exp(-dist / gate_dist_m)
+
+    pcb = env.scene[pcb_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    above_gate = torch.sigmoid((w - pcb_half_thickness_m - above_margin_m) / above_sigma_m)
+
+    return open_ok * near_gate * above_gate
+
+
+def premature_close_at_edge_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    open_width_m: float = 0.010,
+    gate_dist_m: float = 0.10,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+    partial_close_threshold: float = 0.35,
+) -> torch.Tensor:
+    """Penalty for closing (or partially closing) near the edge before pinch geometry is ready.
+
+    Returns ``closed * near_gate * (1 - pinch_ready)`` in ``[0, 1]``.
+    """
+    dist = gripper_mid_to_pcb_trailing_edge_distance(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
+    )
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
+    closed = torch.clamp(1.0 - open_norm / (partial_close_threshold + 1e-6), 0.0, 1.0)
+    near_gate = torch.exp(-dist / gate_dist_m)
+    pinch_ready = gripper_pinch_readiness(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+    )
+    return closed * near_gate * (1.0 - pinch_ready)
+
+
+def closed_below_pcb_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    pcb_half_thickness_m: float = 0.00125,
+    open_width_m: float = 0.010,
+    sigma_below_m: float = 0.005,
+) -> torch.Tensor:
+    """Penalty when the gripper is **closed** and the jaw midpoint is **below the PCB bottom face**.
+
+    Directly penalises the "close and dig under" failure mode. The penalty scales with how
+    closed the gripper is and how far the jaw has sunk below the PCB bottom surface.
+    Returns a value in ``[0, 1]``.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    robot = env.scene[left_finger_cfg.name]
+    pcb_pos = pcb.data.root_pos_w
+    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
+    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
+    mid = 0.5 * (left + right)
+
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
+    # depth_below > 0 only when jaw mid sinks below the PCB bottom face
+    depth_below = torch.relu(-(w + pcb_half_thickness_m))
+    below_signal = 1.0 - torch.exp(-depth_below / sigma_below_m)
+
+    robot_art = env.scene[gripper_joint_cfg.name]
+    gq = robot_art.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    closed_norm = torch.clamp(1.0 - gq / open_width_m, 0.0, 1.0)
+
+    return closed_norm * below_signal
 
 
 def gripper_mid_thickness_offset_obs(

@@ -23,7 +23,10 @@ WidowXPcbPPOCfg = {
                     "mu_activation": "None",
                     "sigma_activation": "None",
                     "mu_init": {"name": "default"},
-                    "sigma_init": {"name": "const_initializer", "val": -1.0},
+                    # Raised from -1.0 → -0.5 so the initial action std ≈ exp(-0.5) ≈ 0.61
+                    # (was exp(-1.0) ≈ 0.37).  More stochastic early exploration before the
+                    # policy hardens its approach trajectory.
+                    "sigma_init": {"name": "const_initializer", "val": -0.5},
                     "fixed_sigma": False,
                 }
             },
@@ -82,13 +85,17 @@ WidowXPcbPPOCfg = {
             
             # 미니배치 및 최적화 설정
             "grad_norm": 0.5,
-            # Raised from 1e-3 to 5e-3 to encourage exploration toward the PCB.
-            "entropy_coef": 2e-3,
+            # Raised to 1e-2 to keep the policy stochastic longer.
+            # At 2e-3 the policy was collapsing to a narrow grasp trajectory too early.
+            # The adaptive LR will reduce the update magnitude when KL spikes, so a
+            # higher entropy coef is safe — it just prevents premature convergence.
+            "entropy_coef": 1e-2,
             "truncate_grads": True,
             "e_clip": 0.2,
-            "horizon_length": 64,
-            # Rollout size = 1024 * 64 = 65536; 4096 divides evenly (16 minibatches × mini_epochs).
-            "minibatch_size": 4096,
+            # Longer horizon gives the value function more context for delayed grasp/push rewards.
+            "horizon_length": 128,
+            # Rollout = 4096 envs × 128 steps = 524288; minibatch 8192 → 64 minibatches × 8 epochs.
+            "minibatch_size": 8192,
             "mini_epochs": 8,
             "critic_coef": 2,
             "clip_value": True,

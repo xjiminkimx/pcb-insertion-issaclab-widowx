@@ -42,6 +42,9 @@ from .mdp_custom import (
     gripper_pinch_orientation_flat_edge_reward,
     gripper_mid_thickness_plane_alignment_shaping,
     gripper_open_push_face_rub_penalty,
+    gripper_open_above_edge_reward,
+    premature_close_at_edge_penalty,
+    closed_below_pcb_penalty,
     pcb_insertion_depth_reward,
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
@@ -98,7 +101,7 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
 # Base on -X beside the rail pair (no overlap with rails at world X ≈ 0.003–0.097).
-_ROBOT_BASE_POS = (-0.25, -0.05, 0.02)
+_ROBOT_BASE_POS = (-0.25, 0.05, 0.02)
 _ROBOT_HOME_JOINT_POS = {
     "joint_0": 0.0,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
     "joint_1": 1.5,    # shoulder pitch down — smaller than 1.2 to reach forward/up
@@ -370,15 +373,62 @@ class RewardsCfg:
             "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
             "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
             "half_length_m": PCB_X * 0.5,
+            "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
         },
         weight=12.0,
     )
 
     # -----------------------------------------------------------------------
-    # Phase 2 — Grasp: close on the short edge with the right pinch geometry
+    # Phase 2 — Grasp: open above edge → align pinch → close → push
     # -----------------------------------------------------------------------
-    # Reward gripper closure when EE is near the push-face centre.
-    # Weight reduced — closure alone is now a prerequisite, not the goal.
+    # Keep gripper wide open while descending to the trailing edge from above the board.
+    gripper_open_above_edge = RewardTermCfg(
+        func=gripper_open_above_edge_reward,
+        params={
+            "pcb_cfg": SceneEntityCfg("pcb"),
+            "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
+            "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+            "gripper_joint_cfg": SceneEntityCfg("robot", joint_names=["left_carriage_joint"]),
+            "half_length_m": PCB_X * 0.5,
+            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "gate_dist_m": 0.10,
+            "pcb_half_thickness_m": PCB_Z * 0.5,
+            "above_margin_m": 0.002,
+            "above_sigma_m": 0.004,
+            "min_open_fraction": 0.65,
+        },
+        weight=12.0,
+    )
+    # Penalise closing / partial close near the edge before pinch geometry is ready.
+    premature_close_at_edge = RewardTermCfg(
+        func=premature_close_at_edge_penalty,
+        params={
+            "pcb_cfg": SceneEntityCfg("pcb"),
+            "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
+            "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+            "gripper_joint_cfg": SceneEntityCfg("robot", joint_names=["left_carriage_joint"]),
+            "half_length_m": PCB_X * 0.5,
+            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "gate_dist_m": 0.10,
+            "partial_close_threshold": 0.35,
+        },
+        weight=-12.0,
+    )
+    # Penalise closed gripper with jaw midpoint below the PCB bottom face (digging exploit).
+    closed_below_pcb = RewardTermCfg(
+        func=closed_below_pcb_penalty,
+        params={
+            "pcb_cfg": SceneEntityCfg("pcb"),
+            "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
+            "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+            "gripper_joint_cfg": SceneEntityCfg("robot", joint_names=["left_carriage_joint"]),
+            "pcb_half_thickness_m": PCB_Z * 0.5,
+            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "sigma_below_m": 0.005,
+        },
+        weight=-15.0,
+    )
+    # Reward closure only when near edge, above board, and pinch-ready (aligned straddle).
     grasp_close_on_edge = RewardTermCfg(
         func=grasp_short_edge_closure_reward,
         params={
@@ -389,10 +439,14 @@ class RewardsCfg:
             "half_length_m": PCB_X * 0.5,
             "open_width_m": _GRIPPER_OPEN_WIDTH_M,
             "gate_dist_m": 0.10,
+            "pcb_half_thickness_m": PCB_Z * 0.5,
+            "above_sigma_m": 0.004,
+            "thickness_sigma_m": 0.006,
+            "min_finger_sep_m": 0.006,
         },
-        weight=8.0,   # reduced: closure is now just a stepping stone, not the destination
+        weight=6.0,
     )
-    # Reward top/bottom pinch orientation.
+    # Reward top/bottom pinch orientation — raised to emphasise correct geometry.
     pinch_orientation = RewardTermCfg(
         func=gripper_pinch_orientation_flat_edge_reward,
         params={
@@ -403,9 +457,11 @@ class RewardsCfg:
             "gate_dist_m": 0.15,
             "min_finger_sep_m": 0.006,
         },
-        weight=3.0,
+        weight=6.0,   # raised: orientation geometry is now the primary grasp signal
     )
-    # Jaw midpoint on PCB mid-thickness plane — reduced now that it's working.
+    # Jaw midpoint on PCB mid-thickness plane, gated to the trailing edge only.
+    # The gate (gate_dist_m=0.12) ensures this reward fires near the short edge,
+    # not across the whole PCB top face, preventing the "roll-on-top" local optimum.
     thickness_alignment = RewardTermCfg(
         func=gripper_mid_thickness_plane_alignment_shaping,
         params={
@@ -413,10 +469,12 @@ class RewardsCfg:
             "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
             "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
             "sigma_m": 0.030,
+            "half_length_m": PCB_X * 0.5,
+            "gate_dist_m": 0.12,
         },
-        weight=6.0,   # reduced: top-down geometry is now learned; free up reward budget for push
+        weight=6.0,
     )
-    # Penalise open gripper hugging the push face without pinching.
+    # Side-rub at rail height only (suppressed during top-down open approach above the board).
     open_face_rub_penalty = RewardTermCfg(
         func=gripper_open_push_face_rub_penalty,
         params={
@@ -426,8 +484,9 @@ class RewardsCfg:
             "gripper_joint_cfg": SceneEntityCfg("robot", joint_names=["left_carriage_joint"]),
             "half_length_m": PCB_X * 0.5,
             "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "pcb_half_thickness_m": PCB_Z * 0.5,
         },
-        weight=-6.0,
+        weight=-3.0,
     )
 
     # -----------------------------------------------------------------------

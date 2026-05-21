@@ -98,7 +98,7 @@ python scripts/reinforcement_learning/rl_games/play.py \
 
 The script finds `WidowX_PCB_RL.pth` (the best saved model) automatically from the log directory.
 Use `--use_last_checkpoint` to load the most-recent epoch checkpoint instead.
-Use `--real-time` to throttle stepping to wall-clock speed.
+`--video` now enables `--real-time` automatically (use `--no-real-time` to disable). Videos are saved at 30 fps so playback matches on-screen speed.
 
 ### Load a specific checkpoint
 
@@ -120,7 +120,14 @@ python scripts/reinforcement_learning/rl_games/play.py \
 ```
 
 Video is saved to `logs/rl_games/WidowX_PCB_RL/widowx_pcb/videos/play/`.
+`--video` turns on real-time stepping and records at **30 fps** (readable wall-clock speed).
 Add `--headless` to render off-screen without the Isaac Sim GUI window.
+
+To fix an already-recorded fast video (sim-tagged 125 fps):
+
+```bash
+ffmpeg -y -i input.mp4 -vf "setpts=PTS*(125/30)" -r 30 -c:v libx264 -crf 18 -pix_fmt yuv420p output_realtime.mp4
+```
 
 ---
 
