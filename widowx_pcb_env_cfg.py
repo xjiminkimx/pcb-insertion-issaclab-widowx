@@ -54,7 +54,7 @@ from .mdp_custom import (
     gripper_vertical_bounce_penalty,
     gripper_fingers_thickness_straddle_shaping,
     gripper_both_fingers_above_pcb_penalty,
-    pcb_motion_near_grasp_penalty,
+    pcb_motion_until_grasp_penalty,
     gripper_along_board_slip_penalty,
     gripper_mid_long_axis_speed_penalty,
     premature_close_at_edge_penalty,
@@ -71,6 +71,8 @@ from .mdp_custom import (
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
+    pcb_tilt_before_grasp_termination,
+    pcb_xy_plane_rotation_before_grasp_termination,
     gripper_mid_thickness_offset_obs,
     gripper_pinch_orientation_cos_obs,
     pcb_moving_backward_termination,
@@ -209,6 +211,22 @@ def _grasp_distance_params(**extra) -> dict:
     return _grasp_entity_params(width_weight=_SHORT_EDGE_WIDTH_WEIGHT, **extra)
 
 
+def _grasp_termination_params(**extra) -> dict:
+    """Entity + geometry kwargs shared by grasp-success and pre-grasp terminations."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "half_length_m": _HALF_LENGTH_M,
+        "half_width_m": _PCB_HALF_WIDTH_M,
+        "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        **_GRASP_CHECK_KWARGS,
+    }
+    base.update(extra)
+    return base
+
+
 @configclass
 class WidowXPcbSceneCfg(InteractiveSceneCfg):
     """Scene assets for the WidowX PCB task.
@@ -261,8 +279,8 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(PCB_X, PCB_Y, PCB_Z),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=24,
-                solver_velocity_iteration_count=12,
+                solver_position_iteration_count=8,
+                solver_velocity_iteration_count=2,
                 max_depenetration_velocity=0.5,
                 max_linear_velocity=25.0,
                 max_angular_velocity=720.0,
@@ -282,7 +300,7 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
                 dynamic_friction=1.6,
                 restitution=0.0,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.1)),
         ),
         # Flat on conveyor; front edge 20 mm before slot (see ``_PCB_INIT_POS``).
@@ -297,17 +315,17 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             # Materials: SteelMaterial (magazine), BeltMaterial (side belts),
             #            StandMaterial (stand + frame).
             usd_path=os.path.join(ASSET_DIR, "usd_model", "usd_env", "pcb_insertion_env.usd"),
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                kinematic_enabled=True,
-                solver_position_iteration_count=32,
-                solver_velocity_iteration_count=12,
-                max_depenetration_velocity=0.5,
-            ),
-            # Match PCB offsets so contacts resolve with less interpenetration vs thin PCBs.
-            collision_props=sim_utils.CollisionPropertiesCfg(
-                contact_offset=0.004,
-                rest_offset=0.0012,
-            ),
+            # rigid_props=sim_utils.RigidBodyPropertiesCfg(
+            #     kinematic_enabled=True,
+            #     solver_position_iteration_count=32,
+            #     solver_velocity_iteration_count=12,
+            #     max_depenetration_velocity=0.5,
+            # ),
+            # # Match PCB offsets so contacts resolve with less interpenetration vs thin PCBs.
+            # collision_props=sim_utils.CollisionPropertiesCfg(
+            #     contact_offset=0.004,
+            #     rest_offset=0.0012,
+            # ),
         ), 
         # Fixture pose: _MAG_POS = assembly root in world; -90 deg Z rotation (see FK comments above).
         init_state=AssetBaseCfg.InitialStateCfg(
@@ -498,9 +516,21 @@ class RewardsGraspPhaseCfg(_SafetyRewardsCfg):
         weight=-10.0,
     )
     pcb_motion = RewardTermCfg(
-        func=pcb_motion_near_grasp_penalty,
-        params={**_grasp_distance_params(gate_dist_m=0.12, speed_scale_m_s=0.04)},
-        weight=-10.0,
+        func=pcb_motion_until_grasp_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "gripper_joint_cfg": _GRIPPER_JOINT,
+            "half_length_m": _HALF_LENGTH_M,
+            "half_width_m": _PCB_HALF_WIDTH_M,
+            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "speed_scale_m_s": 0.03,
+            "ang_speed_scale_rad_s": 0.5,
+            "include_angular": True,
+            **_GRASP_CHECK_KWARGS,
+        },
+        weight=-20.0,
     )
     closed_below_pcb = RewardTermCfg(
         func=closed_below_pcb_penalty,
@@ -711,9 +741,22 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
         weight=-15.0,
     )
     pcb_motion = RewardTermCfg(
-        func=pcb_motion_near_grasp_penalty,
-        params={**_grasp_distance_params(gate_dist_m=0.12, speed_scale_m_s=0.04), "task_phase_gate": "grasp"},
-        weight=-10.0,
+        func=pcb_motion_until_grasp_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "gripper_joint_cfg": _GRIPPER_JOINT,
+            "half_length_m": _HALF_LENGTH_M,
+            "half_width_m": _PCB_HALF_WIDTH_M,
+            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+            "speed_scale_m_s": 0.03,
+            "ang_speed_scale_rad_s": 0.5,
+            "include_angular": True,
+            "task_phase_gate": "grasp",
+            **_GRASP_CHECK_KWARGS,
+        },
+        weight=-20.0,
     )
     open_face_rub_penalty = RewardTermCfg(
         func=gripper_open_push_face_rub_penalty,
@@ -926,20 +969,23 @@ class TerminationsSharedCfg:
 
 @configclass
 class TerminationsGraspCfg(TerminationsSharedCfg):
-    """End episode when a valid edge-centre grasp is achieved."""
+    """End episode on grasp success or pre-grasp PCB pose failures (tilt / XY yaw)."""
+
+    # Stricter than shared defaults; only active until edge-centre grasp is achieved.
+    pcb_tilt_excessive = TerminationTermCfg(
+        func=pcb_tilt_before_grasp_termination,
+        params={**_grasp_termination_params(max_tilt_penalty=0.005)},
+    )
+    pcb_long_axis_not_horizontal = TerminationTermCfg(
+        func=pcb_xy_plane_rotation_before_grasp_termination,
+        params={
+            **_grasp_termination_params(min_xy_alignment=0.995, axis_world=PUSH_AXIS_WORLD),
+        },
+    )
 
     grasp_success = TerminationTermCfg(
         func=grasp_edge_center_achieved,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "gripper_joint_cfg": _GRIPPER_JOINT,
-            "half_length_m": _HALF_LENGTH_M,
-            "half_width_m": _PCB_HALF_WIDTH_M,
-            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-            **_GRASP_CHECK_KWARGS,
-        },
+        params=_grasp_termination_params(),
     )
 
 

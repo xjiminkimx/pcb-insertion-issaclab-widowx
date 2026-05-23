@@ -579,6 +579,59 @@ def pcb_motion_near_grasp_penalty(
     return _apply_task_phase_gate(env, near * speed_norm, task_phase_gate)
 
 
+def pcb_motion_until_grasp_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    half_width_m: float,
+    open_width_m: float,
+    closed_threshold: float = 0.35,
+    gate_dist_m: float = 0.06,
+    width_frac: float = 0.30,
+    min_pinch_ready: float = 0.40,
+    width_weight: float = 3.0,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+    pcb_half_thickness_m: float = 0.00125,
+    min_straddle_sep_m: float = 0.0012,
+    speed_scale_m_s: float = 0.03,
+    ang_speed_scale_rad_s: float = 0.5,
+    include_angular: bool = True,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Penalty for PCB linear (and optional angular) speed until a valid edge-centre grasp."""
+    pcb = env.scene[pcb_cfg.name]
+    speed_norm = torch.square(torch.norm(pcb.data.root_lin_vel_w, dim=-1) / (float(speed_scale_m_s) + 1e-9))
+    if include_angular:
+        speed_norm = speed_norm + torch.square(
+            torch.norm(pcb.data.root_ang_vel_w, dim=-1) / (float(ang_speed_scale_rad_s) + 1e-9)
+        )
+    achieved = grasp_edge_center_achieved(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        half_width_m,
+        open_width_m,
+        closed_threshold=closed_threshold,
+        gate_dist_m=gate_dist_m,
+        width_frac=width_frac,
+        min_pinch_ready=min_pinch_ready,
+        width_weight=width_weight,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+    )
+    penalty = speed_norm * (~achieved).float()
+    return _apply_task_phase_gate(env, penalty, task_phase_gate)
+
+
 def grasp_short_edge_closure_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -1330,6 +1383,163 @@ def pcb_long_axis_vertical_component_exceeds(
     """
     x_w = pcb_body_axis_x_world(env, pcb_cfg)
     return torch.abs(x_w[:, 2]) > max_abs_z
+
+
+def pcb_long_axis_xy_rotation_exceeds(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    min_xy_alignment: float = 0.995,
+) -> torch.Tensor:
+    """True when body +X (long axis) is rotated too far in the horizontal (XY) plane.
+
+    Ideal grasp spawn has long axis parallel to ``axis_world`` (world +Y). Measures alignment of
+    the long-axis XY projection with ``axis_world`` (ignores Z tilt component).
+    """
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    x_xy = x_w.clone()
+    x_xy[:, 2] = 0.0
+    x_xy = x_xy / torch.norm(x_xy, dim=-1, keepdim=True).clamp_min(1e-6)
+    a = torch.tensor(axis_world, device=x_w.device, dtype=x_w.dtype)
+    a_xy = a.clone()
+    a_xy[2] = 0.0
+    a_xy = a_xy / torch.norm(a_xy).clamp_min(1e-6)
+    a_xy = a_xy.unsqueeze(0).expand_as(x_xy)
+    align = torch.abs(torch.sum(x_xy * a_xy, dim=-1))
+    return align < float(min_xy_alignment)
+
+
+def _grasp_not_yet_achieved(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    half_width_m: float,
+    open_width_m: float,
+    closed_threshold: float = 0.35,
+    gate_dist_m: float = 0.06,
+    width_frac: float = 0.30,
+    min_pinch_ready: float = 0.40,
+    width_weight: float = 3.0,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+    pcb_half_thickness_m: float = 0.00125,
+    min_straddle_sep_m: float = 0.0012,
+) -> torch.Tensor:
+    """True while a valid edge-centre grasp has **not** been achieved."""
+    return ~grasp_edge_center_achieved(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        half_width_m,
+        open_width_m,
+        closed_threshold=closed_threshold,
+        gate_dist_m=gate_dist_m,
+        width_frac=width_frac,
+        min_pinch_ready=min_pinch_ready,
+        width_weight=width_weight,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+    )
+
+
+def pcb_tilt_before_grasp_termination(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    half_width_m: float,
+    open_width_m: float,
+    closed_threshold: float = 0.35,
+    gate_dist_m: float = 0.06,
+    width_frac: float = 0.30,
+    min_pinch_ready: float = 0.40,
+    width_weight: float = 3.0,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+    pcb_half_thickness_m: float = 0.00125,
+    min_straddle_sep_m: float = 0.0012,
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    max_tilt_penalty: float = 0.01,
+) -> torch.Tensor:
+    """Terminate on excessive thickness-axis tilt (board not flat) **before** grasp success."""
+    tilt_fail = pcb_tilt_beyond_limit(env, pcb_cfg, world_up=world_up, max_tilt_penalty=max_tilt_penalty)
+    pre_grasp = _grasp_not_yet_achieved(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        half_width_m,
+        open_width_m,
+        closed_threshold=closed_threshold,
+        gate_dist_m=gate_dist_m,
+        width_frac=width_frac,
+        min_pinch_ready=min_pinch_ready,
+        width_weight=width_weight,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+    )
+    return tilt_fail & pre_grasp
+
+
+def pcb_xy_plane_rotation_before_grasp_termination(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    half_width_m: float,
+    open_width_m: float,
+    closed_threshold: float = 0.35,
+    gate_dist_m: float = 0.06,
+    width_frac: float = 0.30,
+    min_pinch_ready: float = 0.40,
+    width_weight: float = 3.0,
+    thickness_sigma_m: float = 0.006,
+    min_finger_sep_m: float = 0.006,
+    pcb_half_thickness_m: float = 0.00125,
+    min_straddle_sep_m: float = 0.0012,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    min_xy_alignment: float = 0.97,
+) -> torch.Tensor:
+    """Terminate on excessive long-axis yaw in the XY plane **before** grasp success."""
+    yaw_fail = pcb_long_axis_xy_rotation_exceeds(
+        env, pcb_cfg, axis_world=axis_world, min_xy_alignment=min_xy_alignment
+    )
+    pre_grasp = _grasp_not_yet_achieved(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        half_width_m,
+        open_width_m,
+        closed_threshold=closed_threshold,
+        gate_dist_m=gate_dist_m,
+        width_frac=width_frac,
+        min_pinch_ready=min_pinch_ready,
+        width_weight=width_weight,
+        thickness_sigma_m=thickness_sigma_m,
+        min_finger_sep_m=min_finger_sep_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+    )
+    return yaw_fail & pre_grasp
 
 
 # Counts consecutive env steps where the PCB moves backward (−Y).
