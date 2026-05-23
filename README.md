@@ -6,15 +6,19 @@ One simulation variant is registered:
 
 | Robot | Task ID | Env config |
 |--------|---------|------------|
-| **WidowX** (Trossen `usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-v0` | `widowx_pcb_env_cfg.py` → `WidowXPcbEnvCfg` |
+| **WidowX** (Trossen `usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-Grasp-v0` | Phase 1 — grasp trailing short-edge centre |
+| | `Isaac-WidowX-PCB-Push-v0` | Phase 2 — push grasped PCB along +Y into slot |
+| | `Isaac-WidowX-PCB-v0` | Both phases in one episode (gated rewards) |
 
 Robot runtime assets now live under `usd_model/usd_robot/`, and environment fixtures plus conversion sources live under `usd_model/usd_env/`.
 
-**High-level episode flow:**
+**High-level episode flow (two-phase curriculum):**
 
-1. Reset places the PCB on the rail pose (see `_PCB_INIT_*` and reset events).
-2. Dense rewards are regularization-style (height, floor, tilt, etc.) — no slot target.
-3. Terminations: PCB too low / dropped; success termination is left for you to define with the new task reward.
+1. **Phase 1 — Grasp** (`Isaac-WidowX-PCB-Grasp-v0`): PCB on rails, gripper open. Rewards shape approach, edge-centre alignment, and closure. Episode ends on successful edge grasp or timeout.
+2. **Phase 2 — Push** (`Isaac-WidowX-PCB-Push-v0`): Reset snaps the PCB to closed jaws (kinematic grasp hold). Rewards shape +Y motion and slot insertion depth.
+3. **Full task** (`Isaac-WidowX-PCB-v0`): Same obs/actions; grasp rewards active until edge grasp, then push rewards only.
+
+Recommended training order: **Grasp → Push → (optional) Full** fine-tune.
 
 ---
 
@@ -60,13 +64,27 @@ Commands below assume you run training from the **Isaac Lab repository root** (t
 
 ## Train (rl-games PPO)
 
-**WidowX:**
+**Phase 1 — grasp only:**
 
 ```bash
 conda activate isaac-sim   # or your env name
 cd /path/to/IsaacLab   # repository root (contains scripts/)
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --headless --num_envs 4096
+```
+
+**Phase 2 — push only** (after grasp policy is reasonable, or from scratch with snapped grasp reset):
+
+```bash
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Push-v0 --headless --num_envs 4096
+```
+
+**Full two-phase episode** (single policy, gated rewards):
+
+```bash
 python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless --num_envs 4096
 ```
+
+Checkpoints go to separate folders: `logs/rl_games/WidowX_PCB_Grasp_RL/`, `WidowX_PCB_Push_RL/`, `WidowX_PCB_RL/`.
 
 If Isaac Sim startup is unstable on newer GPUs or drivers, prefer **headless** mode with safer renderer flags:
 

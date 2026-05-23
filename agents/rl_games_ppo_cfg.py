@@ -104,3 +104,28 @@ WidowXPcbPPOCfg = {
         }
     }
 }
+
+# Phase-specific experiment names (separate TensorBoard / checkpoint folders).
+WidowXPcbGraspPPOCfg = {
+    **WidowXPcbPPOCfg,
+    "params": {
+        **WidowXPcbPPOCfg["params"],
+        "config": {
+            **WidowXPcbPPOCfg["params"]["config"],
+            "name": "WidowX_PCB_Grasp_RL",
+            "full_experiment_name": "widowx_pcb_grasp",
+        },
+    },
+}
+
+WidowXPcbPushPPOCfg = {
+    **WidowXPcbPPOCfg,
+    "params": {
+        **WidowXPcbPPOCfg["params"],
+        "config": {
+            **WidowXPcbPPOCfg["params"]["config"],
+            "name": "WidowX_PCB_Push_RL",
+            "full_experiment_name": "widowx_pcb_push",
+        },
+    },
+}
