@@ -42,6 +42,12 @@ from .mdp_custom import (
     ee_approach_progress_reward,
     ee_xy_approach_progress_reward,
     ee_thickness_descent_progress_reward,
+    gripper_trailing_edge_xy_proximity_shaping,
+    gripper_trailing_edge_thickness_additive_shaping,
+    gripper_trailing_edge_thickness_descent_progress,
+    gripper_trailing_edge_thick_excess_penalty,
+    gripper_trailing_edge_thickness_ascent_penalty,
+    gripper_trailing_edge_height_shaping,
     grasp_short_edge_closure_reward,
     grasp_success_bonus_reward,
     gripper_short_edge_width_centering_shaping,
@@ -54,10 +60,12 @@ from .mdp_custom import (
     gripper_vertical_bounce_penalty,
     gripper_fingers_thickness_straddle_shaping,
     gripper_both_fingers_above_pcb_penalty,
+    gripper_hover_above_edge_penalty,
     pcb_motion_until_grasp_penalty,
     gripper_along_board_slip_penalty,
     gripper_mid_long_axis_speed_penalty,
     premature_close_at_edge_penalty,
+    premature_close_before_straddle_penalty,
     closed_below_pcb_penalty,
     pcb_insertion_depth_reward,
     task_phase_transition_step,
@@ -74,6 +82,7 @@ from .mdp_custom import (
     pcb_tilt_before_grasp_termination,
     pcb_xy_plane_rotation_before_grasp_termination,
     gripper_mid_thickness_offset_obs,
+    gripper_trailing_edge_error_obs,
     gripper_pinch_orientation_cos_obs,
     pcb_moving_backward_termination,
 )
@@ -123,10 +132,10 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
 # Base on -X beside the conveyor (see ``_ROBOT_BASE_POS``).
-_ROBOT_BASE_POS = (-0.25, -0.20, 0.02)
+_ROBOT_BASE_POS = (-0.15, -0.15, 0.02)
 _ROBOT_HOME_JOINT_POS = {
-    "joint_0": 0.0,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
-    "joint_1": 1.5,    # shoulder pitch down — smaller than 1.2 to reach forward/up
+    "joint_0": -0.3,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
+    "joint_1": 0.9,    # shoulder pitch down — smaller than 1.2 to reach forward/up
     "joint_2": 1.2,    # elbow bend / 1.2
     "joint_3": -0.8,    # wrist pitch to level the EE
     "joint_4": -1.0,    # wrist roll — 0 for top/bottom pinch orientation
@@ -145,7 +154,7 @@ _SLOT_MOUTH_Y_ENV = 0.450          # slot entrance Y (assembly root X-min → wo
 # World X midway between side belts part_1_3 (~0.052) and part_1_7 (~0.151).
 _CONVEYOR_CENTER_X_ENV = 0.102 + 0.005
 # Chip CAD centre world Y (−chip_root_x + _MAG_POS[1]); used for spawn along belt.
-_PCB_CHIP_REF_Y_ENV = 0.076 - 0.1
+_PCB_CHIP_REF_Y_ENV = 0.076 - 0.05
 # Belt top at gap centre (not global belt max — avoids spawning into left belt mesh).
 _CONVEYOR_SURFACE_Z = 0.170
 _PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5
@@ -178,20 +187,67 @@ _ROBOT_ENT = SceneEntityCfg("robot")
 _LEFT_FINGER = SceneEntityCfg("robot", body_names="gripper_left")
 _RIGHT_FINGER = SceneEntityCfg("robot", body_names="gripper_right")
 _GRIPPER_JOINT = SceneEntityCfg("robot", joint_names=["left_carriage_joint"])
+# wxai ``gripper_left``/``gripper_right`` body origins sit on the carriage; pad tips are ~6 cm distally.
+_GRIPPER_TIP_OFFSET_M = 0.00
+_WRIST_BODY = SceneEntityCfg("robot", body_names="link_6")
 _HALF_LENGTH_M = PCB_X * 0.5
+
+
+def _gripper_kinematics_kwargs() -> dict:
+    """Pad-tip offset applied to all grasp geometry (rewards, obs, success, snap)."""
+    return {
+        "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+        "wrist_body_cfg": _WRIST_BODY,
+    }
+
+# Relaxed straddle threshold for early learning (≈35% of board thickness between jaw tips).
+_MIN_STRADDLE_SEP_M = PCB_Z * 0.35
 
 # Grasp-success check kwargs reused by phase transition, bonus, and termination.
 _GRASP_CHECK_KWARGS = {
     "closed_threshold": 0.35,
-    "gate_dist_m": 0.06,
+    "gate_dist_m": 0.08,
     "width_frac": 0.30,
-    "min_pinch_ready": 0.40,
+    "min_pinch_ready": 0.25,
     "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
     "thickness_sigma_m": 0.006,
     "min_finger_sep_m": 0.006,
     "pcb_half_thickness_m": PCB_Z * 0.5,
-    "min_straddle_sep_m": PCB_Z * 0.48,
+    "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
 }
+
+# Pinch orientation — reward + obs (active from farther out, still valid while above the board).
+_PINCH_ORIENT_GATE_M = 0.20
+_PINCH_ORIENT_MAX_THICK_M = 0.006
+_PINCH_ORIENT_THICK_SIGMA_M = 0.006
+_PINCH_ORIENT_MIN_GATE = 0.15
+_PINCH_ORIENT_MIN_SEP_M = 0.004
+
+
+def _pinch_orient_reward_params(**extra) -> dict:
+    """Shared kwargs for flat-edge pinch orientation reward (wide gate, soft height cutoff)."""
+    base = _grasp_distance_params(
+        gate_dist_m=_PINCH_ORIENT_GATE_M,
+        min_finger_sep_m=_PINCH_ORIENT_MIN_SEP_M,
+        max_thick_m=_PINCH_ORIENT_MAX_THICK_M,
+        thick_sigma_m=_PINCH_ORIENT_THICK_SIGMA_M,
+        min_gate=_PINCH_ORIENT_MIN_GATE,
+    )
+    base.update(extra)
+    return base
+
+
+def _pinch_orient_obs_params(**extra) -> dict:
+    """Shared kwargs for ``pinch_orientation_cos`` policy observation."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "min_finger_sep_m": _PINCH_ORIENT_MIN_SEP_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
 
 
 def _grasp_entity_params(**extra) -> dict:
@@ -201,6 +257,7 @@ def _grasp_entity_params(**extra) -> dict:
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
         "half_length_m": _HALF_LENGTH_M,
+        **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
     return base
@@ -222,6 +279,7 @@ def _grasp_termination_params(**extra) -> dict:
         "half_width_m": _PCB_HALF_WIDTH_M,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
         **_GRASP_CHECK_KWARGS,
+        **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
     return base
@@ -248,8 +306,8 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=0,
+                solver_position_iteration_count=8*4,
+                solver_velocity_iteration_count=2*4,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -279,8 +337,8 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(PCB_X, PCB_Y, PCB_Z),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=8,
-                solver_velocity_iteration_count=2,
+                solver_position_iteration_count=8*4,
+                solver_velocity_iteration_count=2*4,
                 max_depenetration_velocity=0.5,
                 max_linear_velocity=25.0,
                 max_angular_velocity=720.0,
@@ -300,7 +358,7 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
                 dynamic_friction=1.6,
                 restitution=0.0,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=10.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.1)),
         ),
         # Flat on conveyor; front edge 20 mm before slot (see ``_PCB_INIT_POS``).
@@ -344,6 +402,7 @@ class ActionsCfg:
         scale=1.0,
         use_default_offset=True,
     )
+    
     gripper_action = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["left_carriage_joint"],
@@ -370,6 +429,7 @@ class ObservationsCfg:
             params={
                 "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
                 "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+                **_gripper_kinematics_kwargs(),
             },
         )
         # 0 = closed, 1 = open — explicit signal to learn approach-then-close-then-push.
@@ -388,16 +448,23 @@ class ObservationsCfg:
                 "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
                 "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
                 "scale_m": 0.012,
+                **_gripper_kinematics_kwargs(),
             },
         )
         # |cos|: jaw opening axis ∥ PCB thickness; finger line ∥ PCB short edge (pinch 단변).
         pinch_orientation_cos = ObservationTermCfg(
             func=gripper_pinch_orientation_cos_obs,
+            params=_pinch_orient_obs_params(),
+        )
+        # Jaw mid vs trailing short-edge centre in PCB frame (along / width / thick).
+        trailing_edge_error = ObservationTermCfg(
+            func=gripper_trailing_edge_error_obs,
             params={
-                "pcb_cfg": SceneEntityCfg("pcb"),
-                "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
-                "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
-                "min_finger_sep_m": 0.006,
+                **_grasp_entity_params(
+                    scale_along_m=_HALF_LENGTH_M,
+                    scale_width_m=_PCB_HALF_WIDTH_M,
+                    scale_thick_m=0.050,
+                ),
             },
         )
     policy: PolicyCfg = PolicyCfg()
@@ -422,127 +489,33 @@ class _SafetyRewardsCfg:
 
 @configclass
 class RewardsGraspPhaseCfg(_SafetyRewardsCfg):
-    """Phase 1 — grasp trailing short-edge centre (no push / slot terms).
+    """Phase 1 — approach trailing short-edge centre only.
 
-    Core progress + closure, top/bottom straddle shaping, still PCB near the edge, and
-    penalties for both jaws on the board top or knocking the PCB before push.
+    No close, straddle, orientation, or success shaping (avoids reward hacking).
+    Train this stage first; add grasp terms in a later phase or fine-tune.
     """
 
-    ee_approach = RewardTermCfg(
-        func=ee_approach_progress_reward,
-        params=_grasp_distance_params(max_step_m=0.05),
+    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.0003)
+
+    trailing_edge_xy = RewardTermCfg(
+        func=gripper_trailing_edge_xy_proximity_shaping,
+        params=_grasp_distance_params(sigma_m=0.10, near_along_m=0.030, thick_couple_sigma_m=0.025),
+        weight=35.0,
+    )
+    ee_xy_approach = RewardTermCfg(
+        func=ee_xy_approach_progress_reward,
+        params=_grasp_distance_params(max_step_m=0.008),
+        weight=25.0,
+    )
+    edge_thickness_descent = RewardTermCfg(
+        func=gripper_trailing_edge_thickness_descent_progress,
+        params=_grasp_distance_params(
+            gate_dist_m=0.10,
+            near_along_m=0.030,
+            near_xy_min=0.30,
+            max_step_m=0.008,
+        ),
         weight=30.0,
-    )
-    ee_thickness_descent = RewardTermCfg(
-        func=ee_thickness_descent_progress_reward,
-        params=_grasp_entity_params(near_in_plane_m=0.035, max_step_m=0.004),
-        weight=20.0,
-    )
-    pinch_orientation = RewardTermCfg(
-        func=gripper_pinch_orientation_flat_edge_reward,
-        params={**_grasp_distance_params(gate_dist_m=0.08, min_finger_sep_m=0.006, max_thick_m=0.010)},
-        weight=6.0,
-    )
-    thickness_alignment = RewardTermCfg(
-        func=gripper_mid_thickness_plane_alignment_shaping,
-        params={**_grasp_distance_params(sigma_m=0.030, gate_dist_m=0.08, max_thick_m=0.010)},
-        weight=6.0,
-    )
-    fingers_straddle = RewardTermCfg(
-        func=gripper_fingers_thickness_straddle_shaping,
-        params={
-            **_grasp_entity_params(
-                pcb_half_thickness_m=PCB_Z * 0.5,
-                gate_dist_m=0.10,
-                min_sep_m=PCB_Z * 0.45,
-            ),
-        },
-        weight=12.0,
-    )
-    grasp_close_on_edge = RewardTermCfg(
-        func=grasp_short_edge_closure_reward,
-        params={
-            **_grasp_distance_params(
-                gripper_joint_cfg=_GRIPPER_JOINT,
-                open_width_m=_GRIPPER_OPEN_WIDTH_M,
-                gate_dist_m=0.10,
-                pcb_half_thickness_m=PCB_Z * 0.5,
-                above_sigma_m=0.004,
-                thickness_sigma_m=0.006,
-                min_finger_sep_m=0.006,
-            ),
-        },
-        weight=15.0,
-    )
-    grasp_success_bonus = RewardTermCfg(
-        func=grasp_success_bonus_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "gripper_joint_cfg": _GRIPPER_JOINT,
-            "half_length_m": _HALF_LENGTH_M,
-            "half_width_m": _PCB_HALF_WIDTH_M,
-            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-            **_GRASP_CHECK_KWARGS,
-        },
-        weight=40.0,
-    )
-    leading_edge_grasp = RewardTermCfg(
-        func=gripper_leading_edge_grasp_penalty,
-        params={**_grasp_entity_params(gate_dist_m=0.10)},
-        weight=-20.0,
-    )
-    both_fingers_above = RewardTermCfg(
-        func=gripper_both_fingers_above_pcb_penalty,
-        params={
-            **_grasp_entity_params(
-                pcb_half_thickness_m=PCB_Z * 0.5,
-                gate_dist_m=0.10,
-            ),
-        },
-        weight=-15.0,
-    )
-    top_face_strike = RewardTermCfg(
-        func=gripper_top_face_strike_penalty,
-        params={
-            **_grasp_entity_params(
-                gripper_joint_cfg=_GRIPPER_JOINT,
-                open_width_m=_GRIPPER_OPEN_WIDTH_M,
-                near_in_plane_m=0.035,
-                gate_dist_m=0.10,
-            ),
-        },
-        weight=-10.0,
-    )
-    pcb_motion = RewardTermCfg(
-        func=pcb_motion_until_grasp_penalty,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "gripper_joint_cfg": _GRIPPER_JOINT,
-            "half_length_m": _HALF_LENGTH_M,
-            "half_width_m": _PCB_HALF_WIDTH_M,
-            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-            "speed_scale_m_s": 0.03,
-            "ang_speed_scale_rad_s": 0.5,
-            "include_angular": True,
-            **_GRASP_CHECK_KWARGS,
-        },
-        weight=-20.0,
-    )
-    closed_below_pcb = RewardTermCfg(
-        func=closed_below_pcb_penalty,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "gripper_joint_cfg": _GRIPPER_JOINT,
-            "pcb_half_thickness_m": PCB_Z * 0.5,
-            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-        },
-        weight=-15.0,
     )
 
 
@@ -617,7 +590,7 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
     ee_thickness_descent = RewardTermCfg(
         func=ee_thickness_descent_progress_reward,
         params={**_grasp_entity_params(near_in_plane_m=0.035, max_step_m=0.004), "task_phase_gate": "grasp"},
-        weight=25.0,
+        weight=30.0,
     )
     short_edge_width_center = RewardTermCfg(
         func=gripper_short_edge_width_centering_shaping,
@@ -682,27 +655,32 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
                 gripper_joint_cfg=_GRIPPER_JOINT,
                 open_width_m=_GRIPPER_OPEN_WIDTH_M,
                 gate_dist_m=0.10,
-                pcb_half_thickness_m=PCB_Z * 0.5,
-                above_sigma_m=0.004,
                 thickness_sigma_m=0.006,
                 min_finger_sep_m=0.006,
+                min_straddle_sep_m=_MIN_STRADDLE_SEP_M,
+                straddle_sigma_m=0.002,
             ),
             "task_phase_gate": "grasp",
         },
-        weight=15.0,
+        weight=30.0,
+    )
+    close_before_straddle = RewardTermCfg(
+        func=premature_close_before_straddle_penalty,
+        params={
+            **_grasp_distance_params(
+                gripper_joint_cfg=_GRIPPER_JOINT,
+                open_width_m=_GRIPPER_OPEN_WIDTH_M,
+                gate_dist_m=0.10,
+                min_straddle_sep_m=_MIN_STRADDLE_SEP_M,
+            ),
+            "task_phase_gate": "grasp",
+        },
+        weight=-10.0,
     )
     pinch_orientation = RewardTermCfg(
         func=gripper_pinch_orientation_flat_edge_reward,
-        params={
-            **_grasp_distance_params(
-                gate_dist_m=0.06,
-                min_finger_sep_m=0.006,
-                max_thick_m=0.010,
-                thick_sigma_m=0.006,
-            ),
-            "task_phase_gate": "grasp",
-        },
-        weight=4.0,
+        params={**_pinch_orient_reward_params(), "task_phase_gate": "grasp"},
+        weight=18.0,
     )
     thickness_alignment = RewardTermCfg(
         func=gripper_mid_thickness_plane_alignment_shaping,
@@ -723,11 +701,13 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
             **_grasp_entity_params(
                 pcb_half_thickness_m=PCB_Z * 0.5,
                 gate_dist_m=0.10,
-                min_sep_m=PCB_Z * 0.45,
+                min_sep_m=_MIN_STRADDLE_SEP_M,
+                face_margin_m=0.0002,
+                face_sigma_m=0.0015,
             ),
             "task_phase_gate": "grasp",
         },
-        weight=12.0,
+        weight=28.0,
     )
     both_fingers_above = RewardTermCfg(
         func=gripper_both_fingers_above_pcb_penalty,
@@ -738,7 +718,7 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
             ),
             "task_phase_gate": "grasp",
         },
-        weight=-15.0,
+        weight=-22.0,
     )
     pcb_motion = RewardTermCfg(
         func=pcb_motion_until_grasp_penalty,
@@ -750,13 +730,13 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
             "half_length_m": _HALF_LENGTH_M,
             "half_width_m": _PCB_HALF_WIDTH_M,
             "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-            "speed_scale_m_s": 0.03,
-            "ang_speed_scale_rad_s": 0.5,
+            "speed_scale_m_s": 0.04,
+            "ang_speed_scale_rad_s": 0.6,
             "include_angular": True,
             "task_phase_gate": "grasp",
             **_GRASP_CHECK_KWARGS,
         },
-        weight=-20.0,
+        weight=-12.0,
     )
     open_face_rub_penalty = RewardTermCfg(
         func=gripper_open_push_face_rub_penalty,
@@ -778,10 +758,11 @@ class RewardsFullPhaseCfg(_SafetyRewardsCfg):
                 open_width_m=_GRIPPER_OPEN_WIDTH_M,
                 near_in_plane_m=0.035,
                 gate_dist_m=0.10,
+                strike_thick_m=0.003,
             ),
             "task_phase_gate": "grasp",
         },
-        weight=-12.0,
+        weight=-18.0,
     )
     vertical_bounce = RewardTermCfg(
         func=gripper_vertical_bounce_penalty,
@@ -920,6 +901,7 @@ class EventCfgPush:
             "rot_wxyz": _PCB_INIT_ROT_WXYZ,
             "velocity_scale": 0.0,
             "min_center_z_env_local": _PCB_CENTER_Z_ENV,
+            **_gripper_kinematics_kwargs(),
         },
     )
 
@@ -941,7 +923,7 @@ class TerminationsSharedCfg:
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
     pcb_tilt_excessive = TerminationTermCfg(
         func=pcb_tilt_beyond_limit,
-        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.30},
+        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.10},
     )
     pcb_long_axis_not_horizontal = TerminationTermCfg(
         func=pcb_long_axis_vertical_component_exceeds,
@@ -974,7 +956,7 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
     # Stricter than shared defaults; only active until edge-centre grasp is achieved.
     pcb_tilt_excessive = TerminationTermCfg(
         func=pcb_tilt_before_grasp_termination,
-        params={**_grasp_termination_params(max_tilt_penalty=0.005)},
+        params={**_grasp_termination_params(max_tilt_penalty=0.1)},
     )
     pcb_long_axis_not_horizontal = TerminationTermCfg(
         func=pcb_xy_plane_rotation_before_grasp_termination,
@@ -1001,6 +983,7 @@ class TerminationsPushCfg(TerminationsSharedCfg):
             "right_finger_cfg": _RIGHT_FINGER,
             "check_grasp_geometry": True,
             "min_height": 0.025,
+            **_gripper_kinematics_kwargs(),
         },
     )
 
@@ -1050,7 +1033,7 @@ class WidowXPcbGraspEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 10.0
+        self.episode_length_s = 8.0
 
 
 @configclass

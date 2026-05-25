@@ -84,22 +84,6 @@ python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-
 python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless --num_envs 4096
 ```
 
-Checkpoints go to separate folders: `logs/rl_games/WidowX_PCB_Grasp_RL/`, `WidowX_PCB_Push_RL/`, `WidowX_PCB_RL/`.
-
-If Isaac Sim startup is unstable on newer GPUs or drivers, prefer **headless** mode with safer renderer flags:
-
-```bash
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --headless --rendering_mode performance \
-  --kit_args "--/renderer/multiGpu/enabled=false --/renderer/multiGpu/autoEnable=false --/rtx/raytracing/cached/enabled=false"
-```
-
-Variant:
-
-```bash
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-v0 --video
-```
-
----
 
 ## Evaluate / play a trained policy
 
