@@ -23,9 +23,6 @@ WidowXPcbPPOCfg = {
                     "mu_activation": "None",
                     "sigma_activation": "None",
                     "mu_init": {"name": "default"},
-                    # Raised from -1.0 → -0.5 so the initial action std ≈ exp(-0.5) ≈ 0.61
-                    # (was exp(-1.0) ≈ 0.37).  More stochastic early exploration before the
-                    # policy hardens its approach trajectory.
                     "sigma_init": {"name": "const_initializer", "val": -0.5},
                     "fixed_sigma": False,
                 }
@@ -64,7 +61,6 @@ WidowXPcbPPOCfg = {
             # These are shown in TensorBoard scalar dashboards.
             "use_diagnostics": True,
 
-            # ✅ 추가: 에러의 원인인 어드밴티지 정규화 설정 추가
             "normalize_advantage": True,
             
             # Must match --num_envs argument passed to train.py.

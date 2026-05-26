@@ -13,6 +13,9 @@ import isaaclab.utils.math as math_utils
 from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 from isaaclab.managers import SceneEntityCfg
 
+# World push axis (must match ``PUSH_AXIS_WORLD`` in env cfg).
+_DEFAULT_PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
+
 # ---------------------------------------------------------
 # Gripper kinematics — body origins vs pad tips (wxai carriage offset)
 # ---------------------------------------------------------
@@ -78,6 +81,156 @@ def _gripper_tip_params(
     return {"tip_offset_m": tip_offset_m, "wrist_body_cfg": wrist_body_cfg}
 
 
+def _world_z_up_batch(env: ManagerBasedRLEnv, dtype: torch.dtype) -> torch.Tensor:
+    """Unit world +Z (vertical, normal to the env XY plane), shape ``(num_envs, 3)``."""
+    return torch.tensor((0.0, 0.0, 1.0), device=env.device, dtype=dtype).unsqueeze(0).expand(env.num_envs, 3)
+
+
+def _world_axis_batch(
+    env: ManagerBasedRLEnv,
+    axis_world: tuple[float, float, float],
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Unit axis in world frame, shape ``(num_envs, 3)``."""
+    ax = torch.tensor(axis_world, device=env.device, dtype=dtype)
+    ax = ax / torch.norm(ax).clamp(min=1e-6)
+    return ax.unsqueeze(0).expand(env.num_envs, 3)
+
+
+def _gripper_rail_unit_lr(
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unit jaw-rail direction (left→right) and separation norm."""
+    v = right - left
+    n = torch.norm(v, dim=-1)
+    u_lr = v / n.clamp(min=1e-6).unsqueeze(-1)
+    return u_lr, n
+
+
+def gripper_rail_align_world_z(
+    env: ManagerBasedRLEnv,
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    """``|dot(u_lr, world +Z)|`` in ``[0, 1]`` — jaw rail vertical (⊥ XY plane, top/bottom close)."""
+    u_lr, _ = _gripper_rail_unit_lr(left, right)
+    z_up = _world_z_up_batch(env, u_lr.dtype)
+    return torch.abs(torch.sum(u_lr * z_up, dim=-1))
+
+
+def gripper_rail_horizontal_component(
+    env: ManagerBasedRLEnv,
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> torch.Tensor:
+    """Horizontal fraction of jaw rail in ``[0, 1]`` — 1 when rail lies in the XY plane (wrong for pinch)."""
+    u_lr, _ = _gripper_rail_unit_lr(left, right)
+    return torch.sqrt(u_lr[:, 0] ** 2 + u_lr[:, 1] ** 2 + 1e-12).clamp(0.0, 1.0)
+
+
+def _gripper_top_bottom_near_gate(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float,
+    near_along_m: float,
+    width_weight: float,
+    tip_offset_m: float,
+    wrist_body_cfg: SceneEntityCfg | None,
+    min_finger_sep_m: float,
+    left: torch.Tensor,
+    right: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``near_xy`` gate and finger-separation ok mask shared by orientation rewards."""
+    _, n = _gripper_rail_unit_lr(left, right)
+    sep_ok = (n > float(min_finger_sep_m)).to(dtype=n.dtype)
+    near_xy, _, _ = _trailing_edge_xy_near_factor(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m=float(gate_dist_m),
+        near_along_m=near_along_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return near_xy, sep_ok
+
+
+def gripper_wrist_carriage_align_axis(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    tip_offset_m: float = 0.0,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """``|dot(u_wc, axis_world)|`` in ``[0, 1]`` — wrist→carriage mid parallel to push axis (+Y)."""
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return torch.ones(env.num_envs, device=env.device, dtype=torch.float32)
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    mid = 0.5 * (left + right)
+    d = mid - wrist
+    u_wc = d / torch.norm(d, dim=-1, keepdim=True).clamp(min=1e-6)
+    axis = _world_axis_batch(env, axis_world, u_wc.dtype)
+    return torch.abs(torch.sum(u_wc * axis, dim=-1))
+
+
+def _gripper_belt_corridor_x_bounds_env(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    origins: torch.Tensor,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    corridor_tip_offset_m: float = 0.0,
+    jaw_lateral_half_width_m: float = 0.010,
+    wrist_lateral_half_width_m: float = 0.012,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Conservative env-local X span and per-body Z for belt-corridor checks.
+
+    Samples ``gripper_left`` / ``gripper_right`` (optional distal offset) and ``link_6``,
+    then expands each point by a lateral half-width so the penalty matches collision meshes
+    that extend beyond body origins.
+
+    Returns ``x_lo, x_hi, z_left, z_right, z_wrist`` (``z_wrist`` is zeros when no wrist cfg).
+    """
+    robot = env.scene[left_finger_cfg.name]
+    left, right = gripper_finger_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        corridor_tip_offset_m,
+        wrist_body_cfg,
+    )
+    left_env = left - origins
+    right_env = right - origins
+    jaw_hw = float(jaw_lateral_half_width_m)
+
+    x_lo = torch.minimum(left_env[:, 0] - jaw_hw, right_env[:, 0] - jaw_hw)
+    x_hi = torch.maximum(left_env[:, 0] + jaw_hw, right_env[:, 0] + jaw_hw)
+    z_left = left_env[:, 2]
+    z_right = right_env[:, 2]
+    z_wrist = torch.zeros_like(z_left)
+
+    if wrist_body_cfg is not None and len(wrist_body_cfg.body_ids) > 0:
+        wrist_env = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]] - origins
+        w_hw = float(wrist_lateral_half_width_m)
+        x_lo = torch.minimum(x_lo, wrist_env[:, 0] - w_hw)
+        x_hi = torch.maximum(x_hi, wrist_env[:, 0] + w_hw)
+        z_wrist = wrist_env[:, 2]
+
+    return x_lo, x_hi, z_left, z_right, z_wrist
+
+
 # ---------------------------------------------------------
 # 관측 (Observations)
 # ---------------------------------------------------------
@@ -125,10 +278,6 @@ def pcb_body_axis_z_world(env: ManagerBasedRLEnv, pcb_cfg: SceneEntityCfg) -> to
     local_z = torch.tensor([0.0, 0.0, 1.0], device=env.device, dtype=q.dtype).unsqueeze(0).repeat(q.shape[0], 1)
     z_w = math_utils.quat_apply(q, local_z)
     return z_w / torch.norm(z_w, dim=-1, keepdim=True).clamp_min(1e-6)
-
-
-# World push axis for slot insertion (must match ``PUSH_AXIS_WORLD`` in env cfg).
-_DEFAULT_PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 
 
 def pcb_body_x_push_sign(
@@ -257,25 +406,6 @@ def _finger_thickness_offsets(
     w_left = torch.sum((left - pcb_pos) * z_w, dim=-1)
     w_right = torch.sum((right - pcb_pos) * z_w, dim=-1)
     return w_left, w_right
-
-
-def gripper_leading_edge_grasp_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for the jaw midpoint near the **leading** (slot-side) short edge during grasp."""
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
-    lead = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
-    dist = torch.norm(mid - lead, dim=-1)
-    near = torch.exp(-dist / (float(gate_dist_m) + 1e-9))
-    return _apply_task_phase_gate(env, near, task_phase_gate)
 
 
 def gripper_mid_to_pcb_trailing_edge_distance(
@@ -409,42 +539,8 @@ def gripper_trailing_edge_xy_proximity_shaping(
     return _apply_task_phase_gate(env, near_xy * height_couple, task_phase_gate)
 
 
-def gripper_trailing_edge_thickness_additive_shaping(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    near_along_m: float = 0.030,
-    thick_sigma_m: float = 0.025,
-    near_xy_min: float = 0.35,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Sustained thick proximity (additive stack layer 1): ``height_ok`` when XY-near.
-
-    Once ``near_xy >= near_xy_min``, returns full ``exp(-|thick|/σ)`` — not multiplied by
-    ``near_xy`` again (that lives in ``trailing_edge_xy``). Wider ``thick_sigma_m`` keeps
-    gradient alive from a hover height.
-    """
-    near_xy, _, abs_thick = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=gate_dist_m,
-        near_along_m=near_along_m,
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    height_ok = torch.exp(-abs_thick / (float(thick_sigma_m) + 1e-9))
-    xy_ready = (near_xy >= float(near_xy_min)).to(dtype=near_xy.dtype)
-    return _apply_task_phase_gate(env, xy_ready * height_ok, task_phase_gate)
+# Per-env previous |thick| for thickness descent progress (reset each episode).
+_EE_THICK_PREV: torch.Tensor | None = None
 
 
 def gripper_trailing_edge_thickness_descent_progress(
@@ -462,10 +558,10 @@ def gripper_trailing_edge_thickness_descent_progress(
     wrist_body_cfg: SceneEntityCfg | None = None,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Progress on ``|thick|`` when XY-near the trailing edge (additive stack layer 2).
+    """Progress on ``|thick|`` when XY-near the trailing edge.
 
-    Pays ``near_xy * clamp(prev_|thick| - |thick|, 0, max_step) / max_step`` so descent is
-    rewarded step-to-step once horizontal alignment is sufficient.
+    Pays ``near_xy * clamp(prev_|thick| - |thick|, 0, max_step) / max_step`` once horizontal
+    alignment is sufficient.
     """
     global _EE_THICK_PREV
 
@@ -498,140 +594,6 @@ def gripper_trailing_edge_thickness_descent_progress(
     return _apply_task_phase_gate(env, near_xy * xy_ready * progress / float(max_step_m), task_phase_gate)
 
 
-def gripper_trailing_edge_thick_excess_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    near_along_m: float = 0.030,
-    near_xy_min: float = 0.35,
-    max_thick_m: float = 0.008,
-    excess_sigma_m: float = 0.012,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for staying above the pinch plane once XY-aligned (linear excess above ``max_thick_m``).
-
-    Stronger than exponential hover at large heights — discourages slow upward drift while
-    horizontally near the trailing edge.
-    """
-    near_xy, _, abs_thick = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=gate_dist_m,
-        near_along_m=near_along_m,
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    xy_ready = (near_xy >= float(near_xy_min)).to(dtype=near_xy.dtype)
-    excess = torch.relu(abs_thick - float(max_thick_m))
-    penalty = 1.0 - torch.exp(-excess / (float(excess_sigma_m) + 1e-9))
-    return _apply_task_phase_gate(env, near_xy * xy_ready * penalty, task_phase_gate)
-
-
-def gripper_trailing_edge_thickness_ascent_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    near_along_m: float = 0.030,
-    near_xy_min: float = 0.35,
-    min_abs_thick_m: float = 0.006,
-    speed_scale_m_s: float = 0.025,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for upward jaw motion along PCB thickness when XY-near and already above the edge.
-
-    Uses instantaneous velocity (no shared progress buffer) so it pairs safely with descent progress.
-    """
-    near_xy, _, abs_thick = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=gate_dist_m,
-        near_along_m=near_along_m,
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    xy_ready = (near_xy >= float(near_xy_min)).to(dtype=near_xy.dtype)
-    above = (abs_thick >= float(min_abs_thick_m)).to(dtype=near_xy.dtype)
-
-    robot = env.scene[left_finger_cfg.name]
-    left_vel = robot.data.body_lin_vel_w[:, left_finger_cfg.body_ids[0]]
-    right_vel = robot.data.body_lin_vel_w[:, right_finger_cfg.body_ids[0]]
-    mid_vel = 0.5 * (left_vel + right_vel)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    v_up = torch.relu(torch.sum(mid_vel * z_w, dim=-1))
-    speed_norm = torch.clamp(v_up / (float(speed_scale_m_s) + 1e-9), 0.0, 1.0)
-    return _apply_task_phase_gate(env, near_xy * xy_ready * above * speed_norm, task_phase_gate)
-
-
-def gripper_short_edge_width_centering_shaping(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    half_width_m: float,
-    sigma_frac: float = 0.22,
-    gate_dist_m: float = 0.10,
-    max_thick_m: float = 0.012,
-    thick_sigma_m: float = 0.006,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Shaping in ``[0, 1]``: jaw centred on the short edge along body +Y."""
-    _, width, thick, _, edge_dist = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    sigma_w = float(half_width_m) * float(sigma_frac) + 1e-9
-    center = torch.exp(-torch.square(width / sigma_w))
-    near = torch.exp(-edge_dist / (float(gate_dist_m) + 1e-9))
-    height_gate = torch.exp(-torch.relu(torch.abs(thick) - float(max_thick_m)) / (float(thick_sigma_m) + 1e-9))
-    return _apply_task_phase_gate(env, center * near * height_gate, task_phase_gate)
-
-
-def gripper_short_edge_corner_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    half_width_m: float,
-    corner_frac: float = 0.45,
-    gate_dist_m: float = 0.10,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty in ``[0, 1]`` for hugging a short-edge corner (large ``|width|``)."""
-    _, width, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    hw = float(half_width_m) + 1e-9
-    near = torch.exp(-edge_dist / (float(gate_dist_m) + 1e-9))
-    corner = torch.relu(torch.abs(width) / hw - float(corner_frac))
-    out = near * torch.clamp(corner / (1.0 - float(corner_frac) + 1e-9), 0.0, 1.0)
-    return _apply_task_phase_gate(env, out, task_phase_gate)
-
-
 def grasp_edge_center_achieved(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -652,6 +614,7 @@ def grasp_edge_center_achieved(
     min_straddle_sep_m: float = 0.0012,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """True when the gripper has a valid closed pinch on the trailing short-edge centre."""
     dist = gripper_mid_to_pcb_trailing_edge_distance(
@@ -679,6 +642,7 @@ def grasp_edge_center_achieved(
         half_length_m,
         thickness_sigma_m=thickness_sigma_m,
         min_finger_sep_m=min_finger_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     w_left, w_right = _finger_thickness_offsets(env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg)
@@ -706,6 +670,7 @@ def task_phase_transition_step(
     min_straddle_sep_m: float = 0.0012,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """Side-effect reward (return 0): advance grasp → push when :func:`grasp_edge_center_achieved`."""
     phase = _ensure_task_phase(env)
@@ -729,6 +694,7 @@ def task_phase_transition_step(
         min_finger_sep_m=min_finger_sep_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
         min_straddle_sep_m=min_straddle_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     phase[:] = torch.where((phase == 0) & achieved, torch.ones_like(phase), phase)
@@ -755,6 +721,7 @@ def grasp_success_bonus_reward(
     min_straddle_sep_m: float = 0.0012,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Bonus (1.0) on steps where a valid edge-centre grasp is achieved; for grasp-only training."""
@@ -776,6 +743,7 @@ def grasp_success_bonus_reward(
         min_finger_sep_m=min_finger_sep_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
         min_straddle_sep_m=min_straddle_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     bonus = achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
@@ -800,7 +768,7 @@ def ee_xy_approach_progress_reward(
 ) -> torch.Tensor:
     """Progress reward for moving closer in **XY only** to the trailing short-edge centre.
 
-    Ignores thickness offset so Z descent is not double-counted with ``ee_thickness_descent_progress_reward``.
+    Ignores thickness offset so Z descent is not double-counted with ``gripper_trailing_edge_thickness_descent_progress``.
     """
     global _EE_XY_APPROACH_PREV_DIST
 
@@ -835,8 +803,9 @@ def gripper_pinch_readiness(
     min_finger_sep_m: float = 0.006,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Soft readiness in ``[0, 1]`` for closing: thickness alignment × pinch orientation."""
+    """Soft readiness in ``[0, 1]`` for closing: thickness + jaw rail + wrist→carriage alignment."""
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
     left, right = gripper_finger_tips_world(
@@ -849,734 +818,70 @@ def gripper_pinch_readiness(
 
     v = right - left
     n = torch.norm(v, dim=-1)
-    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
-    u_lr = v / safe_n
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    y_w = pcb_body_axis_y_world(env, pcb_cfg)
-    open_est = torch.cross(x_w, u_lr, dim=-1)
-    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
-    open_est = open_est / no
-    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
-    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
+    rail_align_z = gripper_rail_align_world_z(env, left, right)
+    wc_align = gripper_wrist_carriage_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        tip_offset_m,
+        push_axis_world,
+    )
     sep_ok = (n > min_finger_sep_m).to(dtype=v.dtype)
-    return thickness_ok * align_open * align_finger * sep_ok
+    return thickness_ok * rail_align_z * wc_align * sep_ok
 
 
-def gripper_fingers_thickness_straddle_shaping(
+def gripper_jaw_belt_corridor_penalty(
     env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    pcb_half_thickness_m: float = 0.00125,
-    gate_dist_m: float = 0.10,
-    min_sep_m: float = 0.0015,
-    sep_sigma_m: float = 0.001,
-    face_margin_m: float = 0.0005,
-    face_sigma_m: float = 0.001,
-    tip_offset_m: float = 0.0,
+    corridor_x_min_env: float,
+    corridor_x_max_env: float,
+    belt_surface_z_env: float,
+    height_z_max_env: float,
+    height_z_min_env: float | None = None,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    corridor_tip_offset_m: float = 0.0,
+    jaw_lateral_half_width_m: float = 0.010,
+    wrist_lateral_half_width_m: float = 0.012,
+    overflow_sigma_m: float = 0.008,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Shaping in ``[0, 1]``: one jaw above and one below the mid-thickness plane near the edge.
+    """Penalty when gripper collision volume protrudes outside the side-belt corridor in world X.
 
-    Rewards opposite signs of ``w_left`` / ``w_right`` (body +Z offsets from PCB centre) and
-    separation spanning at least ``min_sep_m`` — the geometry needed for a top/bottom pinch rather
-    than both pads hovering on the board top.
+    Uses jaw bodies (optional distal offset), ``link_6``, and lateral half-width margins so
+    the reward tracks collision meshes — not just ``gripper_left`` / ``gripper_right`` origins.
+    Active in a vertical band over the belt gap. Returns a value in ``[0, 1]``.
     """
-    w_left, w_right = _finger_thickness_offsets(env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg)
-    opposite = (w_left * w_right < 0).to(dtype=w_left.dtype)
-    sep = torch.abs(w_left - w_right)
-    sep_ok = torch.exp(-torch.relu(float(min_sep_m) - sep) / (float(sep_sigma_m) + 1e-9))
-
-    hz = float(pcb_half_thickness_m)
-    sig = float(face_sigma_m) + 1e-9
-    m = float(face_margin_m)
-    top_bottom = torch.sigmoid((w_left - hz + m) / sig) * torch.sigmoid((-w_right - hz + m) / sig)
-    bottom_top = torch.sigmoid((w_right - hz + m) / sig) * torch.sigmoid((-w_left - hz + m) / sig)
-    faces = torch.maximum(top_bottom, bottom_top)
-
-    near_xy, _, _ = _trailing_edge_xy_near_factor(
+    origins = env.scene.env_origins
+    x_lo, x_hi, z_left, z_right, z_wrist = _gripper_belt_corridor_x_bounds_env(
         env,
-        pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        tip_offset_m=tip_offset_m,
+        origins,
         wrist_body_cfg=wrist_body_cfg,
+        corridor_tip_offset_m=corridor_tip_offset_m,
+        jaw_lateral_half_width_m=jaw_lateral_half_width_m,
+        wrist_lateral_half_width_m=wrist_lateral_half_width_m,
     )
-    return _apply_task_phase_gate(env, opposite * sep_ok * faces * near_xy, task_phase_gate)
-
-
-def gripper_both_fingers_above_pcb_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    pcb_half_thickness_m: float = 0.00125,
-    gate_dist_m: float = 0.10,
-    above_sigma_m: float = 0.001,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty when **both** jaw tips sit above the PCB top face near the trailing short edge."""
-    w_left, w_right = _finger_thickness_offsets(env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg)
-    hz = float(pcb_half_thickness_m)
-    sig = float(above_sigma_m) + 1e-9
-    above_l = torch.sigmoid((w_left - hz) / sig)
-    above_r = torch.sigmoid((w_right - hz) / sig)
-    both_above = above_l * above_r
-
-    near_xy, _, _ = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
+    overflow = torch.relu(float(corridor_x_min_env) - x_lo) + torch.relu(
+        x_hi - float(corridor_x_max_env)
     )
-    return _apply_task_phase_gate(env, both_above * near_xy, task_phase_gate)
+    corridor_violation = 1.0 - torch.exp(-overflow / (float(overflow_sigma_m) + 1e-9))
 
+    z_min = float(height_z_min_env) if height_z_min_env is not None else float(belt_surface_z_env) - 0.015
+    z_max = float(height_z_max_env)
 
-def gripper_hover_above_edge_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    near_along_m: float = 0.025,
-    hover_thick_m: float = 0.003,
-    thick_sigma_m: float = 0.012,
-    min_straddle_sep_m: float = 0.0012,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Continuous penalty for hovering above the pinch plane near the trailing edge without straddling.
+    def _in_height_band(z: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid((z - z_min) / 0.008) * (1.0 - torch.sigmoid((z - z_max) / 0.012))
 
-    Unlike progress-only descent rewards, this fires every step while ``|thick|`` stays above
-    ``hover_thick_m`` and the jaws have not split across the board thickness.
-    """
-    near_xy, _, abs_thick = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        near_along_m=near_along_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg
+    in_height = torch.maximum(
+        _in_height_band(z_left),
+        torch.maximum(_in_height_band(z_right), _in_height_band(z_wrist)),
     )
 
-    straddled = (w_left * w_right < 0) & (torch.abs(w_left - w_right) >= float(min_straddle_sep_m))
-    not_straddled = (~straddled).to(dtype=near_xy.dtype)
+    return _apply_task_phase_gate(env, corridor_violation * in_height, task_phase_gate)
 
-    excess = torch.relu(abs_thick - float(hover_thick_m))
-    hover_exp = 1.0 - torch.exp(-excess / (float(thick_sigma_m) + 1e-9))
-    hover_lin = torch.clamp(excess / (float(thick_sigma_m) + 1e-9), 0.0, 1.0)
-    hover = torch.maximum(hover_exp, hover_lin)
-    return _apply_task_phase_gate(env, near_xy * not_straddled * hover, task_phase_gate)
-
-
-def pcb_motion_near_grasp_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.12,
-    speed_scale_m_s: float = 0.04,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for PCB linear speed while the gripper is near the trailing edge (pre-push stillness)."""
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, width_weight=width_weight, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    near = torch.exp(-dist / (float(gate_dist_m) + 1e-9))
-    pcb = env.scene[pcb_cfg.name]
-    speed = torch.norm(pcb.data.root_lin_vel_w, dim=-1)
-    speed_norm = torch.square(speed / (float(speed_scale_m_s) + 1e-9))
-    return _apply_task_phase_gate(env, near * speed_norm, task_phase_gate)
-
-
-def pcb_motion_until_grasp_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    half_width_m: float,
-    open_width_m: float,
-    closed_threshold: float = 0.35,
-    gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
-    min_pinch_ready: float = 0.40,
-    width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
-    speed_scale_m_s: float = 0.03,
-    ang_speed_scale_rad_s: float = 0.5,
-    include_angular: bool = True,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for PCB linear (and optional angular) speed until a valid edge-centre grasp."""
-    pcb = env.scene[pcb_cfg.name]
-    speed_norm = torch.square(torch.norm(pcb.data.root_lin_vel_w, dim=-1) / (float(speed_scale_m_s) + 1e-9))
-    if include_angular:
-        speed_norm = speed_norm + torch.square(
-            torch.norm(pcb.data.root_ang_vel_w, dim=-1) / (float(ang_speed_scale_rad_s) + 1e-9)
-        )
-    achieved = grasp_edge_center_achieved(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        gripper_joint_cfg,
-        half_length_m,
-        half_width_m,
-        open_width_m,
-        closed_threshold=closed_threshold,
-        gate_dist_m=gate_dist_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-    )
-    penalty = speed_norm * (~achieved).float()
-    return _apply_task_phase_gate(env, penalty, task_phase_gate)
-
-
-def grasp_short_edge_closure_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float = 0.044,
-    gate_dist_m: float = 0.07,
-    pcb_half_thickness_m: float = 0.00125,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    min_straddle_sep_m: float = 0.0012,
-    straddle_sigma_m: float = 0.001,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Reward **closing** when near the trailing edge with jaws straddling the board thickness.
-
-    Returns ``closure * gate * straddle_gate * pinch_soft`` in ``[0, 1]``.
-    ``pinch_soft = 0.25 + 0.75 * pinch_ready`` so partial closure is rewarded once straddle
-    geometry is roughly aligned.
-    """
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closure = torch.clamp(1.0 - gq / open_width_m, 0.0, 1.0)
-    near_xy, _, _ = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    gate = near_xy
-
-    w_left, w_right = _finger_thickness_offsets(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    opposite = (w_left * w_right < 0).to(dtype=w_left.dtype)
-    sep = torch.abs(w_left - w_right)
-    straddle_gate = opposite * torch.exp(
-        -torch.relu(float(min_straddle_sep_m) - sep) / (float(straddle_sigma_m) + 1e-9)
-    )
-
-    pinch_ready = gripper_pinch_readiness(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-    )
-    # Generous floor so closing while straddled pays even if orientation is still imperfect.
-    pinch_soft = 0.55 + 0.45 * pinch_ready
-
-    return _apply_task_phase_gate(env, closure * gate * straddle_gate * pinch_soft, task_phase_gate)
-
-
-def gripper_mid_thickness_plane_alignment_shaping(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    sigma_m: float = 0.012,
-    half_length_m: float | None = None,
-    gate_dist_m: float | None = None,
-    max_thick_m: float = 0.010,
-    thick_sigma_m: float = 0.006,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Shaping: 1 when jaw midpoint lies on the PCB **mid-thickness** plane (ideal top/bottom pinch).
-
-    Parallel jaws should straddle the thin board; ``dot(mid - pcb_center, body+Z)`` should be ~0.
-
-    Optional trailing-edge gate: when ``half_length_m`` and ``gate_dist_m`` are provided the
-    reward is multiplied by ``exp(-d / gate_dist_m)`` where ``d`` is the distance to the trailing
-    edge face center.  This prevents the large PCB top surface from becoming an attractive well —
-    thickness alignment only pays off near the short edge where we actually want to pinch.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
-    alignment = torch.exp(-torch.abs(w) / sigma_m)
-
-    if half_length_m is not None and gate_dist_m is not None:
-        dist = gripper_mid_to_pcb_trailing_edge_distance(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            width_weight=width_weight,
-            **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-        )
-        alignment = alignment * torch.exp(-dist / gate_dist_m)
-        _, _, thick, _, _ = _gripper_mid_trailing_edge_errors(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-        )
-        height_gate = torch.exp(-torch.relu(torch.abs(thick) - float(max_thick_m)) / (float(thick_sigma_m) + 1e-9))
-        alignment = alignment * height_gate
-
-    return _apply_task_phase_gate(env, alignment, task_phase_gate)
-
-
-def gripper_open_push_face_rub_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float = 0.044,
-    plane_band_m: float = 0.032,
-    thickness_band_m: float = 0.004,
-    pcb_half_thickness_m: float = 0.00125,
-    above_sigma_m: float = 0.003,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for **open** gripper side-rubbing the push face at rail height (not top-down descent).
-
-    Suppressed when the jaw midpoint is above the PCB top face so top-down open approach is not
-    penalised.  High when: open, near push-face plane, near mid-thickness, and not above the board.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    w_coord = torch.sum((mid - pcb_pos) * z_w, dim=-1)
-    sign = pcb_body_x_push_sign(env, pcb_cfg)
-    d_plane = torch.abs(torch.sum((mid - pcb_pos) * x_w, dim=-1) + sign * float(half_length_m))
-    gq = env.scene[gripper_joint_cfg.name].data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
-    rub_plane = torch.exp(-d_plane / plane_band_m)
-    rub_thick = torch.exp(-torch.abs(w_coord) / (thickness_band_m + 1e-6))
-    # No side-rub penalty while descending from above the board top.
-    not_top_down = 1.0 - torch.sigmoid((w_coord - pcb_half_thickness_m) / above_sigma_m)
-    out = open_norm * rub_plane * rub_thick * not_top_down
-    return _apply_task_phase_gate(env, out, task_phase_gate)
-
-
-def premature_close_at_edge_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float = 0.010,
-    gate_dist_m: float = 0.10,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    partial_close_threshold: float = 0.35,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for closing (or partially closing) near the edge before pinch geometry is ready.
-
-    Returns ``closed * near_gate * (1 - pinch_ready)`` in ``[0, 1]``.
-    """
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, width_weight=width_weight, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
-    closed = torch.clamp(1.0 - open_norm / (partial_close_threshold + 1e-6), 0.0, 1.0)
-    near_gate = torch.exp(-dist / gate_dist_m)
-    pinch_ready = gripper_pinch_readiness(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-    )
-    return _apply_task_phase_gate(env, closed * near_gate * (1.0 - pinch_ready), task_phase_gate)
-
-
-def premature_close_before_straddle_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float = 0.010,
-    gate_dist_m: float = 0.10,
-    min_straddle_sep_m: float = 0.0012,
-    partial_close_threshold: float = 0.35,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for closing near the trailing edge **before** jaws straddle the board thickness.
-
-    Discourages pinching down on the board top; closure is only safe once one jaw is above
-    and one below the mid-thickness plane.
-    """
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, width_weight=width_weight, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    open_norm = torch.clamp(gq / open_width_m, 0.0, 1.0)
-    closed = torch.clamp(1.0 - open_norm / (partial_close_threshold + 1e-6), 0.0, 1.0)
-    near_gate = torch.exp(-dist / gate_dist_m)
-
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg
-    )
-    straddled = (w_left * w_right < 0) & (torch.abs(w_left - w_right) >= float(min_straddle_sep_m))
-    not_straddled = (~straddled).to(dtype=closed.dtype)
-
-    return _apply_task_phase_gate(env, closed * near_gate * not_straddled, task_phase_gate)
-
-
-def gripper_trailing_edge_height_shaping(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.10,
-    near_along_m: float = 0.025,
-    thick_sigma_m: float = 0.010,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Deprecated alias: use :func:`gripper_trailing_edge_thickness_additive_shaping`."""
-    return gripper_trailing_edge_thickness_additive_shaping(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=gate_dist_m,
-        near_along_m=near_along_m,
-        thick_sigma_m=thick_sigma_m,
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-        task_phase_gate=task_phase_gate,
-    )
-
-
-# Per-env previous |thick| for thickness descent progress (reset each episode).
-_EE_THICK_PREV: torch.Tensor | None = None
-
-
-def ee_thickness_descent_progress_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    near_in_plane_m: float = 0.035,
-    near_along_m: float = 0.025,
-    max_step_m: float = 0.004,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Progress reward for lowering the jaw toward the short-edge pinch plane when XY-near the edge.
-
-    Gated on ``|along|`` so descent is **not** rewarded at the leading (slot-side) short edge —
-    ``in_plane`` alone is ~0 at both short edges.
-    """
-    global _EE_THICK_PREV
-
-    along, _, thick, in_plane, _ = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    abs_thick = torch.abs(thick)
-    along_gate = _trailing_edge_along_gate(along, near_along_m)
-    near = along_gate * torch.exp(-in_plane / (float(near_in_plane_m) + 1e-9))
-
-    if (
-        _EE_THICK_PREV is None
-        or _EE_THICK_PREV.shape[0] != abs_thick.shape[0]
-        or _EE_THICK_PREV.device != abs_thick.device
-    ):
-        _EE_THICK_PREV = abs_thick.clone()
-        return torch.zeros_like(abs_thick)
-
-    first_step = env.episode_length_buf == 1
-    _EE_THICK_PREV = torch.where(first_step, abs_thick, _EE_THICK_PREV)
-    progress = (_EE_THICK_PREV - abs_thick).clamp(0.0, float(max_step_m))
-    _EE_THICK_PREV = abs_thick.clone()
-    return _apply_task_phase_gate(env, near * progress / float(max_step_m), task_phase_gate)
-
-
-def gripper_top_face_strike_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float,
-    near_in_plane_m: float = 0.035,
-    near_along_m: float = 0.025,
-    gate_dist_m: float = 0.10,
-    strike_thick_m: float = 0.008,
-    strike_sigma_m: float = 0.004,
-    min_open_fraction: float = 0.65,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for an **open** gripper hovering or tapping over the board top near the trailing edge."""
-    along, _, thick, in_plane, edge_dist = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    along_gate = _trailing_edge_along_gate(along, near_along_m)
-    near_xy = along_gate * torch.exp(-in_plane / (float(near_in_plane_m) + 1e-9))
-    near_edge = torch.exp(-edge_dist / (float(gate_dist_m) + 1e-9))
-    above_pinch = 1.0 - torch.exp(
-        -torch.relu(torch.abs(thick) - float(strike_thick_m)) / (float(strike_sigma_m) + 1e-9)
-    )
-
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    open_norm = torch.clamp(gq / float(open_width_m), 0.0, 1.0)
-    open_ok = (open_norm >= float(min_open_fraction)).to(dtype=open_norm.dtype)
-
-    out = near_xy * near_edge * above_pinch * open_ok
-    return _apply_task_phase_gate(env, out, task_phase_gate)
-
-
-def gripper_vertical_bounce_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float,
-    near_in_plane_m: float = 0.035,
-    near_along_m: float = 0.025,
-    gate_dist_m: float = 0.10,
-    speed_scale_m_s: float = 0.06,
-    min_open_fraction: float = 0.65,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for large vertical jaw speed while open and XY-near the trailing edge (Z oscillation)."""
-    near_xy, _, _ = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        near_along_m=near_along_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-
-    robot = env.scene[left_finger_cfg.name]
-    left_vel = robot.data.body_lin_vel_w[:, left_finger_cfg.body_ids[0]]
-    right_vel = robot.data.body_lin_vel_w[:, right_finger_cfg.body_ids[0]]
-    mid_vel = 0.5 * (left_vel + right_vel)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    v_thick = torch.abs(torch.sum(mid_vel * z_w, dim=-1))
-    speed_norm = torch.clamp(v_thick / (float(speed_scale_m_s) + 1e-9), 0.0, 1.0)
-
-    gq = env.scene[gripper_joint_cfg.name].data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    open_norm = torch.clamp(gq / float(open_width_m), 0.0, 1.0)
-    open_ok = (open_norm >= float(min_open_fraction)).to(dtype=open_norm.dtype)
-
-    out = near_xy * speed_norm * open_ok
-    return _apply_task_phase_gate(env, out, task_phase_gate)
-
-
-def closed_below_pcb_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    pcb_half_thickness_m: float = 0.00125,
-    open_width_m: float = 0.010,
-    sigma_below_m: float = 0.005,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty when the gripper is **closed** and the jaw midpoint is **below the PCB bottom face**.
-
-    Directly penalises the "close and dig under" failure mode. The penalty scales with how
-    closed the gripper is and how far the jaw has sunk below the PCB bottom surface.
-    Returns a value in ``[0, 1]``.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
-
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
-    # depth_below > 0 only when jaw mid sinks below the PCB bottom face
-    depth_below = torch.relu(-(w + pcb_half_thickness_m))
-    below_signal = 1.0 - torch.exp(-depth_below / sigma_below_m)
-
-    robot_art = env.scene[gripper_joint_cfg.name]
-    gq = robot_art.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closed_norm = torch.clamp(1.0 - gq / open_width_m, 0.0, 1.0)
-
-    return _apply_task_phase_gate(env, closed_norm * below_signal, task_phase_gate)
-
-
-def gripper_along_board_slip_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    near_cross_m: float = 0.025,
-    near_along_m: float = 0.025,
-    along_sigma_m: float = 0.035,
-    near_edge_gate_m: float = 0.14,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for sliding along the PCB long axis near the trailing-edge line (Y scrape between rails)."""
-    along, _, _, in_plane, edge_dist = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    on_trailing = _trailing_edge_along_gate(along, near_along_m)
-    on_board_line = on_trailing * torch.exp(-in_plane / (near_cross_m + 1e-9))
-    along_slip = 1.0 - torch.exp(-torch.abs(along) / (along_sigma_m + 1e-9))
-    near_edge = torch.exp(-edge_dist / (near_edge_gate_m + 1e-9))
-    return _apply_task_phase_gate(env, on_board_line * along_slip * near_edge, task_phase_gate)
-
-
-def gripper_mid_long_axis_speed_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gate_dist_m: float = 0.14,
-    speed_scale_m_s: float = 0.08,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """Penalty for jaw midpoint speed along the PCB long axis before pinch-ready (Y swing)."""
-    robot = env.scene[left_finger_cfg.name]
-    left = robot.data.body_pos_w[:, left_finger_cfg.body_ids[0]]
-    right = robot.data.body_pos_w[:, right_finger_cfg.body_ids[0]]
-    left_vel = robot.data.body_lin_vel_w[:, left_finger_cfg.body_ids[0]]
-    right_vel = robot.data.body_lin_vel_w[:, right_finger_cfg.body_ids[0]]
-    mid_vel = 0.5 * (left_vel + right_vel)
-    long_axis = pcb_body_axis_x_world(env, pcb_cfg)
-    v_along = torch.abs(torch.sum(mid_vel * long_axis, dim=-1))
-
-    _, _, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-    near = torch.exp(-edge_dist / (gate_dist_m + 1e-9))
-    ready = gripper_pinch_readiness(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-    )
-    speed_norm = torch.clamp(v_along / (speed_scale_m_s + 1e-9), 0.0, 1.0)
-    return _apply_task_phase_gate(env, speed_norm * near * (1.0 - ready), task_phase_gate)
 
 
 def gripper_mid_thickness_offset_obs(
@@ -1629,58 +934,175 @@ def gripper_trailing_edge_error_obs(
     )
 
 
-def gripper_pinch_orientation_flat_edge_reward(
+
+def gripper_jaw_rail_vertical_shaping(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float = 0.12,
+    near_along_m: float = 0.030,
     min_finger_sep_m: float = 0.006,
-    max_thick_m: float = 0.010,
-    thick_sigma_m: float = 0.006,
-    min_gate: float = 0.0,
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Near the short-edge / push-face target, reward a **rail-parallel pinch** pose (top/bottom grasp).
+    """Shaping ``[0, 1]``: reward jaw rail parallel to world +Z (top/bottom thickness close).
 
-    Ideal geometry (board flat, long axis ∥ rail / body +X):
-    - **Finger span** ``normalize(right - left)`` ∥ PCB **short edge** (body +Y) so pads straddle the
-      thin board in thickness.
-    - **Opening direction** estimated as ``normalize(cross(body+X, finger_span))`` ∥ body +Z so jaws
-      open along thickness (same as ``pcb_body_axis_z_world``).
-
-    Gated by distance to the push-face center. ``min_gate > 0`` keeps a partial orientation signal
-    during long-range approach so wrist roll/yaw can align before XY convergence.
+    Carriage must **not** stay level (∥ XY); the left↔right rail is rolled vertical so fingers
+    straddle PCB thickness.
     """
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, width_weight=width_weight, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    v = right - left
-    n = torch.norm(v, dim=-1)
-    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
-    u_lr = v / safe_n
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    y_w = pcb_body_axis_y_world(env, pcb_cfg)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    open_est = torch.cross(x_w, u_lr, dim=-1)
-    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
-    open_est = open_est / no
-    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
-    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
-    sep_ok = (n > min_finger_sep_m).to(dtype=v.dtype)
-    gate = float(min_gate) + (1.0 - float(min_gate)) * torch.exp(-dist / gate_dist_m)
-    _, _, thick, _, _ = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
+    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m,
+        near_along_m,
+        width_weight,
+        tip_offset_m,
+        wrist_body_cfg,
+        min_finger_sep_m,
+        left,
+        right,
     )
-    height_gate = torch.exp(-torch.relu(torch.abs(thick) - float(max_thick_m)) / (float(thick_sigma_m) + 1e-9))
-    return _apply_task_phase_gate(env, align_open * align_finger * sep_ok * gate * height_gate, task_phase_gate)
+    rail_z = gripper_rail_align_world_z(env, left, right)
+    return _apply_task_phase_gate(env, rail_z * sep_ok * near_xy, task_phase_gate)
+
+
+def gripper_wrist_carriage_push_axis_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float = 0.12,
+    near_along_m: float = 0.030,
+    min_finger_sep_m: float = 0.006,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Shaping ``[0, 1]``: reward wrist (``link_6``) → carriage mid parallel to push axis (+Y)."""
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m,
+        near_along_m,
+        width_weight,
+        tip_offset_m,
+        wrist_body_cfg,
+        min_finger_sep_m,
+        left,
+        right,
+    )
+    wc_y = gripper_wrist_carriage_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        tip_offset_m,
+        push_axis_world,
+    )
+    return _apply_task_phase_gate(env, wc_y * sep_ok * near_xy, task_phase_gate)
+
+
+def gripper_jaw_rail_horizontal_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float = 0.12,
+    near_along_m: float = 0.030,
+    min_finger_sep_m: float = 0.006,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Penalty ``[0, 1]``: jaw rail lying in the XY plane (level carriage / width-pinch pose)."""
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m,
+        near_along_m,
+        width_weight,
+        tip_offset_m,
+        wrist_body_cfg,
+        min_finger_sep_m,
+        left,
+        right,
+    )
+    horiz = gripper_rail_horizontal_component(env, left, right)
+    return _apply_task_phase_gate(env, horiz * sep_ok * near_xy, task_phase_gate)
+
+
+# Backward-compatible alias (deprecated name — use split terms above).
+def gripper_fingers_perpendicular_to_trailing_edge_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float = 0.12,
+    near_along_m: float = 0.030,
+    min_finger_sep_m: float = 0.006,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Combined orientation: ``jaw_rail_vertical * wrist_carriage_push`` (legacy single term)."""
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m,
+        near_along_m,
+        width_weight,
+        tip_offset_m,
+        wrist_body_cfg,
+        min_finger_sep_m,
+        left,
+        right,
+    )
+    rail_z = gripper_rail_align_world_z(env, left, right)
+    wc_y = gripper_wrist_carriage_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        tip_offset_m,
+        push_axis_world,
+    )
+    return _apply_task_phase_gate(env, rail_z * wc_y * sep_ok * near_xy, task_phase_gate)
 
 
 def gripper_pinch_orientation_cos_obs(
@@ -1691,28 +1113,24 @@ def gripper_pinch_orientation_cos_obs(
     min_finger_sep_m: float = 0.006,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Two cosines in [0, 1]: opening∥thickness, finger-span∥short-edge.
-
-    Uses a soft finger-separation scale so alignment is visible before the jaws are fully open.
-    """
+    """Two scalars in ``[0, 1]``: jaw rail ∥ +Z, wrist→carriage ∥ push (+Y); sep-scaled."""
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    v = right - left
-    n = torch.norm(v, dim=-1)
-    safe_n = n.clamp(min=1e-6).unsqueeze(-1)
-    u_lr = v / safe_n
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    y_w = pcb_body_axis_y_world(env, pcb_cfg)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    open_est = torch.cross(x_w, u_lr, dim=-1)
-    no = torch.norm(open_est, dim=-1).clamp(min=1e-6).unsqueeze(-1)
-    open_est = open_est / no
-    align_open = torch.abs(torch.sum(open_est * z_w, dim=-1))
-    align_finger = torch.abs(torch.sum(u_lr * y_w, dim=-1))
+    _, n = _gripper_rail_unit_lr(left, right)
+    rail_z = gripper_rail_align_world_z(env, left, right)
+    wc_y = gripper_wrist_carriage_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        tip_offset_m,
+        push_axis_world,
+    )
     sep_soft = torch.clamp(n / (float(min_finger_sep_m) + 1e-9), 0.0, 1.0)
-    return torch.stack([align_open * sep_soft, align_finger * sep_soft], dim=-1)
+    return torch.stack([rail_z * sep_soft, wc_y * sep_soft], dim=-1)
 
 
 def gripper_opening_normalized(
@@ -1794,53 +1212,6 @@ def pcb_leading_edge_insertion_proximity_reward(
     dist = torch.norm(lead_env - tgt, dim=-1)
     return _apply_task_phase_gate(env, torch.exp(-dist / (float(sigma_m) + 1e-9)), task_phase_gate)
 
-
-# Per-env previous EE distance used by the progress reward (reset each episode).
-_EE_APPROACH_PREV_DIST: torch.Tensor | None = None
-
-
-def ee_approach_progress_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    max_step_m: float = 0.05,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
-) -> torch.Tensor:
-    """**Progress-only** approach reward: fires only when the EE is getting *closer* to the PCB.
-
-    Returns ``clamp(prev_dist - curr_dist, 0, max_step_m) / max_step_m`` ∈ [0, 1].
-    When hovering (distance unchanged) or moving away the reward is exactly 0, which
-    prevents the hover-exploit cycle that the Gaussian form is susceptible to.
-
-    The previous distance is reset to the current distance on the first step of each
-    episode (``episode_length_buf == 1``), so resets are handled cleanly.
-    """
-    global _EE_APPROACH_PREV_DIST
-
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, width_weight=width_weight, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
-    )
-
-    if (
-        _EE_APPROACH_PREV_DIST is None
-        or _EE_APPROACH_PREV_DIST.shape[0] != dist.shape[0]
-        or _EE_APPROACH_PREV_DIST.device != dist.device
-    ):
-        _EE_APPROACH_PREV_DIST = dist.clone()
-        return torch.zeros_like(dist)
-
-    first_step = env.episode_length_buf == 1
-    # On the first step of an episode, reset prev_dist so we don't reward the teleport.
-    _EE_APPROACH_PREV_DIST = torch.where(first_step, dist, _EE_APPROACH_PREV_DIST)
-
-    progress = (_EE_APPROACH_PREV_DIST - dist).clamp(0.0, float(max_step_m))
-    _EE_APPROACH_PREV_DIST = dist.clone()
-    return _apply_task_phase_gate(env, progress / float(max_step_m), task_phase_gate)
 
 
 def pcb_insertion_depth_reward(
@@ -2022,6 +1393,7 @@ def _grasp_not_yet_achieved(
     min_straddle_sep_m: float = 0.0012,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """True while a valid edge-centre grasp has **not** been achieved."""
     return ~grasp_edge_center_achieved(
@@ -2042,6 +1414,7 @@ def _grasp_not_yet_achieved(
         min_finger_sep_m=min_finger_sep_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
         min_straddle_sep_m=min_straddle_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
 
@@ -2068,6 +1441,7 @@ def pcb_tilt_before_grasp_termination(
     max_tilt_penalty: float = 0.01,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """Terminate on excessive thickness-axis tilt (board not flat) **before** grasp success."""
     tilt_fail = pcb_tilt_beyond_limit(env, pcb_cfg, world_up=world_up, max_tilt_penalty=max_tilt_penalty)
@@ -2089,6 +1463,7 @@ def pcb_tilt_before_grasp_termination(
         min_finger_sep_m=min_finger_sep_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
         min_straddle_sep_m=min_straddle_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     return tilt_fail & pre_grasp
@@ -2116,6 +1491,7 @@ def pcb_xy_plane_rotation_before_grasp_termination(
     min_xy_alignment: float = 0.97,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """Terminate on excessive long-axis yaw in the XY plane **before** grasp success."""
     yaw_fail = pcb_long_axis_xy_rotation_exceeds(
@@ -2139,6 +1515,7 @@ def pcb_xy_plane_rotation_before_grasp_termination(
         min_finger_sep_m=min_finger_sep_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
         min_straddle_sep_m=min_straddle_sep_m,
+        push_axis_world=push_axis_world,
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     return yaw_fail & pre_grasp
