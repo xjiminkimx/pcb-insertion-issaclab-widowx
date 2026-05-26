@@ -31,7 +31,6 @@ Recommended training order: **Grasp → Push → (optional) Full** fine-tune.
 | `usd_model/` | Unified asset root: `usd_env/` contains fixture USDs and conversion sources, and `usd_robot/` contains robot USD bundles. |
 | `mdp_custom.py` | Custom MDP terms (regularization, rail reset, drop detection). |
 | `agents/` | PPO config (`WidowXPcbPPOCfg` in `rl_games_ppo_cfg.py`), log-std safety helper, TensorBoard monitor script. |
-| `jetcobot_assets/` | URDF/USD/meshes (legacy / alternate robot assets). |
 
 A local `trossen_ai_isaac/` directory (if present) is intentionally **not** tracked: it is a separate clone with its own `.git`. Track it as a **submodule** or symlink if your workflow depends on it.
 
@@ -168,25 +167,3 @@ Tune **`pcb_tilt_excessive`**, **`pcb_long_axis_not_horizontal`**, **`pcb_fallen
 1. In `RewardsCfg`, balance insertion / push terms vs **`action_rate_penalty`**.
 2. In PPO (`agents/rl_games_ppo_cfg.py`), raise **entropy** slightly or decay it more slowly if the policy collapses early.
 3. Log **per-term rewards** in TensorBoard if available, to see which term is flat.
-
----
-
-## Troubleshooting
-
-- **GPU / RTX Blackwell (RTX 5080, 5090, 5060 Ti, …) — segfault at startup (`librtx.scenedb.plugin`, `libcarb.scenerenderer-rtx`, ~2–4 s):** This is usually **Kit + Vulkan + RTX** on a **driver or GPU generation** combination Isaac Sim was not validated against yet — not a broken CUDA install if `nvidia-smi` works.
-  1. Train **headless** and use the direct `train.py` command with the `--kit_args` line in the Train section above.
-  2. Install the **NVIDIA driver branch** listed for your **Isaac Sim version** in NVIDIA’s release notes / download page. Community reports often show **580.x** working when **595+** crashes on Blackwell; pick the validated branch before chasing application bugs.
-  3. Avoid the **GUI** path while debugging (`./isaac-sim.sh` without headless); it pulls a heavier RTX path.
-  4. If it still crashes, try **Isaac Sim / Isaac Lab updates** (patch releases often add Blackwell fixes) or ask on [NVIDIA Isaac Sim forums](https://forums.developer.nvidia.com/c/omniverse/simulation/69) with your **Kit log**, **driver version**, and **GPU model**.
-
-- **Body name errors:** Match `SceneEntityCfg("robot", body_names=...)` to link names in your robot asset — **WidowX:** `gripper_left`, `gripper_right`.
-- **Penetration at reset:** Slightly increase vertical `pos_offset`, soften edge offsets, or check gripper initial opening.
-
----
-
-## Quick workflow
-
-1. Match `_MAG_*` / `_PCB_INIT_*` to your combined USD (in the env cfg for the task you train).
-2. Add rail-forward rewards and success criteria as needed.
-3. Train `Isaac-WidowX-PCB-v0` and monitor TensorBoard.
-4. Tune reset and termination thresholds if needed.
