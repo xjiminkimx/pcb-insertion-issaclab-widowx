@@ -4,12 +4,11 @@ from __future__ import annotations
 
 Two-phase task design:
   Phase 1 (Grasp):  approach + pinch the trailing short-edge **centre**.
-  Phase 2 (Push):   slide the grasped PCB along world +Y into the magazine slot.
+  Phase 2 (Insert): slide the grasped PCB along world +Y into the magazine slot.
 
 Registered variants (see ``__init__.py``):
   - ``Isaac-WidowX-PCB-Grasp-v0``  — phase 1 only (train grasp first)
-  - ``Isaac-WidowX-PCB-Push-v0``   — phase 2 only (reset with PCB snapped to closed jaws)
-  - ``Isaac-WidowX-PCB-v0``        — both phases in one episode (gated rewards)
+  - ``Isaac-WidowX-PCB-Insert-v0`` — phase 2 only (reset with PCB snapped to closed jaws)
 """
 
 import os
@@ -46,12 +45,10 @@ from .mdp_custom import (
     gripper_wrist_carriage_push_axis_shaping,
     gripper_jaw_rail_horizontal_penalty,
     pcb_insertion_depth_reward,
-    task_phase_transition_step,
     grasp_edge_center_achieved,
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
     reset_robot_joints_to_values,
-    reset_task_phase_on_reset,
     snap_pcb_root_to_short_edge_grasp,
     pcb_dropped_from_gripper,
     pcb_root_height_below_env_minimum,
@@ -108,7 +105,7 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
 # Base on -X beside the conveyor.
-_ROBOT_BASE_POS = (-0.25, -0.25, 0.02)
+_ROBOT_BASE_POS = (-0.17, -0.20, 0.02)
 _ROBOT_HOME_JOINT_POS = {
     "joint_0": -0.3,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
     "joint_1": 0.9,    # shoulder pitch down — smaller than 1.2 to reach forward/up
@@ -118,8 +115,8 @@ _ROBOT_HOME_JOINT_POS = {
     "joint_5": -0.8,    # wrist yaw — face toward conveyor (+Y approach)
     "left_carriage_joint": 0.010,  # open
 }
-# Push-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
-_PUSH_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": 0.002}
+# Insert-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
+_INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": 0.002}
 # Must match the joint value when the gripper is fully open (same as left_carriage_joint above).
 _GRIPPER_OPEN_WIDTH_M = 0.010
 
@@ -147,7 +144,7 @@ _BELT_CORRIDOR_TIP_OFFSET_M = 0.015
 # ---------------------------------------------------------------------------
 _PCB_FRONT_EDGE_GAP_M = 0.020      # front edge (toward +Y) this far before slot mouth
 # Nudge spawn toward slot so the arm is not fully stretched at the trailing edge.
-_PCB_INIT_Y_OFFSET_M = -0.150
+_PCB_INIT_Y_OFFSET_M = -0.075
 
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
@@ -239,7 +236,7 @@ def _grasp_distance_params(**extra) -> dict:
 
 def _grasp_orientation_base_params(**extra) -> dict:
     """Near-edge gate kwargs for top/bottom orientation rewards (no push axis)."""
-    base = _grasp_distance_params(gate_dist_m=0.12, near_along_m=0.030, min_finger_sep_m=0.006)
+    base = _grasp_distance_params(gate_dist_m=0.12, min_finger_sep_m=0.006)
     base.update(extra)
     return base
 
@@ -498,7 +495,7 @@ class RewardsGraspPhaseCfg():
     jaw_rail_vertical = RewardTermCfg(
         func=gripper_jaw_rail_vertical_shaping,
         params=_grasp_orientation_base_params(),
-        weight=30.0,
+        weight=1000.0,
     )
     wrist_carriage_push = RewardTermCfg(
         func=gripper_wrist_carriage_push_axis_shaping,
@@ -518,15 +515,15 @@ class RewardsGraspPhaseCfg():
 
 
 @configclass
-class RewardsPushPhaseCfg(_SafetyRewardsCfg):
-    """Phase 2 — push grasped PCB along +Y into the slot."""
+class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
+    """Phase 2 — insert grasped PCB along +Y into the slot."""
 
     insert_axis_align = RewardTermCfg(
         func=pcb_long_axis_parallel_to_push_reward,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
         weight=2.0,
     )
-    push_y_toward_slot = RewardTermCfg(
+    insert_y_toward_slot = RewardTermCfg(
         func=pcb_lin_vel_y_toward_lead_target_y,
         params={
             "pcb_cfg": _PCB_ENT,
@@ -560,108 +557,6 @@ class RewardsPushPhaseCfg(_SafetyRewardsCfg):
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
         weight=-2.5,
     )
-
-
-@configclass
-class RewardsFullPhaseCfg(_SafetyRewardsCfg):
-    """Both phases — grasp stack matches :class:`RewardsGraspPhaseCfg` (gated), then push terms."""
-
-    task_phase_step = RewardTermCfg(
-        func=task_phase_transition_step,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "gripper_joint_cfg": _GRIPPER_JOINT,
-            "half_length_m": _HALF_LENGTH_M,
-            "half_width_m": _PCB_HALF_WIDTH_M,
-            "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-            **_GRASP_CHECK_KWARGS,
-        },
-        weight=0.0,
-    )
-    trailing_edge_proximity = RewardTermCfg(
-        func=gripper_trailing_edge_proximity_shaping,
-        params={
-            **_grasp_distance_params(sigma_m=0.10, near_along_m=0.030),
-            "task_phase_gate": "grasp",
-        },
-        weight=40.0,
-    )
-    trailing_edge_approach = RewardTermCfg(
-        func=gripper_trailing_edge_approach_progress,
-        params={
-            **_grasp_distance_params(near_along_m=0.030, max_step_m=0.008),
-            "task_phase_gate": "grasp",
-        },
-        weight=50.0,
-    )
-    jaw_rail_vertical = RewardTermCfg(
-        func=gripper_jaw_rail_vertical_shaping,
-        params={**_grasp_orientation_base_params(), "task_phase_gate": "grasp"},
-        weight=30.0,
-    )
-    wrist_carriage_push = RewardTermCfg(
-        func=gripper_wrist_carriage_push_axis_shaping,
-        params={**_grasp_orientation_params(), "task_phase_gate": "grasp"},
-        weight=25.0,
-    )
-    jaw_rail_horizontal = RewardTermCfg(
-        func=gripper_jaw_rail_horizontal_penalty,
-        params={**_grasp_orientation_base_params(), "task_phase_gate": "grasp"},
-        weight=-20.0,
-    )
-    grasp_success_bonus = RewardTermCfg(
-        func=grasp_success_bonus_reward,
-        params={**_grasp_termination_params(), "task_phase_gate": "grasp"},
-        weight=60.0,
-    )
-    push_y_toward_slot = RewardTermCfg(
-        func=pcb_lin_vel_y_toward_lead_target_y,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "target_lead_y_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV[1],
-            "task_phase_gate": "push",
-        },
-        weight=35.0,
-    )
-    insert_axis_align = RewardTermCfg(
-        func=pcb_long_axis_parallel_to_push_reward,
-        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD, "task_phase_gate": "push"},
-        weight=2.0,
-    )
-    insertion_proximity = RewardTermCfg(
-        func=pcb_leading_edge_insertion_proximity_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "target_lead_xyz_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV,
-            "sigma_m": 0.06,
-            "task_phase_gate": "push",
-        },
-        weight=6.0,
-    )
-    insertion_depth = RewardTermCfg(
-        func=pcb_insertion_depth_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
-            "max_depth_m": 0.20,
-            "task_phase_gate": "push",
-        },
-        weight=50.0,
-    )
-    lateral_slide_penalty = RewardTermCfg(
-        func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
-        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD, "task_phase_gate": "push"},
-        weight=-2.5,
-    )
-
-
-# Backward-compatible aliases for the full two-phase task.
-RewardsCfg = RewardsFullPhaseCfg
 
 
 @configclass
@@ -691,7 +586,7 @@ class EventCfgGrasp:
 
 
 @configclass
-class EventCfgPush:
+class EventCfgInsert:
     """Phase 2 reset: arm at home with closed gripper, PCB kinematically snapped to jaws."""
 
     reset_robot_grasp_hold = EventTermCfg(
@@ -699,7 +594,7 @@ class EventCfgPush:
         mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
-            "joint_positions": _PUSH_INIT_JOINT_POS,
+            "joint_positions": _INSERT_INIT_JOINT_POS,
             "velocity_scale": 0.0,
             "use_current_joint_pos": False,
         },
@@ -718,16 +613,6 @@ class EventCfgPush:
             **_gripper_kinematics_kwargs(),
         },
     )
-
-
-@configclass
-class EventCfgFull(EventCfgGrasp):
-    """Full task reset plus per-episode phase buffer."""
-
-    reset_task_phase = EventTermCfg(func=reset_task_phase_on_reset, mode="reset", params={})
-
-
-EventCfg = EventCfgFull
 
 
 @configclass
@@ -786,8 +671,8 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
 
 
 @configclass
-class TerminationsPushCfg(TerminationsSharedCfg):
-    """Push phase: stricter drop check once the policy should hold the board."""
+class TerminationsInsertCfg(TerminationsSharedCfg):
+    """Insert phase: stricter drop check once the policy should hold the board."""
 
     pcb_dropped = TerminationTermCfg(
         func=pcb_dropped_from_gripper,
@@ -800,9 +685,6 @@ class TerminationsPushCfg(TerminationsSharedCfg):
             **_gripper_kinematics_kwargs(),
         },
     )
-
-
-TerminationsCfg = TerminationsSharedCfg
 
 
 @configclass
@@ -851,26 +733,13 @@ class WidowXPcbGraspEnvCfg(_WidowXPcbEnvCfgBase):
 
 
 @configclass
-class WidowXPcbPushEnvCfg(_WidowXPcbEnvCfgBase):
-    """Phase 2 only: learn to push a pre-grasped PCB into the slot (+Y)."""
+class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
+    """Phase 2 only: learn to insert a pre-grasped PCB into the slot (+Y)."""
 
-    rewards: RewardsPushPhaseCfg = RewardsPushPhaseCfg()
-    events: EventCfgPush = EventCfgPush()
-    terminations: TerminationsPushCfg = TerminationsPushCfg()
+    rewards: RewardsInsertPhaseCfg = RewardsInsertPhaseCfg()
+    events: EventCfgInsert = EventCfgInsert()
+    terminations: TerminationsInsertCfg = TerminationsInsertCfg()
 
     def __post_init__(self):
         super().__post_init__()
         self.episode_length_s = 12.0
-
-
-@configclass
-class WidowXPcbEnvCfg(_WidowXPcbEnvCfgBase):
-    """Full two-phase task in one episode (grasp rewards → push rewards after edge grasp)."""
-
-    rewards: RewardsFullPhaseCfg = RewardsFullPhaseCfg()
-    events: EventCfgFull = EventCfgFull()
-    terminations: TerminationsSharedCfg = TerminationsSharedCfg()
-
-    def __post_init__(self):
-        super().__post_init__()
-        self.episode_length_s = 15.0

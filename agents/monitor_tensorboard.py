@@ -3,10 +3,10 @@
 
 Usage:
     python3 monitor_tensorboard.py
-    python3 monitor_tensorboard.py --logdir /path/to/logs --port 6006
+    python3 monitor_tensorboard.py --logdir /path/to/IsaacLab/logs --port 6006
 
 This helper script avoids typing long TensorBoard commands repeatedly and
-prints a short checklist of useful loss/diagnostic tags to monitor.
+prints WidowX-specific run paths plus useful scalar tags to monitor.
 """
 
 from __future__ import annotations
@@ -16,6 +16,12 @@ import os
 import subprocess
 import sys
 
+# Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
+WIDOWX_RL_RUNS = (
+    ("Grasp", "WidowX_PCB_Grasp_RL/widowx_pcb_grasp/summaries"),
+    ("Insert", "WidowX_PCB_Insert_RL/widowx_pcb_insert/summaries"),
+)
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Launch TensorBoard for rl-games logs.")
@@ -23,7 +29,7 @@ def parse_args() -> argparse.Namespace:
         "--logdir",
         type=str,
         default="logs",
-        help="Root directory that contains IsaacLab/rl-games training logs.",
+        help="Isaac Lab logs root (typically <IsaacLab>/logs).",
     )
     parser.add_argument("--port", type=int, default=6006, help="TensorBoard HTTP port.")
     parser.add_argument(
@@ -39,17 +45,15 @@ def _find_existing_logdir(user_logdir: str) -> str | None:
     """Resolve a usable log directory from current workspace layout.
 
     Priority:
-    1) user-provided path as-is
-    2) user-provided path relative to cwd
-    3) nearest ancestor directory that contains a `logs/` folder
+    1) user-provided path as-is (absolute or relative to cwd)
+    2) walk upward from cwd and try "<ancestor>/<user_logdir>" and "<ancestor>/logs"
     """
-    candidates = []
+    candidates: list[str] = []
     if os.path.isabs(user_logdir):
         candidates.append(user_logdir)
     else:
         candidates.append(os.path.abspath(user_logdir))
 
-    # Walk upward from cwd and try "<ancestor>/<user_logdir>" and "<ancestor>/logs".
     cwd = os.getcwd()
     current = cwd
     while True:
@@ -60,31 +64,86 @@ def _find_existing_logdir(user_logdir: str) -> str | None:
             break
         current = parent
 
+    seen: set[str] = set()
     for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
         if os.path.isdir(path):
             return os.path.abspath(path)
     return None
 
 
+def _is_widowx_package_cwd() -> bool:
+    return os.path.basename(os.getcwd()) == "widowx_pcb"
+
+
+def _find_widowx_summary_dirs(logdir: str) -> list[tuple[str, str]]:
+    """Return (phase_label, absolute_summaries_path) for runs that exist on disk."""
+    found: list[tuple[str, str]] = []
+    for phase, rel in WIDOWX_RL_RUNS:
+        summaries = os.path.join(logdir, "rl_games", rel)
+        if os.path.isdir(summaries):
+            found.append((phase, summaries))
+    return found
+
+
+def _print_cwd_hint() -> None:
+    if not _is_widowx_package_cwd():
+        return
+    print("[HINT] Current directory is the widowx_pcb package folder.")
+    print("       Train from the Isaac Lab root (directory containing scripts/)")
+    print("       so logs land in <IsaacLab>/logs/rl_games/...")
+    print("       Pass --logdir /path/to/IsaacLab/logs if auto-detection picks the wrong folder.")
+    print()
+
+
+def _print_run_paths(logdir: str) -> None:
+    found = _find_widowx_summary_dirs(logdir)
+    print("[INFO] WidowX PCB run folders (relative to logdir):")
+    for phase, rel in WIDOWX_RL_RUNS:
+        summaries = os.path.join(logdir, "rl_games", rel)
+        if os.path.isdir(summaries):
+            status = "found"
+            n_events = len([f for f in os.listdir(summaries) if f.startswith("events.out.tfevents")])
+            extra = f" ({n_events} event file{'s' if n_events != 1 else ''})"
+        else:
+            status = "not found (train this phase first)"
+            extra = ""
+        print(f"       {phase:5}  rl_games/{rel}  [{status}]{extra}")
+    print()
+    if not found:
+        print("[WARN] No WidowX summary folders under this logdir yet.")
+        print("       Start training, then re-run this script.")
+        print()
+
+
 def main() -> int:
     args = parse_args()
+    _print_cwd_hint()
     logdir = _find_existing_logdir(args.logdir)
 
     if logdir is None:
         print(f"[ERROR] Could not find a valid log directory for: {args.logdir}")
-        print("Run training first or pass an explicit --logdir (example: --logdir /home/<user>/Documents/IsaacLab/logs).")
+        print("Run training first or pass an explicit --logdir")
+        print("(example: --logdir /home/<user>/Documents/IsaacLab/logs).")
         return 1
 
     print(f"[INFO] Launching TensorBoard")
     print(f"       logdir: {logdir}")
     print(f"       url:    http://{args.host}:{args.port}")
     print()
-    print("[TIP] Useful scalars to watch:")
+    _print_run_paths(logdir)
+    print("[TIP] Useful scalars to watch in the TensorBoard UI:")
+    print("      - episodic reward (rl-games rewards tag)")
     print("      - policy loss / actor loss")
     print("      - value loss / critic loss")
     print("      - entropy")
     print("      - KL / approx_kl")
-    print("      - episodic reward")
+    print()
+    print("[TIP] Run selector names in TensorBoard:")
+    print("      - WidowX_PCB_Grasp_RL  (phase 1 grasp)")
+    print("      - WidowX_PCB_Insert_RL   (phase 2 insert)")
     print()
 
     cmd = [

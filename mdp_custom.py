@@ -2,10 +2,8 @@
 
 Observation helpers, push/grasp shaping, regularization, rail reset, and drop detection.
 
-Two-phase task support (grasp edge centre → push +Y into slot):
-  - Standalone grasp / push envs use separate reward configs (no gating).
-  - Full env gates rewards with ``task_phase_gate`` (``"grasp"`` | ``"push"``) and
-    :func:`task_phase_transition_step` to advance after :func:`grasp_edge_center_achieved`.
+Grasp and insert are separate registered envs (``Isaac-WidowX-PCB-Grasp-v0``,
+``Isaac-WidowX-PCB-Insert-v0``); each uses its own reward config with no in-episode phase gating.
 """
 
 import torch
@@ -136,7 +134,6 @@ def _gripper_top_bottom_near_gate(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float,
-    near_along_m: float,
     width_weight: float,
     tip_offset_m: float,
     wrist_body_cfg: SceneEntityCfg | None,
@@ -144,22 +141,25 @@ def _gripper_top_bottom_near_gate(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``near`` gate (3D proximity to trailing edge) and finger-separation ok mask."""
+    """3D proximity gate to trailing-edge centre and finger-separation ok mask.
+
+    Uses ``exp(-dist / gate_dist_m)`` only — no separate along-axis gate (orientation
+    rewards are already gated by 3D distance to the edge centre).
+    """
     _, n = _gripper_rail_unit_lr(left, right)
     sep_ok = (n > float(min_finger_sep_m)).to(dtype=n.dtype)
-    near_xy, _, _ = _trailing_edge_xy_near_factor(
+    dist, _, _, _ = _trailing_edge_weighted_distance(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        gate_dist_m=float(gate_dist_m),
-        near_along_m=near_along_m,
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-    return near_xy, sep_ok
+    near = torch.exp(-dist / (float(gate_dist_m) + 1e-9))
+    return near, sep_ok
 
 
 def gripper_wrist_carriage_align_axis(
@@ -317,37 +317,6 @@ def pcb_leading_short_edge_center_w(
     x_w = pcb_body_axis_x_world(env, pcb_cfg)
     sign = pcb_body_x_push_sign(env, pcb_cfg, axis_world)
     return pcb.data.root_pos_w + sign.unsqueeze(-1) * float(half_length_m) * x_w
-
-
-# ---------------------------------------------------------------------------
-# Two-phase task state (grasp → push), per parallel env
-# ---------------------------------------------------------------------------
-_TASK_PHASE: torch.Tensor | None = None  # 0 = grasp, 1 = push
-
-
-def _ensure_task_phase(env: ManagerBasedRLEnv) -> torch.Tensor:
-    global _TASK_PHASE
-    if _TASK_PHASE is None or _TASK_PHASE.shape[0] != env.num_envs or _TASK_PHASE.device != env.device:
-        _TASK_PHASE = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
-    return _TASK_PHASE
-
-
-def reset_task_phase_on_reset(env: ManagerBasedRLEnv, env_ids: torch.Tensor) -> None:
-    """Event (mode=reset): set task phase back to grasp for reset envs."""
-    phase = _ensure_task_phase(env)
-    phase[env_ids] = 0
-
-
-def _apply_task_phase_gate(
-    env: ManagerBasedRLEnv,
-    reward: torch.Tensor,
-    task_phase_gate: str | None,
-) -> torch.Tensor:
-    if task_phase_gate is None:
-        return reward
-    phase = _ensure_task_phase(env)
-    phase_id = 0 if task_phase_gate == "grasp" else 1
-    return reward * (phase == phase_id).to(reward.dtype)
 
 
 def _gripper_mid_trailing_edge_errors(
@@ -551,7 +520,6 @@ def gripper_trailing_edge_proximity_shaping(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Dense shaping in ``[0, 1]``: exponential proximity to the trailing edge centre in 3D."""
     near, _, _ = _trailing_edge_near_factor(
@@ -566,7 +534,7 @@ def gripper_trailing_edge_proximity_shaping(
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-    return _apply_task_phase_gate(env, near, task_phase_gate)
+    return near
 
 
 # Per-env previous 3D distance to trailing-edge target (reset each episode).
@@ -584,7 +552,6 @@ def gripper_trailing_edge_approach_progress(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Progress reward for moving closer in 3D to the trailing short-edge face centre."""
     global _EE_TRAILING_EDGE_PREV_DIST
@@ -613,7 +580,7 @@ def gripper_trailing_edge_approach_progress(
     _EE_TRAILING_EDGE_PREV_DIST = torch.where(first_step, dist, _EE_TRAILING_EDGE_PREV_DIST)
     progress = (_EE_TRAILING_EDGE_PREV_DIST - dist).clamp(0.0, float(max_step_m))
     _EE_TRAILING_EDGE_PREV_DIST = dist.clone()
-    return _apply_task_phase_gate(env, along_gate * progress / float(max_step_m), task_phase_gate)
+    return along_gate * progress / float(max_step_m)
 
 
 def gripper_trailing_edge_xy_proximity_shaping(
@@ -628,7 +595,6 @@ def gripper_trailing_edge_xy_proximity_shaping(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_proximity_shaping` (3D target)."""
     return gripper_trailing_edge_proximity_shaping(
@@ -642,7 +608,6 @@ def gripper_trailing_edge_xy_proximity_shaping(
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
-        task_phase_gate=task_phase_gate,
     )
 
 
@@ -659,7 +624,6 @@ def gripper_trailing_edge_thickness_descent_progress(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
     return gripper_trailing_edge_approach_progress(
@@ -673,7 +637,6 @@ def gripper_trailing_edge_thickness_descent_progress(
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
-        task_phase_gate=task_phase_gate,
     )
 
 
@@ -688,7 +651,7 @@ def grasp_edge_center_achieved(
     open_width_m: float,
     closed_threshold: float = 0.35,
     gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
+    width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
     width_weight: float = 3.0,
     thickness_sigma_m: float = 0.006,
@@ -733,56 +696,6 @@ def grasp_edge_center_achieved(
     return closed & near & centered & (pinch >= float(min_pinch_ready)) & straddled
 
 
-def task_phase_transition_step(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    half_width_m: float,
-    open_width_m: float,
-    closed_threshold: float = 0.35,
-    gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
-    min_pinch_ready: float = 0.55,
-    width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-) -> torch.Tensor:
-    """Side-effect reward (return 0): advance grasp → push when :func:`grasp_edge_center_achieved`."""
-    phase = _ensure_task_phase(env)
-    first = env.episode_length_buf == 1
-    phase[:] = torch.where(first, torch.zeros_like(phase), phase)
-    achieved = grasp_edge_center_achieved(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        gripper_joint_cfg,
-        half_length_m,
-        half_width_m,
-        open_width_m,
-        closed_threshold=closed_threshold,
-        gate_dist_m=gate_dist_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        push_axis_world=push_axis_world,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
-    )
-    phase[:] = torch.where((phase == 0) & achieved, torch.ones_like(phase), phase)
-    return torch.zeros(env.num_envs, device=env.device, dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
-
 
 def grasp_success_bonus_reward(
     env: ManagerBasedRLEnv,
@@ -795,7 +708,7 @@ def grasp_success_bonus_reward(
     open_width_m: float,
     closed_threshold: float = 0.35,
     gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
+    width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
     width_weight: float = 3.0,
     thickness_sigma_m: float = 0.006,
@@ -805,7 +718,6 @@ def grasp_success_bonus_reward(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Bonus (1.0) on steps where a valid edge-centre grasp is achieved; for grasp-only training."""
     achieved = grasp_edge_center_achieved(
@@ -830,7 +742,7 @@ def grasp_success_bonus_reward(
         **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
     )
     bonus = achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
-    return _apply_task_phase_gate(env, bonus, task_phase_gate)
+    return bonus
 
 
 # Deprecated alias — kept for old env cfgs / checkpoints logging names.
@@ -847,7 +759,6 @@ def ee_xy_approach_progress_reward(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
     return gripper_trailing_edge_approach_progress(
@@ -860,7 +771,6 @@ def ee_xy_approach_progress_reward(
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
-        task_phase_gate=task_phase_gate,
     )
 
 
@@ -916,7 +826,6 @@ def gripper_jaw_belt_corridor_penalty(
     jaw_lateral_half_width_m: float = 0.010,
     wrist_lateral_half_width_m: float = 0.012,
     overflow_sigma_m: float = 0.008,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Penalty when gripper collision volume protrudes outside the side-belt corridor in world X.
 
@@ -951,7 +860,7 @@ def gripper_jaw_belt_corridor_penalty(
         torch.maximum(_in_height_band(z_right), _in_height_band(z_wrist)),
     )
 
-    return _apply_task_phase_gate(env, corridor_violation * in_height, task_phase_gate)
+    return corridor_violation * in_height
 
 
 
@@ -1013,12 +922,10 @@ def gripper_jaw_rail_vertical_shaping(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float = 0.12,
-    near_along_m: float = 0.030,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Shaping ``[0, 1]``: reward jaw rail parallel to world +Z (top/bottom thickness close).
 
@@ -1028,14 +935,13 @@ def gripper_jaw_rail_vertical_shaping(
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+    near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
         gate_dist_m,
-        near_along_m,
         width_weight,
         tip_offset_m,
         wrist_body_cfg,
@@ -1044,7 +950,7 @@ def gripper_jaw_rail_vertical_shaping(
         right,
     )
     rail_z = gripper_rail_align_world_z(env, left, right)
-    return _apply_task_phase_gate(env, rail_z * sep_ok * near_xy, task_phase_gate)
+    return rail_z * sep_ok * near
 
 
 def gripper_wrist_carriage_push_axis_shaping(
@@ -1054,26 +960,23 @@ def gripper_wrist_carriage_push_axis_shaping(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float = 0.12,
-    near_along_m: float = 0.030,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Shaping ``[0, 1]``: reward wrist (``link_6``) → carriage mid parallel to push axis (+Y)."""
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+    near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
         gate_dist_m,
-        near_along_m,
         width_weight,
         tip_offset_m,
         wrist_body_cfg,
@@ -1089,7 +992,7 @@ def gripper_wrist_carriage_push_axis_shaping(
         tip_offset_m,
         push_axis_world,
     )
-    return _apply_task_phase_gate(env, wc_y * sep_ok * near_xy, task_phase_gate)
+    return wc_y * sep_ok * near
 
 
 def gripper_jaw_rail_horizontal_penalty(
@@ -1099,25 +1002,22 @@ def gripper_jaw_rail_horizontal_penalty(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float = 0.12,
-    near_along_m: float = 0.030,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Penalty ``[0, 1]``: jaw rail lying in the XY plane (level carriage / width-pinch pose)."""
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+    near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
         gate_dist_m,
-        near_along_m,
         width_weight,
         tip_offset_m,
         wrist_body_cfg,
@@ -1126,7 +1026,7 @@ def gripper_jaw_rail_horizontal_penalty(
         right,
     )
     horiz = gripper_rail_horizontal_component(env, left, right)
-    return _apply_task_phase_gate(env, horiz * sep_ok * near_xy, task_phase_gate)
+    return horiz * sep_ok * near
 
 
 # Backward-compatible alias (deprecated name — use split terms above).
@@ -1137,26 +1037,23 @@ def gripper_fingers_perpendicular_to_trailing_edge_shaping(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     gate_dist_m: float = 0.12,
-    near_along_m: float = 0.030,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Combined orientation: ``jaw_rail_vertical * wrist_carriage_push`` (legacy single term)."""
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    near_xy, sep_ok = _gripper_top_bottom_near_gate(
+    near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
         gate_dist_m,
-        near_along_m,
         width_weight,
         tip_offset_m,
         wrist_body_cfg,
@@ -1173,7 +1070,7 @@ def gripper_fingers_perpendicular_to_trailing_edge_shaping(
         tip_offset_m,
         push_axis_world,
     )
-    return _apply_task_phase_gate(env, rail_z * wc_y * sep_ok * near_xy, task_phase_gate)
+    return rail_z * wc_y * sep_ok * near
 
 
 def gripper_pinch_orientation_cos_obs(
@@ -1226,7 +1123,6 @@ def pcb_lin_vel_y_toward_lead_target_y(
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
     target_lead_y_env: float,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """``relu((y_target - lead_y) * v_y)`` with lead = root + half_length * body +X in env frame.
 
@@ -1239,14 +1135,13 @@ def pcb_lin_vel_y_toward_lead_target_y(
     lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
     err_y = float(target_lead_y_env) - lead_y
     v_y = pcb.data.root_lin_vel_w[:, 1]
-    return _apply_task_phase_gate(env, torch.relu(err_y * v_y), task_phase_gate)
+    return torch.relu(err_y * v_y)
 
 
 def pcb_long_axis_parallel_to_push_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Shaped in ``[0, 1]``: PCB body +X (long edge) aligned with the insertion direction.
 
@@ -1256,7 +1151,7 @@ def pcb_long_axis_parallel_to_push_reward(
     a = torch.tensor(axis_world, device=env.device, dtype=x_w.dtype)
     a = a / torch.norm(a).clamp_min(1e-9)
     c = torch.abs(torch.sum(x_w * a.unsqueeze(0).expand_as(x_w), dim=-1))
-    return _apply_task_phase_gate(env, torch.square(torch.clamp(c, max=1.0)), task_phase_gate)
+    return torch.square(torch.clamp(c, max=1.0))
 
 
 def pcb_leading_edge_insertion_proximity_reward(
@@ -1265,7 +1160,6 @@ def pcb_leading_edge_insertion_proximity_reward(
     half_length_m: float,
     target_lead_xyz_env: tuple[float, float, float],
     sigma_m: float = 0.12,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Dense reward: PCB **leading** point near a fixed slot-mouth pose in env-local frame.
 
@@ -1281,7 +1175,7 @@ def pcb_leading_edge_insertion_proximity_reward(
         env.num_envs, -1
     )
     dist = torch.norm(lead_env - tgt, dim=-1)
-    return _apply_task_phase_gate(env, torch.exp(-dist / (float(sigma_m) + 1e-9)), task_phase_gate)
+    return torch.exp(-dist / (float(sigma_m) + 1e-9))
 
 
 
@@ -1291,25 +1185,23 @@ def pcb_insertion_depth_reward(
     half_length_m: float,
     slot_mouth_y_env: float,
     max_depth_m: float = 0.20,
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Reward for **PCB depth inside the slot**: leading edge past the slot mouth in +Y.
 
     Zero while the leading edge has not yet crossed ``slot_mouth_y_env``.
     Linearly increases up to ``max_depth_m`` of penetration (returns 1.0 at full insertion).
-    Use a positive weight; combine with ``push_y_toward_slot`` which only fires before the mouth.
+    Use a positive weight; combine with ``insert_y_toward_slot`` which only fires before the mouth.
     """
     lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
     lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
     depth = torch.clamp(lead_y - float(slot_mouth_y_env), min=0.0, max=float(max_depth_m))
-    return _apply_task_phase_gate(env, depth / float(max_depth_m), task_phase_gate)
+    return depth / float(max_depth_m)
 
 
 def pcb_horizontal_velocity_perpendicular_to_axis_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    task_phase_gate: str | None = None,
 ) -> torch.Tensor:
     """Squared horizontal speed **orthogonal** to the insertion axis (lateral skidding off-axis)."""
     pcb = env.scene[pcb_cfg.name]
@@ -1320,7 +1212,7 @@ def pcb_horizontal_velocity_perpendicular_to_axis_penalty(
     a3 = a.unsqueeze(0).expand(v.shape[0], -1)
     v_para = torch.sum(v * a3, dim=-1, keepdim=True) * a3
     v_perp = v - v_para
-    return _apply_task_phase_gate(env, torch.sum(torch.square(v_perp), dim=-1), task_phase_gate)
+    return torch.sum(torch.square(v_perp), dim=-1)
 
 
 # ---------------------------------------------------------
@@ -1455,7 +1347,7 @@ def _grasp_not_yet_achieved(
     open_width_m: float,
     closed_threshold: float = 0.35,
     gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
+    width_frac: float = 0.10,
     min_pinch_ready: float = 0.40,
     width_weight: float = 3.0,
     thickness_sigma_m: float = 0.006,

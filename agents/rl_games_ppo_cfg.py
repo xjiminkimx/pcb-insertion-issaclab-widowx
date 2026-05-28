@@ -4,7 +4,7 @@ from .rl_games_logstd_safety import apply_patch as _apply_rl_games_logstd_safety
 # See rl_games_logstd_safety.py (exp(log_std) underflow / Normal.sample on zero std).
 _apply_rl_games_logstd_safety_patch()
 
-WidowXPcbPPOCfg = {
+WidowXPcbPPOBaseCfg = {
     "params": {
         "seed": 42,
         
@@ -44,8 +44,8 @@ WidowXPcbPPOCfg = {
         },
         
         "config": {
-            "name": "WidowX_PCB_RL",
-            "full_experiment_name": "widowx_pcb",
+            "name": "WidowX_PCB_Base_RL",
+            "full_experiment_name": "widowx_pcb_base",
             # rl-games writes TensorBoard summaries under the experiment log directory.
             # This name appears in the path and helps you filter runs in TensorBoard UI.
             "env_name": "rlgpu", # env_name은 config 내부에 있는 것이 표준입니다.
@@ -103,26 +103,26 @@ WidowXPcbPPOCfg = {
 
 # Phase-specific experiment names (separate TensorBoard / checkpoint folders).
 WidowXPcbGraspPPOCfg = {
-    **WidowXPcbPPOCfg,
+    **WidowXPcbPPOBaseCfg,
     "params": {
-        **WidowXPcbPPOCfg["params"],
+        **WidowXPcbPPOBaseCfg["params"],
         "env": {
-            **WidowXPcbPPOCfg["params"]["env"],
+            **WidowXPcbPPOBaseCfg["params"]["env"],
             # Slightly larger per-step joint deltas help sustained descent at the edge.
             "clip_actions": 0.45,
         },
         "network": {
-            **WidowXPcbPPOCfg["params"]["network"],
+            **WidowXPcbPPOBaseCfg["params"]["network"],
             "space": {
-                **WidowXPcbPPOCfg["params"]["network"]["space"],
+                **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
                 "continuous": {
-                    **WidowXPcbPPOCfg["params"]["network"]["space"]["continuous"],
+                    **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
                     "sigma_init": {"name": "const_initializer", "val": -0.3},
                 },
             },
         },
         "config": {
-            **WidowXPcbPPOCfg["params"]["config"],
+            **WidowXPcbPPOBaseCfg["params"]["config"],
             "name": "WidowX_PCB_Grasp_RL",
             "full_experiment_name": "widowx_pcb_grasp",
             "entropy_coef": 5e-3,
@@ -131,14 +131,14 @@ WidowXPcbGraspPPOCfg = {
     },
 }
 
-WidowXPcbPushPPOCfg = {
-    **WidowXPcbPPOCfg,
+WidowXPcbInsertPPOCfg = {
+    **WidowXPcbPPOBaseCfg,
     "params": {
-        **WidowXPcbPPOCfg["params"],
+        **WidowXPcbPPOBaseCfg["params"],
         "config": {
-            **WidowXPcbPPOCfg["params"]["config"],
-            "name": "WidowX_PCB_Push_RL",
-            "full_experiment_name": "widowx_pcb_push",
+            **WidowXPcbPPOBaseCfg["params"]["config"],
+            "name": "WidowX_PCB_Insert_RL",
+            "full_experiment_name": "widowx_pcb_insert",
         },
     },
 }
