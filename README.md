@@ -1,6 +1,6 @@
 # PCB on-rail task — WidowX (Isaac Lab)
 
-This package is an **Isaac Lab** manager-based RL task: a robot arm interacts with a **PCB** on a **magazine + guide rail** assembly (single aligned USD). **Target-slot distance rewards and slot observations have been removed** so you can add forward-push / rail objectives separately. Training uses **rl-games** (PPO).
+This package is an **Isaac Lab** manager-based RL task: a robot arm interacts with a **PCB** on a **magazine + conveyor** assembly (single aligned USD). Side guide-rail rods are omitted from the fixture USD. Training uses **rl-games** (PPO).
 
 One simulation variant is registered:
 
@@ -28,7 +28,8 @@ Recommended training order: **Grasp → Push → (optional) Full** fine-tune.
 |------|------|
 | `__init__.py` | Registers `Isaac-WidowX-PCB-v0` and applies the rl-games log-std safety patch. |
 | `widowx_pcb_env_cfg.py` | WidowX scene, actions, observations, rewards, events, terminations, magazine/rail geometry. |
-| `usd_model/` | Unified asset root: `usd_env/` contains fixture USDs and conversion sources, and `usd_robot/` contains robot USD bundles. |
+| `usd_model/env_v3/` | URDF + meshes + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` (short axle rods / width cross-rods omitted) |
+| `usd_model/usd_robot/` | Robot USD bundles (wxai follower). |
 | `mdp_custom.py` | Custom MDP terms (regularization, rail reset, drop detection). |
 | `agents/` | PPO config (`WidowXPcbPPOCfg` in `rl_games_ppo_cfg.py`), log-std safety helper, TensorBoard monitor script. |
 
@@ -148,7 +149,13 @@ Open <http://127.0.0.1:6006> and watch policy/value loss, entropy, KL, and episo
 
 ### Fixture pose vs USD
 
-Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with your imported **magazine + rail** asset in world frame. Analytic `_GUIDE_RAIL_*` may not match `usd_model/usd_env/magazine.usd` collision—if the **green PCB clips into white rails**, raise **`_PCB_SPAWN_Z_BIAS`** (and optionally `collision_props.contact_offset` / `rest_offset` on PCB + magazine) until the board sits on the rail tops in the contact view.
+The runtime fixture is `usd_model/usd_env/pcb_insertion_env.usd`, generated from **env_v3** (`assembly_2.urdf`):
+
+```bash
+cd usd_model/env_v3 && python3 convert_to_usd.py
+```
+
+Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with the loaded asset in world frame. If the **green PCB clips into the conveyor**, raise spawn Z (or `collision_props.contact_offset` / `rest_offset`) until the board sits on the belt top in the contact view.
 
 ### Physics and collision
 

@@ -7,6 +7,10 @@ Three-material classification:
   RailMaterial    — guide-rail bars (Part_1_2.stl)  (hard plastic,   mu_s 0.80)
   StandMaterial   — stand + conveyor structure       (brushed steel,  mu_s 0.50)
 
+Guide-rail bars (Part_1_2.stl, full-width) and conveyor belts are kept.
+Short axle rods (Part_1_4.stl, ~120 mm, slightly longer than PCB width) and
+width cross-rods (Part_1_3.stl) are omitted.
+
 All mesh vertices are FK-baked into the URDF "root" frame at q=0.
 Chip / PCB link is intentionally excluded — spawned separately as CuboidCfg.
 
@@ -262,8 +266,13 @@ STATIC_LINKS = {
     "part_1_14",
 }
 
-# Guide-rail bars (Part_1_2.stl) → hard plastic
+# Short axle rods through pulleys (~120 mm, Part_1_4.stl; PCB width ≈ 77.5 mm).
+SHORT_AXLE_LINKS = {"part_1_5", "part_1_8"}
+# Width-direction cross-rods (Part_1_3.stl, ~340 mm span).
+WIDTH_CROSSBAR_LINKS = {"part_1_4", "part_1_9"}
+# Side guide-rail bars (Part_1_2.stl) — exported (RailMaterial).
 GUIDE_RAIL_LINKS = {"part_1_2", "part_1_10"}
+EXCLUDED_LINKS = SHORT_AXLE_LINKS | WIDTH_CROSSBAR_LINKS
 
 # Magazine body → steel
 MAGAZINE_LINKS = {"magazine"}
@@ -304,6 +313,12 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
     bbox_all: list = []
 
     for link_name in sorted(STATIC_LINKS):
+        if link_name in EXCLUDED_LINKS:
+            if link_name in SHORT_AXLE_LINKS:
+                print(f"  [omit] {link_name} (short axle rod / Part_1_4.stl excluded)")
+            else:
+                print(f"  [omit] {link_name} (width cross-rod excluded)")
+            continue
         info = links.get(link_name)
         if info is None or info["mesh"] is None:
             print(f"  [skip] no visual: {link_name}")
@@ -426,6 +441,8 @@ def Xform "PCB_Env" (
     print("\n--- env_cfg reminders ---")
     print("  steel  (magazine):          SteelMaterial  mu_s=0.55")
     print("  plastic (guide rails):      RailMaterial   mu_s=0.80")
+    print("  short axle rods:            omitted (Part_1_4.stl, ~120 mm)")
+    print("  width cross-rods:           omitted (Part_1_3.stl)")
     print("  steel  (stand/conveyor):    StandMaterial  mu_s=0.50")
     print("  Tune _MAG_POS / _RAIL_SURFACE_Z in Isaac Sim after loading.")
 

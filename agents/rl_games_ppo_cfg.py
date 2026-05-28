@@ -85,7 +85,7 @@ WidowXPcbPPOCfg = {
             # At 2e-3 the policy was collapsing to a narrow grasp trajectory too early.
             # The adaptive LR will reduce the update magnitude when KL spikes, so a
             # higher entropy coef is safe — it just prevents premature convergence.
-            "entropy_coef": 3e-1,
+            "entropy_coef": 2e-1,
             "truncate_grads": True,
             "e_clip": 0.3,
             # Longer horizon gives the value function more context for delayed grasp/push rewards.

@@ -144,7 +144,7 @@ def _gripper_top_bottom_near_gate(
     left: torch.Tensor,
     right: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``near_xy`` gate and finger-separation ok mask shared by orientation rewards."""
+    """``near`` gate (3D proximity to trailing edge) and finger-separation ok mask."""
     _, n = _gripper_rail_unit_lr(left, right)
     sep_ok = (n > float(min_finger_sep_m)).to(dtype=n.dtype)
     near_xy, _, _ = _trailing_edge_xy_near_factor(
@@ -460,6 +460,59 @@ def _trailing_edge_xy_distance(
     return dist_xy, along, width
 
 
+def _trailing_edge_weighted_distance(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Width-weighted 3D distance to trailing short-edge face centre and PCB-frame errors."""
+    along, width, thick, _, _ = _gripper_mid_trailing_edge_errors(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    ww = float(width_weight)
+    dist = torch.sqrt(along * along + (ww * width) * (ww * width) + thick * thick + 1e-12)
+    return dist, along, width, thick
+
+
+def _trailing_edge_near_factor(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gate_dist_m: float = 0.10,
+    near_along_m: float = 0.030,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Trailing-edge 3D proximity factor in ``[0, 1]`` plus ``(dist_3d, |thick|)``."""
+    dist, along, _, thick = _trailing_edge_weighted_distance(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    along_gate = _trailing_edge_along_gate(along, near_along_m)
+    near = along_gate * torch.exp(-dist / (float(gate_dist_m) + 1e-9))
+    return near, dist, torch.abs(thick)
+
+
 def _trailing_edge_xy_near_factor(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -472,24 +525,95 @@ def _trailing_edge_xy_near_factor(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Trailing-edge XY proximity factor in ``[0, 1]`` plus ``(dist_xy, |thick|)``.
-
-    Uses in-plane PCB-frame error only (``along`` + ``width``), excluding ``thick``.
-    """
-    along, width, thick, _, _ = _gripper_mid_trailing_edge_errors(
+    """Alias for :func:`_trailing_edge_near_factor` (full 3D target, not XY-only)."""
+    return _trailing_edge_near_factor(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
+        gate_dist_m=gate_dist_m,
+        near_along_m=near_along_m,
+        width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-    ww = float(width_weight)
-    dist_xy = torch.sqrt(along * along + (ww * width) * (ww * width) + 1e-12)
+
+
+def gripper_trailing_edge_proximity_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    sigma_m: float = 0.10,
+    near_along_m: float = 0.030,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Dense shaping in ``[0, 1]``: exponential proximity to the trailing edge centre in 3D."""
+    near, _, _ = _trailing_edge_near_factor(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        gate_dist_m=float(sigma_m),
+        near_along_m=near_along_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return _apply_task_phase_gate(env, near, task_phase_gate)
+
+
+# Per-env previous 3D distance to trailing-edge target (reset each episode).
+_EE_TRAILING_EDGE_PREV_DIST: torch.Tensor | None = None
+
+
+def gripper_trailing_edge_approach_progress(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    near_along_m: float = 0.030,
+    max_step_m: float = 0.008,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    task_phase_gate: str | None = None,
+) -> torch.Tensor:
+    """Progress reward for moving closer in 3D to the trailing short-edge face centre."""
+    global _EE_TRAILING_EDGE_PREV_DIST
+
+    dist, along, _, _ = _trailing_edge_weighted_distance(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
     along_gate = _trailing_edge_along_gate(along, near_along_m)
-    near_xy = along_gate * torch.exp(-dist_xy / (float(gate_dist_m) + 1e-9))
-    return near_xy, dist_xy, torch.abs(thick)
+
+    if (
+        _EE_TRAILING_EDGE_PREV_DIST is None
+        or _EE_TRAILING_EDGE_PREV_DIST.shape[0] != dist.shape[0]
+        or _EE_TRAILING_EDGE_PREV_DIST.device != dist.device
+    ):
+        _EE_TRAILING_EDGE_PREV_DIST = dist.clone()
+        return torch.zeros_like(dist)
+
+    first_step = env.episode_length_buf == 1
+    _EE_TRAILING_EDGE_PREV_DIST = torch.where(first_step, dist, _EE_TRAILING_EDGE_PREV_DIST)
+    progress = (_EE_TRAILING_EDGE_PREV_DIST - dist).clamp(0.0, float(max_step_m))
+    _EE_TRAILING_EDGE_PREV_DIST = dist.clone()
+    return _apply_task_phase_gate(env, along_gate * progress / float(max_step_m), task_phase_gate)
 
 
 def gripper_trailing_edge_xy_proximity_shaping(
@@ -506,41 +630,20 @@ def gripper_trailing_edge_xy_proximity_shaping(
     wrist_body_cfg: SceneEntityCfg | None = None,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Dense shaping in ``[0, 1]``: exponential proximity to the trailing edge in **XY only**.
-
-    Multiplied by ``exp(-|thick|/thick_couple_sigma_m)`` so hovering high cannot retain full
-    horizontal reward — the policy must descend to keep the XY term.
-    """
-    dist_xy, along, _ = _trailing_edge_xy_distance(
+    """Deprecated — use :func:`gripper_trailing_edge_proximity_shaping` (3D target)."""
+    return gripper_trailing_edge_proximity_shaping(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    along_gate = _trailing_edge_along_gate(along, near_along_m)
-    near_xy = along_gate * torch.exp(-dist_xy / (float(sigma_m) + 1e-9))
-    _, _, abs_thick = _trailing_edge_xy_near_factor(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        gate_dist_m=float(sigma_m),
+        sigma_m=sigma_m,
         near_along_m=near_along_m,
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
+        task_phase_gate=task_phase_gate,
     )
-    height_couple = torch.exp(-abs_thick / (float(thick_couple_sigma_m) + 1e-9))
-    return _apply_task_phase_gate(env, near_xy * height_couple, task_phase_gate)
-
-
-# Per-env previous |thick| for thickness descent progress (reset each episode).
-_EE_THICK_PREV: torch.Tensor | None = None
 
 
 def gripper_trailing_edge_thickness_descent_progress(
@@ -558,40 +661,20 @@ def gripper_trailing_edge_thickness_descent_progress(
     wrist_body_cfg: SceneEntityCfg | None = None,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Progress on ``|thick|`` when XY-near the trailing edge.
-
-    Pays ``near_xy * clamp(prev_|thick| - |thick|, 0, max_step) / max_step`` once horizontal
-    alignment is sufficient.
-    """
-    global _EE_THICK_PREV
-
-    near_xy, _, abs_thick = _trailing_edge_xy_near_factor(
+    """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
+    return gripper_trailing_edge_approach_progress(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        gate_dist_m=gate_dist_m,
         near_along_m=near_along_m,
+        max_step_m=max_step_m,
         width_weight=width_weight,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
+        task_phase_gate=task_phase_gate,
     )
-    xy_ready = (near_xy >= float(near_xy_min)).to(dtype=near_xy.dtype)
-
-    if (
-        _EE_THICK_PREV is None
-        or _EE_THICK_PREV.shape[0] != abs_thick.shape[0]
-        or _EE_THICK_PREV.device != abs_thick.device
-    ):
-        _EE_THICK_PREV = abs_thick.clone()
-        return torch.zeros_like(abs_thick)
-
-    first_step = env.episode_length_buf == 1
-    _EE_THICK_PREV = torch.where(first_step, abs_thick, _EE_THICK_PREV)
-    progress = (_EE_THICK_PREV - abs_thick).clamp(0.0, float(max_step_m))
-    _EE_THICK_PREV = abs_thick.clone()
-    return _apply_task_phase_gate(env, near_xy * xy_ready * progress / float(max_step_m), task_phase_gate)
 
 
 def grasp_edge_center_achieved(
@@ -750,7 +833,7 @@ def grasp_success_bonus_reward(
     return _apply_task_phase_gate(env, bonus, task_phase_gate)
 
 
-# Per-env previous XY distance to trailing edge (ignores thickness).
+# Deprecated alias — kept for old env cfgs / checkpoints logging names.
 _EE_XY_APPROACH_PREV_DIST: torch.Tensor | None = None
 
 
@@ -766,31 +849,19 @@ def ee_xy_approach_progress_reward(
     wrist_body_cfg: SceneEntityCfg | None = None,
     task_phase_gate: str | None = None,
 ) -> torch.Tensor:
-    """Progress reward for moving closer in **XY only** to the trailing short-edge centre.
-
-    Ignores thickness offset so Z descent is not double-counted with ``gripper_trailing_edge_thickness_descent_progress``.
-    """
-    global _EE_XY_APPROACH_PREV_DIST
-
-    along, width, _, _, _ = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
+    """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
+    return gripper_trailing_edge_approach_progress(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        max_step_m=max_step_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        task_phase_gate=task_phase_gate,
     )
-    ww = float(width_weight)
-    dist = torch.sqrt(along * along + (ww * width) * (ww * width) + 1e-12)
-
-    if (
-        _EE_XY_APPROACH_PREV_DIST is None
-        or _EE_XY_APPROACH_PREV_DIST.shape[0] != dist.shape[0]
-        or _EE_XY_APPROACH_PREV_DIST.device != dist.device
-    ):
-        _EE_XY_APPROACH_PREV_DIST = dist.clone()
-        return torch.zeros_like(dist)
-
-    first_step = env.episode_length_buf == 1
-    _EE_XY_APPROACH_PREV_DIST = torch.where(first_step, dist, _EE_XY_APPROACH_PREV_DIST)
-    progress = (_EE_XY_APPROACH_PREV_DIST - dist).clamp(0.0, float(max_step_m))
-    _EE_XY_APPROACH_PREV_DIST = dist.clone()
-    return _apply_task_phase_gate(env, progress / float(max_step_m), task_phase_gate)
 
 
 def gripper_pinch_readiness(
