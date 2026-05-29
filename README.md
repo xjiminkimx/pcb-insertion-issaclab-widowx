@@ -67,13 +67,13 @@ Commands below assume you run training from the **Isaac Lab repository root** (t
 ```bash
 conda activate isaac-sim   # or your env name
 cd /path/to/IsaacLab   # repository root (contains scripts/)
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --headless --num_envs 4096
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --num_envs 4096 --headless
 ```
 
 **Phase 2 — insert only** (after grasp policy is reasonable, or from scratch with snapped grasp reset):
 
 ```bash
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Insert-v0 --headless --num_envs 4096
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Insert-v0 --num_envs 4096 --headless
 ```
 
 

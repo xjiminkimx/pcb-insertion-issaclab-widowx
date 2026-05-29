@@ -19,6 +19,7 @@ import sys
 # Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
 WIDOWX_RL_RUNS = (
     ("Grasp", "WidowX_PCB_Grasp_RL/widowx_pcb_grasp/summaries"),
+    ("Grasp gripper test", "WidowX_PCB_Grasp_GripperTest_RL/widowx_pcb_grasp_gripper_test/summaries"),
     ("Insert", "WidowX_PCB_Insert_RL/widowx_pcb_insert/summaries"),
 )
 

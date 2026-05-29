@@ -70,7 +70,7 @@ WidowXPcbPPOBaseCfg = {
             # PPO 학습 하이퍼파라미터
             "gamma": 0.99,
             "tau": 0.95,
-            "learning_rate": 1e-4,
+            "learning_rate": 5e-4,
             "lr_schedule": "adaptive",
             "kl_threshold": 0.012,
             "score_to_win": 20000,
@@ -85,7 +85,7 @@ WidowXPcbPPOBaseCfg = {
             # At 2e-3 the policy was collapsing to a narrow grasp trajectory too early.
             # The adaptive LR will reduce the update magnitude when KL spikes, so a
             # higher entropy coef is safe — it just prevents premature convergence.
-            "entropy_coef": 2e-1,
+            "entropy_coef": 5e-2,
             "truncate_grads": True,
             "e_clip": 0.3,
             # Longer horizon gives the value function more context for delayed grasp/push rewards.
@@ -127,6 +127,36 @@ WidowXPcbGraspPPOCfg = {
             "full_experiment_name": "widowx_pcb_grasp",
             "entropy_coef": 5e-3,
             "reward_shaper": {"scale_value": 0.15},
+        },
+    },
+}
+
+WidowXPcbGraspGripperTestPPOCfg = {
+    **WidowXPcbPPOBaseCfg,
+    "params": {
+        **WidowXPcbPPOBaseCfg["params"],
+        "env": {
+            **WidowXPcbPPOBaseCfg["params"]["env"],
+            # Single gripper joint — smaller per-step deltas than full-arm grasp.
+            "clip_actions": 0.20,
+        },
+        "network": {
+            **WidowXPcbPPOBaseCfg["params"]["network"],
+            "space": {
+                **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
+                "continuous": {
+                    **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
+                    "sigma_init": {"name": "const_initializer", "val": -0.5},
+                },
+            },
+        },
+        "config": {
+            **WidowXPcbPPOBaseCfg["params"]["config"],
+            "name": "WidowX_PCB_Grasp_GripperTest_RL",
+            "full_experiment_name": "widowx_pcb_grasp_gripper_test",
+            "entropy_coef": 1e-2,
+            "reward_shaper": {"scale_value": 0.2},
+            "horizon_length": 64,
         },
     },
 }

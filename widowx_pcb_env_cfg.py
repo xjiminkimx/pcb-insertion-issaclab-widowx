@@ -44,6 +44,8 @@ from .mdp_custom import (
     gripper_jaw_rail_vertical_shaping,
     gripper_wrist_carriage_push_axis_shaping,
     gripper_jaw_rail_horizontal_penalty,
+    pcb_between_gripper_fingers,
+    pcb_finger_object_proximity,
     pcb_insertion_depth_reward,
     grasp_edge_center_achieved,
     # --- resets & terminations ---
@@ -95,7 +97,7 @@ ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
 #   slot entrance world Y   :  0.490 m  (assembly root X-min)
 #
 # TUNE _MAG_POS and _CONVEYOR_SURFACE_Z in Isaac Sim after loading.
-_MAG_POS      = (-0.380, 0.094, 0.280)
+_MAG_POS      = (-0.380, 0.094, 0.350)
 _MAG_ROT_WXYZ = (0.7071068, 0.0, 0.0, -0.7071068)   # -90 deg about world Z
 
 # World-frame push direction: root -X  →  world +Y.
@@ -104,15 +106,18 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # ---------------------------------------------------------------------------
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
-# Base on -X beside the conveyor.
-_ROBOT_BASE_POS = (-0.17, -0.20, 0.02)
+# Base beside the conveyor; +90° CCW yaw about world +Z (``_ROBOT_BASE_ROT_WXYZ``).
+_ROBOT_BASE_POS = (0.05, -0.35, 0.00)
+# +90° CCW about world +Z (w, x, y, z).
+_ROBOT_BASE_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
+
 _ROBOT_HOME_JOINT_POS = {
-    "joint_0": -0.3,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
-    "joint_1": 0.9,    # shoulder pitch down — smaller than 1.2 to reach forward/up
+    "joint_0": 0.0,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
+    "joint_1": 1.25,    # shoulder pitch down — smaller than 1.2 to reach forward/up
     "joint_2": 1.2,    # elbow bend / 1.2
     "joint_3": -0.8,    # wrist pitch
-    "joint_4": -1.57,  # wrist roll ≈ −90° — jaw rail vertical (⊥ XY), not level carriage
-    "joint_5": -0.8,    # wrist yaw — face toward conveyor (+Y approach)
+    "joint_4": 0.0,  # wrist roll ≈ −90° — jaw rail vertical (⊥ XY), not level carriage
+    "joint_5": 0.0,    # wrist yaw — face toward conveyor (+Y approach)
     "left_carriage_joint": 0.010,  # open
 }
 # Insert-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
@@ -126,7 +131,7 @@ _GRIPPER_OPEN_WIDTH_M = 0.010
 _SLOT_MOUTH_Y_ENV = 0.490          # slot entrance Y (assembly root X-min → world +Y)
 _CONVEYOR_CENTER_X_ENV = 0.050     # chip / conveyor centre X in env frame
 _CONVEYOR_SURFACE_Z = 0.163        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
-_PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5
+_PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 +0.07
 
 # Optional jaw corridor penalty bounds (unused while guide rods are omitted from USD).
 _BELT_CORRIDOR_X_MIN_ENV = 0.0
@@ -231,12 +236,21 @@ def _grasp_entity_params(**extra) -> dict:
 
 def _grasp_distance_params(**extra) -> dict:
     """Grasp entity params plus width-weighted trailing-edge distance kwargs."""
-    return _grasp_entity_params(width_weight=_SHORT_EDGE_WIDTH_WEIGHT, **extra)
+    base = _grasp_entity_params(
+        width_weight=_SHORT_EDGE_WIDTH_WEIGHT,
+        pcb_half_thickness_m=PCB_Z * 0.5,
+    )
+    base.update(extra)
+    return base
 
 
 def _grasp_orientation_base_params(**extra) -> dict:
     """Near-edge gate kwargs for top/bottom orientation rewards (no push axis)."""
-    base = _grasp_distance_params(gate_dist_m=0.12, min_finger_sep_m=0.006)
+    base = _grasp_entity_params(
+        width_weight=_SHORT_EDGE_WIDTH_WEIGHT,
+        gate_dist_m=0.05,
+        min_finger_sep_m=0.006,
+    )
     base.update(extra)
     return base
 
@@ -244,6 +258,37 @@ def _grasp_orientation_base_params(**extra) -> dict:
 def _grasp_orientation_params(**extra) -> dict:
     """Orientation rewards including wrist→carriage ∥ push axis (+Y)."""
     return _grasp_orientation_base_params(push_axis_world=PUSH_AXIS_WORLD, **extra)
+
+
+def _grasp_between_fingers_params(**extra) -> dict:
+    """Kwargs for per-finger PCB-between-jaws shaping."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "half_length_m": _HALF_LENGTH_M,
+        "pcb_half_thickness_m": PCB_Z * 0.5,
+        "offset_m": PCB_Z * 0.5 + 0.010,
+        "thickness_sigma_m": 0.0008,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _grasp_finger_proximity_params(**extra) -> dict:
+    """Kwargs for per-finger tanh proximity to trailing-edge grasp targets."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "half_length_m": _HALF_LENGTH_M,
+        "pcb_half_thickness_m": PCB_Z * 0.5,
+        "std": 0.04,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
 
 
 def _belt_corridor_penalty_params(**extra) -> dict:
@@ -310,8 +355,8 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
-            # Beside the conveyor on -X (see ``_ROBOT_BASE_POS``).
             pos=_ROBOT_BASE_POS,
+            rot=_ROBOT_BASE_ROT_WXYZ,
             joint_pos=_ROBOT_HOME_JOINT_POS,
         ),
         # wxai_follower.usd has PD gains baked in — use None to inherit from USD.
@@ -485,32 +530,42 @@ class RewardsGraspPhaseCfg():
     trailing_edge_proximity = RewardTermCfg(
         func=gripper_trailing_edge_proximity_shaping,
         params=_grasp_distance_params(sigma_m=0.10, near_along_m=0.030),
-        weight=40.0,
+        weight=20.0,
     )
     trailing_edge_approach = RewardTermCfg(
         func=gripper_trailing_edge_approach_progress,
         params=_grasp_distance_params(near_along_m=0.030, max_step_m=0.008),
-        weight=50.0,
+        weight=20.0,
     )
     jaw_rail_vertical = RewardTermCfg(
         func=gripper_jaw_rail_vertical_shaping,
         params=_grasp_orientation_base_params(),
+        weight=500.0,
+    )
+    # wrist_carriage_push = RewardTermCfg(
+    #     func=gripper_wrist_carriage_push_axis_shaping,
+    #     params=_grasp_orientation_params(),
+    #     weight=25.0,
+    # )
+    pcb_between_fingers = RewardTermCfg(
+        func=pcb_between_gripper_fingers,
+        params=_grasp_between_fingers_params(),
         weight=1000.0,
     )
-    wrist_carriage_push = RewardTermCfg(
-        func=gripper_wrist_carriage_push_axis_shaping,
-        params=_grasp_orientation_params(),
-        weight=25.0,
+    pcb_finger_proximity = RewardTermCfg(
+        func=pcb_finger_object_proximity,
+        params=_grasp_finger_proximity_params(),
+        weight=300.0,
     )
-    jaw_rail_horizontal = RewardTermCfg(
-        func=gripper_jaw_rail_horizontal_penalty,
-        params=_grasp_orientation_base_params(),
-        weight=-20.0,
-    )
+    # jaw_rail_horizontal = RewardTermCfg(
+    #     func=gripper_jaw_rail_horizontal_penalty,
+    #     params=_grasp_orientation_base_params(),
+    #     weight=-20.0,
+    # )
     grasp_success_bonus = RewardTermCfg(
         func=grasp_success_bonus_reward,
         params=_grasp_termination_params(),
-        weight=60.0,
+        weight=1000.0,
     )
 
 
@@ -691,7 +746,7 @@ class TerminationsInsertCfg(TerminationsSharedCfg):
 class _WidowXPcbEnvCfgBase(ManagerBasedRLEnvCfg):
     """Shared scene, actions, observations, and simulation for all task variants."""
 
-    scene: WidowXPcbSceneCfg = WidowXPcbSceneCfg(num_envs=2048, env_spacing=1.0)
+    scene: WidowXPcbSceneCfg = WidowXPcbSceneCfg(num_envs=2048, env_spacing=1.5)
     observations: ObservationsCfg = ObservationsCfg()
     actions: ActionsCfg = ActionsCfg()
     sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(
