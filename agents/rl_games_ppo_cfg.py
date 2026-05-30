@@ -125,8 +125,9 @@ WidowXPcbGraspPPOCfg = {
             **WidowXPcbPPOBaseCfg["params"]["config"],
             "name": "WidowX_PCB_Grasp_RL",
             "full_experiment_name": "widowx_pcb_grasp",
-            "entropy_coef": 5e-3,
-            "reward_shaper": {"scale_value": 0.15},
+            # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
+            "entropy_coef": 8e-3,
+            "reward_shaper": {"scale_value": 1.0},
         },
     },
 }

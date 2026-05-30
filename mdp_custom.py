@@ -384,7 +384,9 @@ def _finger_tip_errors_vs_trailing_target(
     width = torch.sum(delta * y_axis, dim=-1)
     thick = torch.sum(delta * z_axis, dim=-1)
     ww = float(width_weight)
-    dist = torch.sqrt(along * along + (ww * width) * (ww * width) + thick * thick + 1e-12)
+    # Use clamp(min=0) + 1e-6 to avoid NaN from negative fp16 subnormals under mixed precision.
+    sq_sum = (along * along + (ww * width) * (ww * width) + thick * thick).clamp(min=0.0)
+    dist = torch.sqrt(sq_sum + 1e-6)
     return along, width, thick, dist
 
 
@@ -948,46 +950,59 @@ def pcb_object_gripper_mid_distance(
 
 def pcb_between_gripper_fingers(
     env: ManagerBasedRLEnv,
-    offset_m: float,
+    proximity_sigma_m: float,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.00125,
-    thickness_sigma_m: float = 0.0008,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.05,
 ) -> torch.Tensor:
-    """Reward placing the PCB between the jaws with each finger on its own thickness-side target.
+    """Straddle-quality reward: PCB between the jaws, each jaw close to its thickness-face target.
 
-    Left/right targets are trailing-edge centre ± ``pcb_half_thickness_m`` along body +Z (not the
-  jaw midpoint). Thickness shaping uses the smaller of two assignments so gripper roll flips do not
-    break the reward.
+    Produces a **dense, non-zero gradient from the very first step** so the policy is immediately
+    trained to:
+
+    1. Keep the board straddled (``is_graspable``: one jaw above, one below the board centre).
+    2. Keep the board in the jaw span (``between_jaws``).
+    3. Move each jaw toward its per-face trailing-edge target (``min proximity``).
+
+    The old design multiplied four factors (including a tight ``thickness_sigma`` and a
+    ``closedness`` term); the product was numerically zero at the home pose because the jaw bodies
+    are 50+ mm from the ±1.25 mm board-surface targets while ``thickness_sigma = 0.0012 m``.
+    This version replaces that product with a single ``min(exp(-dist_l/σ), exp(-dist_r/σ))``
+    where ``σ = proximity_sigma_m`` is wide enough to span the full jaw travel distance so the
+    gradient is never zero.
+
+    *Gripper closing is handled by a separate ``gripper_closing_reward`` term* so that each
+    sub-goal can be learned independently without one multiplicative factor silencing the rest.
     """
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
+
+    # Gate 1: one jaw on each face of the board (thickness axis sign differs).
     w_left, w_right = _finger_thickness_offsets(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    is_graspable = w_left * w_right < 0.0
+    is_graspable = (w_left * w_right < 0.0).to(left.dtype)
 
-    h = float(pcb_half_thickness_m)
-    sig = float(thickness_sigma_m) + 1e-9
-    err_a = torch.abs(w_left - h) + torch.abs(w_right + h)
-    err_b = torch.abs(w_left + h) + torch.abs(w_right - h)
-    thickness_err = torch.minimum(err_a, err_b)
-    thickness_shaping = torch.exp(-thickness_err / sig)
-
+    # Gate 2: PCB centre lies within the jaw span projection.
     span = right - left
     span_len_sq = torch.sum(span * span, dim=-1).clamp_min(1e-12)
     span_frac = torch.sum((pcb_pos - left) * span, dim=-1) / span_len_sq
     margin = float(min_span_frac)
-    between_jaws = (span_frac >= margin) & (span_frac <= (1.0 - margin))
+    between_jaws = ((span_frac >= margin) & (span_frac <= (1.0 - margin))).to(left.dtype)
 
+    # Dense proximity: each jaw toward its own trailing-edge ±half-thickness target.
+    # ``dist_l`` / ``dist_r`` are 3D distances (with width penalty) so they encode BOTH
+    # edge approach and thickness alignment in a single smooth term.
+    # ``proximity_sigma_m`` should be large enough that the reward is ≥ 0.2 at the home pose
+    # (jaw bodies ~28–30 mm from targets) so the gradient never vanishes before convergence.
     geom = _fingers_trailing_edge_geometry(
         env,
         pcb_cfg,
@@ -998,18 +1013,31 @@ def pcb_between_gripper_fingers(
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-    edge_sig = float(offset_m) + 1e-9
-    edge_l = torch.exp(-geom["dist_l"] / edge_sig)
-    edge_r = torch.exp(-geom["dist_r"] / edge_sig)
-    edge_shaping = torch.minimum(edge_l, edge_r)
-
-    reward = (
-        is_graspable.to(thickness_shaping.dtype)
-        * between_jaws.to(thickness_shaping.dtype)
-        * thickness_shaping
-        * edge_shaping
+    sig = float(proximity_sigma_m) + 1e-9
+    prox = torch.minimum(
+        torch.exp(-geom["dist_l"] / sig),
+        torch.exp(-geom["dist_r"] / sig),
     )
-    return reward
+
+    return is_graspable * between_jaws * prox
+
+
+def gripper_closing_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    open_width_m: float,
+) -> torch.Tensor:
+    """Dense reward for closing the parallel gripper from its open position.
+
+    Returns ``(1 - gq / open_width_m)`` in ``[0, 1]``: 0 when fully open, 1 when fully closed.
+    This term is **ungated** — it always provides a gradient to close — so the policy gets an
+    exploration signal toward closing from the very first step, even before ``pcb_between_fingers``
+    can contribute (which requires the straddle + proximity conditions to be partially satisfied).
+    The full grasp reward still dominates once the board is properly straddled.
+    """
+    robot = env.scene[asset_cfg.name]
+    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
+    return (1.0 - gq / float(open_width_m)).clamp(0.0, 1.0)
 
 
 def pcb_finger_object_proximity(
@@ -1023,24 +1051,27 @@ def pcb_finger_object_proximity(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Per-finger tanh proximity to opposite-side trailing-edge targets (not PCB root vs midpoint)."""
+    """Per-finger tanh proximity to opposite-side trailing-edge targets.
+
+    Ungated dense gradient (active from far away) so each jaw is pulled toward its own target —
+    left → trailing-edge centre ``+`` half-thickness, right → centre ``-`` half-thickness. The two
+    targets sit on opposite faces of the board, so maximising this term already steers the jaws
+    toward a straddle without any hard ``between`` gate.
+    """
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
     left_tgt, right_tgt = _finger_trailing_edge_grasp_targets(
         env, pcb_cfg, half_length_m, pcb_half_thickness_m
     )
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
-    is_between = (w_left * w_right < 0.0).to(dtype=left.dtype)
     lfinger_dist = torch.norm(left - left_tgt, dim=-1)
     rfinger_dist = torch.norm(right - right_tgt, dim=-1)
     sig = float(std) + 1e-9
-    proximity = 0.5 * (
-        (1.0 - torch.tanh(lfinger_dist / sig)) + (1.0 - torch.tanh(rfinger_dist / sig))
+    # min over fingers: both jaws must be close (no farming one finger only).
+    return torch.minimum(
+        1.0 - torch.tanh(lfinger_dist / sig),
+        1.0 - torch.tanh(rfinger_dist / sig),
     )
-    return is_between * proximity
 
 
 def gripper_jaw_belt_corridor_penalty(
