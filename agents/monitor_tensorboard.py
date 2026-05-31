@@ -16,6 +16,11 @@ import os
 import subprocess
 import sys
 
+try:
+    from .workspace_paths import ISAACLAB_ROOT, WORKSPACE_LOGS_DIR
+except ImportError:
+    from workspace_paths import ISAACLAB_ROOT, WORKSPACE_LOGS_DIR
+
 # Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
 WIDOWX_RL_RUNS = (
     ("Grasp", "WidowX_PCB_Grasp_RL/widowx_pcb_grasp/summaries"),
@@ -29,8 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--logdir",
         type=str,
-        default="logs",
-        help="Isaac Lab logs root (typically <IsaacLab>/logs).",
+        default=WORKSPACE_LOGS_DIR,
+        help=f"Logs root (default: workspace logs at {WORKSPACE_LOGS_DIR}).",
     )
     parser.add_argument("--port", type=int, default=6006, help="TensorBoard HTTP port.")
     parser.add_argument(
@@ -47,13 +52,18 @@ def _find_existing_logdir(user_logdir: str) -> str | None:
 
     Priority:
     1) user-provided path as-is (absolute or relative to cwd)
-    2) walk upward from cwd and try "<ancestor>/<user_logdir>" and "<ancestor>/logs"
+    2) workspace logs (``WORKSPACE_LOGS_DIR``)
+    3) Isaac Lab root logs (``<IsaacLab>/logs``)
+    4) walk upward from cwd and try "<ancestor>/<user_logdir>" and "<ancestor>/logs"
     """
     candidates: list[str] = []
     if os.path.isabs(user_logdir):
         candidates.append(user_logdir)
     else:
         candidates.append(os.path.abspath(user_logdir))
+
+    candidates.append(WORKSPACE_LOGS_DIR)
+    candidates.append(os.path.join(ISAACLAB_ROOT, "logs"))
 
     cwd = os.getcwd()
     current = cwd
@@ -92,10 +102,8 @@ def _find_widowx_summary_dirs(logdir: str) -> list[tuple[str, str]]:
 def _print_cwd_hint() -> None:
     if not _is_widowx_package_cwd():
         return
-    print("[HINT] Current directory is the widowx_pcb package folder.")
-    print("       Train from the Isaac Lab root (directory containing scripts/)")
-    print("       so logs land in <IsaacLab>/logs/rl_games/...")
-    print("       Pass --logdir /path/to/IsaacLab/logs if auto-detection picks the wrong folder.")
+    print("[HINT] Train with scripts/train_grasp.sh so logs land in ./logs/rl_games/ (this workspace).")
+    print("       To copy existing Isaac Lab logs: bash scripts/sync_logs_from_isaaclab.sh")
     print()
 
 

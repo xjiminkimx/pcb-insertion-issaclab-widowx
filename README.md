@@ -58,22 +58,35 @@ Both branches are created from the same initial commit when the repository is fi
 - [Isaac Sim](https://developer.nvidia.com/isaac-sim) and **Isaac Lab** installed and on your `PYTHONPATH`, consistent with the parent `IsaacLab` repo layout.
 - Conda (or equivalent) env that can run Isaac Lab training scripts (example name: `isaac-sim`).
 
-Commands below assume you run training from the **Isaac Lab repository root** (the directory that contains `scripts/`).
-
 ## Train (rl-games PPO)
+
+**Recommended:** use the workspace scripts so TensorBoard logs and checkpoints are saved under **`logs/` in this repo**.
 
 **Phase 1 — grasp only:**
 
 ```bash
 conda activate isaac-sim   # or your env name
-cd /path/to/IsaacLab   # repository root (contains scripts/)
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --num_envs 4096 --headless
+cd /path/to/widowx_pcb   # this workspace
+bash scripts/train_grasp.sh --num_envs 4096 --headless
 ```
 
-**Phase 2 — insert only** (after grasp policy is reasonable, or from scratch with snapped grasp reset):
+**Phase 2 — insert only:**
 
 ```bash
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Insert-v0 --num_envs 4096 --headless
+bash scripts/train_insert.sh --num_envs 4096 --headless
+```
+
+If you already trained from the Isaac Lab root, copy logs into the workspace once:
+
+```bash
+bash scripts/sync_logs_from_isaaclab.sh
+```
+
+Alternative (logs under `<IsaacLab>/logs/` instead of this workspace):
+
+```bash
+cd /path/to/IsaacLab
+python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --num_envs 4096 --headless
 ```
 
 
@@ -137,14 +150,10 @@ ffmpeg -y -i input.mp4 -vf "setpts=PTS*(125/30)" -r 30 -c:v libx264 -crf 18 -pix
 
 Training with rl-games **automatically** writes TensorBoard event files. No extra flags are required — `use_diagnostics: True` is already set in [`agents/rl_games_ppo_cfg.py`](agents/rl_games_ppo_cfg.py).
 
-Run training from the **Isaac Lab repository root** (the directory that contains `scripts/`). If you start training from the `widowx_pcb` package folder, logs may land under an unexpected cwd.
+When you use `scripts/train_grasp.sh` / `scripts/train_insert.sh`, logs are written under **this workspace**:
 
-### Where logs are saved
-
-Each run folder contains `summaries/` (TensorBoard scalars), `nn/` (checkpoints), and `params/` (saved YAML configs).
-
-| Task | Task ID | Log folder (under Isaac Lab root) |
-|------|---------|-----------------------------------|
+| Task | Task ID | Log folder (under workspace) |
+|------|---------|------------------------------|
 | Grasp | `Isaac-WidowX-PCB-Grasp-v0` | `logs/rl_games/WidowX_PCB_Grasp_RL/widowx_pcb_grasp/` |
 | Insert | `Isaac-WidowX-PCB-Insert-v0` | `logs/rl_games/WidowX_PCB_Insert_RL/widowx_pcb_insert/` |
 
@@ -154,14 +163,14 @@ TensorBoard event files live in each run's `summaries/` subdirectory, e.g.:
 
 ### View logs
 
-**Option A — project helper** (works from any cwd; resolves the Isaac Lab `logs/` folder automatically):
+**Option A — project helper** (defaults to workspace `logs/`):
 
 ```bash
-python /path/to/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/manager_based/widowx_pcb/agents/monitor_tensorboard.py \
-    --logdir /path/to/IsaacLab/logs --port 6006
+cd /path/to/widowx_pcb
+python agents/monitor_tensorboard.py --port 6006
 ```
 
-**Option B — Isaac Lab wrapper** (from Isaac Lab root):
+**Option B — Isaac Lab wrapper** (if logs are still under Isaac Lab root):
 
 ```bash
 cd /path/to/IsaacLab
