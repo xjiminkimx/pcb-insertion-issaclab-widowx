@@ -902,7 +902,18 @@ def gripper_pinch_readiness(
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Soft readiness in ``[0, 1]`` for closing: thickness + jaw rail + wrist→carriage alignment."""
+    """Soft readiness in ``[0, 1]`` for closing: thickness + jaw rail + wrist→carriage alignment.
+
+    ``sep_ok`` uses the **thickness-axis straddle gap** ``|w_left - w_right|`` (jaw separation
+    along the PCB normal), not the raw 3D distance between the jaw body origins.  A genuine grip
+    on a 2.5 mm board drives the body-origin distance small, so the old ``n > min_finger_sep_m``
+    raw check spuriously failed (``sep_ok = 0``) exactly when the gripper was correctly closed.
+    The straddle gap stays ~board-thickness while straddling, so it is the correct, geometry-
+    independent anti-degenerate signal.
+
+    ``wc_align`` is floored so a non-ideal wrist→carriage heading cannot by itself zero out the
+    readiness; it still contributes a continuous bonus toward the push-axis-aligned pose.
+    """
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
     left, right = gripper_finger_tips_world(
@@ -913,8 +924,6 @@ def gripper_pinch_readiness(
     w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
     thickness_ok = torch.exp(-torch.abs(w) / thickness_sigma_m)
 
-    v = right - left
-    n = torch.norm(v, dim=-1)
     rail_align_z = gripper_rail_align_world_z(env, left, right)
     wc_align = gripper_wrist_carriage_align_axis(
         env,
@@ -924,7 +933,15 @@ def gripper_pinch_readiness(
         tip_offset_m,
         push_axis_world,
     )
-    sep_ok = (n > min_finger_sep_m).to(dtype=v.dtype)
+    # Floor wc_align at 0.5 so a non-ideal heading reduces but never zeroes the readiness.
+    wc_align = 0.5 + 0.5 * wc_align
+
+    # Anti-degenerate: jaws straddle the board faces with a real gap along the thickness axis.
+    w_left, w_right = _finger_thickness_offsets(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    straddle_gap = torch.abs(w_left - w_right)
+    sep_ok = (straddle_gap > float(min_finger_sep_m)).to(dtype=thickness_ok.dtype)
     return thickness_ok * rail_align_z * wc_align * sep_ok
 
 
@@ -955,37 +972,25 @@ def pcb_between_gripper_fingers(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
-    pcb_half_thickness_m: float = 0.00125,
+    pcb_half_thickness_m: float = 0.0005,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    min_span_frac: float = 0.05,
-    width_sigma_m: float = 0.020,
-    gripper_joint_cfg: SceneEntityCfg | None = None,
-    open_width_m: float = 0.010,
-    closed_target_m: float | None = None,
+    min_span_frac: float = 0.01,
+    width_sigma_m: float = 0.010,
 ) -> torch.Tensor:
-    """Unified grasp reward: straddle + approach + width-centering + closing — all multiplicative.
+    """Straddle-quality reward: how well the PCB is positioned between the jaws (position only).
 
-    **Why all factors must be in one term (not separate additive terms):**
+    Four multiplicative factors — purely geometric, **no closedness** (closing is handled by
+    the separate ``gripper_closing_reward`` term so the closing gradient is not diluted or
+    suppressed by these position factors):
 
-    A separate ``gripper_closing_reward`` term creates a shortcut: the policy closes early
-    whenever the straddle gate triggers transiently during approach, collecting closing reward
-    without ever achieving a proper straddle.  Making closedness a multiplicative factor inside
-    this term removes that shortcut — closing only pays when **all** of the following are
-    simultaneously satisfied:
-
-    1. ``is_graspable``  — one jaw on each face of the PCB (thickness axis, hard gate).
-    2. ``between_jaws``  — PCB centre within the jaw-span projection (hard gate).
-    3. ``prox``          — ``min(exp(-dist_l/σ), exp(-dist_r/σ))`` per-finger proximity.
-                           σ=proximity_sigma_m is wide (≥ finger travel distance) so the
-                           gradient is non-zero throughout the full approach.
-    4. ``width_centre``  — ``exp(-|mean_Y_err|/σ_w)`` — jaws centred along PCB short edge.
-    5. ``closedness``    — ``(open_width - gq) / (open_width - closed_target)`` — gripper
-                           is actually closing onto the board.  Zero when fully open, 1 at
-                           contact.  When ``gripper_joint_cfg`` is None this factor is omitted.
-
-    Training sequence that emerges:
-      Approach → achieve straddle + edge alignment → THEN close (all five factors peak together).
+    1. ``is_graspable``  — hard gate: one jaw on each face of the PCB (thickness axis sign).
+    2. ``between_jaws``  — hard gate: PCB centre within the jaw-span projection.
+    3. ``prox``          — ``min(exp(-dist_l/σ), exp(-dist_r/σ))`` per-finger proximity to the
+                           trailing-edge ±half-thickness targets (the real board faces).
+                           σ=proximity_sigma_m is wide enough that the gradient spans the full
+                           approach distance.
+    4. ``width_centre``  — ``exp(-|mean_Y_err|/σ_w)`` — jaws centred along the PCB short edge.
     """
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
@@ -1006,10 +1011,10 @@ def pcb_between_gripper_fingers(
     margin = float(min_span_frac)
     between_jaws = ((span_frac >= margin) & (span_frac <= (1.0 - margin))).to(left.dtype)
 
-    # Factor 3: per-finger proximity to trailing-edge ±half-thickness targets.
+    # Factor 3: per-finger proximity to trailing-edge ±half-thickness targets (real board faces).
     geom = _fingers_trailing_edge_geometry(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg,
-        half_length_m, pcb_half_thickness_m*10,
+        half_length_m, pcb_half_thickness_m,
         tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg,
     )
     sig = float(proximity_sigma_m) + 1e-9
@@ -1023,19 +1028,7 @@ def pcb_between_gripper_fingers(
     wsig = float(width_sigma_m) + 1e-9
     width_centre = torch.exp(-torch.abs(mean_width_err) / wsig)
 
-    reward = is_graspable * between_jaws * prox * width_centre
-
-    # Factor 5: closedness — only if gripper joint config provided.
-    if gripper_joint_cfg is not None:
-        robot = env.scene[gripper_joint_cfg.name]
-        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-        h = float(pcb_half_thickness_m)
-        target = float(closed_target_m) if closed_target_m is not None else 2.0 * h
-        denom = max(float(open_width_m) - target, 1e-4)
-        closedness = ((float(open_width_m) - gq) / denom).clamp(0.0, 1.0)
-        reward = reward * closedness
-
-    return reward
+    return is_graspable * between_jaws * prox * width_centre
 
 
 def gripper_closing_reward(
@@ -1558,6 +1551,25 @@ def action_rate_l2(env: ManagerBasedRLEnv) -> torch.Tensor:
     """
     # Penalize abrupt action changes: smoother control -> less jitter at grasp/insert.
     return torch.sum(torch.square(env.action_manager.action - env.action_manager.prev_action), dim=1)
+
+
+def pcb_push_axis_displacement_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    initial_y_env: float,
+    max_displacement_m: float = 0.02,
+) -> torch.Tensor:
+    """Penalty when the PCB root shifts beyond ``max_displacement_m`` toward +Y (push direction).
+
+    Grasp phase should pinch the trailing edge without sliding the board toward the slot.
+    Uses env-local Y displacement from the spawn position (``initial_y_env``).
+
+    Returns ``relu(dy - max_displacement_m)`` — pair with a **negative** weight.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    y_env = pcb.data.root_pos_w[:, 1] - env.scene.env_origins[:, 1]
+    dy = y_env - float(initial_y_env)
+    return torch.clamp(dy - float(max_displacement_m), min=0.0)
 
 
 def pcb_height_below_reference(

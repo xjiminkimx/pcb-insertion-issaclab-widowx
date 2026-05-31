@@ -36,16 +36,16 @@ from .mdp_custom import (
     pcb_horizontal_velocity_perpendicular_to_axis_penalty,
     action_rate_l2,
     pcb_height_below_reference,
+    pcb_push_axis_displacement_penalty,
     pcb_thickness_axis_tilt_penalty,
     # --- grasp / push rewards ---
-    gripper_trailing_edge_proximity_shaping,
-    gripper_trailing_edge_approach_progress,
     grasp_success_bonus_reward,
     gripper_jaw_rail_vertical_shaping,
     gripper_wrist_carriage_push_axis_shaping,
     gripper_jaw_rail_horizontal_penalty,
     pcb_between_gripper_fingers,
     pcb_finger_object_proximity,
+    gripper_closing_reward,
     premature_close_penalty,
     pcb_insertion_depth_reward,
     grasp_edge_center_achieved,
@@ -68,7 +68,7 @@ from .mdp_custom import (
 # Conversion: mm to meters
 PCB_X = 240.0 * 0.001
 PCB_Y = 77.5 * 0.001
-PCB_Z = 0.0025
+PCB_Z = 0.0005
 _PCB_HALF_WIDTH_M = PCB_Y * 0.5
 _SHORT_EDGE_WIDTH_WEIGHT = 3.0
 ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -119,12 +119,12 @@ _ROBOT_HOME_JOINT_POS = {
     "joint_3": 0.0,    # wrist pitch
     "joint_4": 0.0,  # wrist roll ≈ −90° — jaw rail vertical (⊥ XY), not level carriage
     "joint_5": 1.5,    # wrist yaw — face toward conveyor (+Y approach)
-    "left_carriage_joint": 0.010,  # open
+    "left_carriage_joint": 0.020,  # open
 }
 # Insert-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
-_INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": 0.002}
+_INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": PCB_Z * 0.5}
 # Must match the joint value when the gripper is fully open (same as left_carriage_joint above).
-_GRIPPER_OPEN_WIDTH_M = 0.010
+_GRIPPER_OPEN_WIDTH_M = 0.020
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (env_v3 FK at _MAG_POS above)
@@ -134,23 +134,11 @@ _CONVEYOR_CENTER_X_ENV = 0.050     # chip / conveyor centre X in env frame
 _CONVEYOR_SURFACE_Z = 0.163        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
 _PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 +0.07
 
-# Optional jaw corridor penalty bounds (unused while guide rods are omitted from USD).
-_BELT_CORRIDOR_X_MIN_ENV = 0.0
-_BELT_CORRIDOR_X_MAX_ENV = 0.20
-_BELT_CORRIDOR_Z_MIN_ENV = _CONVEYOR_SURFACE_Z - 0.010
-_BELT_CORRIDOR_Z_MAX_ENV = _PCB_CENTER_Z_ENV + PCB_Z * 0.5 + 0.030
-# Lateral collision hull beyond jaw / wrist body origins (world X, env-local corridor).
-_BELT_CORRIDOR_JAW_HALF_WIDTH_M = 0.025
-_BELT_CORRIDOR_WRIST_HALF_WIDTH_M = 0.012
-# Distal offset for corridor only (grasp rewards still use ``_GRIPPER_TIP_OFFSET_M = 0``).
-_BELT_CORRIDOR_TIP_OFFSET_M = 0.015
-
 # ---------------------------------------------------------------------------
 # PCB — derived only from conveyor + slot (not from robot / gripper)
 # ---------------------------------------------------------------------------
 _PCB_FRONT_EDGE_GAP_M = 0.020      # front edge (toward +Y) this far before slot mouth
-# Nudge spawn toward slot so the arm is not fully stretched at the trailing edge.
-_PCB_INIT_Y_OFFSET_M = -0.075
+_PCB_INIT_Y_OFFSET_M = -0.1
 
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
@@ -162,6 +150,8 @@ _PCB_INIT_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
 
 _MIN_PCB_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.005
 _PCB_TERMINATE_MIN_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.025
+# Grasp phase: penalize sliding the board toward the slot (+Y) beyond this displacement.
+_PCB_MAX_PUSH_DISPLACEMENT_M = 0.020
 
 _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV = (
     _CONVEYOR_CENTER_X_ENV,
@@ -189,7 +179,7 @@ def _gripper_kinematics_kwargs() -> dict:
     }
 
 # Relaxed straddle threshold for early learning (≈35% of board thickness between jaw tips).
-_MIN_STRADDLE_SEP_M = PCB_Z * 0.35
+_MIN_STRADDLE_SEP_M = PCB_Z * 0.20
 
 # Grasp-success check kwargs reused by phase transition, bonus, and termination.
 # Thresholds are intentionally generous: the policy must achieve a real closed straddle
@@ -205,12 +195,12 @@ _MIN_STRADDLE_SEP_M = PCB_Z * 0.35
 # ``gate_dist_m``: jaw-mid distance to trailing edge < this.  20 mm is generous.
 # ``min_pinch_ready``: pinch_readiness score ≥ 0.10 (very easy).
 _GRASP_CHECK_KWARGS = {
-    "closed_threshold": 0.60,
-    "gate_dist_m": 0.020,
-    "width_frac": 0.15,
+    "closed_threshold": 0.85,
+    "gate_dist_m": 0.030,
+    "width_frac": 0.30,
     "min_pinch_ready": 0.10,
     "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-    "thickness_sigma_m": 0.010,
+    "thickness_sigma_m": 0.020,
     "min_finger_sep_m": 0.004,
     "pcb_half_thickness_m": PCB_Z * 0.5,
     "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
@@ -247,16 +237,6 @@ def _grasp_entity_params(**extra) -> dict:
     return base
 
 
-def _grasp_distance_params(**extra) -> dict:
-    """Grasp entity params plus width-weighted trailing-edge distance kwargs."""
-    base = _grasp_entity_params(
-        width_weight=_SHORT_EDGE_WIDTH_WEIGHT,
-        pcb_half_thickness_m=PCB_Z * 0.5,
-    )
-    base.update(extra)
-    return base
-
-
 def _grasp_orientation_base_params(**extra) -> dict:
     """Near-edge gate kwargs for top/bottom orientation rewards (no push axis)."""
     base = _grasp_entity_params(
@@ -268,13 +248,8 @@ def _grasp_orientation_base_params(**extra) -> dict:
     return base
 
 
-def _grasp_orientation_params(**extra) -> dict:
-    """Orientation rewards including wrist→carriage ∥ push axis (+Y)."""
-    return _grasp_orientation_base_params(push_axis_world=PUSH_AXIS_WORLD, **extra)
-
-
 def _grasp_between_fingers_params(**extra) -> dict:
-    """Kwargs for pcb_between_gripper_fingers (straddle + proximity + width-centering + closing)."""
+    """Kwargs for pcb_between_gripper_fingers (straddle + proximity + width-centering, position only)."""
     base = {
         "pcb_cfg": _PCB_ENT,
         "left_finger_cfg": _LEFT_FINGER,
@@ -285,10 +260,25 @@ def _grasp_between_fingers_params(**extra) -> dict:
         "proximity_sigma_m": 0.040,
         # Width-centring: 0.37 at 20 mm off, 0.78 at 5 mm off, 1.0 centred.
         "width_sigma_m": 0.020,
-        # Closing factor inside the term — prevents any reward for closing before straddling.
-        "gripper_joint_cfg": _GRIPPER_JOINT,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _grasp_closing_params(**extra) -> dict:
+    """Kwargs for gripper_closing_reward — straddle-gated closing signal.
+
+    Returns ``is_straddled * closedness`` so the reward is zero during the open-jaw approach
+    and ramps up only once one jaw is on each face of the board (paired with a positive weight).
+    """
+    base = {
+        "asset_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
-        "closed_target_m": PCB_Z,   # gripper closes to ~board thickness
+        # Enable the straddle gate (w_left * w_right < 0 → close only when straddling).
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
         **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
@@ -319,26 +309,6 @@ def _grasp_premature_close_params(**extra) -> dict:
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
         **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _belt_corridor_penalty_params(**extra) -> dict:
-    """Shared kwargs for side-belt jaw corridor penalty (world-frame geometry)."""
-    base = {
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "wrist_body_cfg": _WRIST_BODY,
-        "corridor_x_min_env": _BELT_CORRIDOR_X_MIN_ENV,
-        "corridor_x_max_env": _BELT_CORRIDOR_X_MAX_ENV,
-        "belt_surface_z_env": _CONVEYOR_SURFACE_Z,
-        "height_z_min_env": _BELT_CORRIDOR_Z_MIN_ENV,
-        "height_z_max_env": _BELT_CORRIDOR_Z_MAX_ENV,
-        "corridor_tip_offset_m": _BELT_CORRIDOR_TIP_OFFSET_M,
-        "jaw_lateral_half_width_m": _BELT_CORRIDOR_JAW_HALF_WIDTH_M,
-        "wrist_lateral_half_width_m": _BELT_CORRIDOR_WRIST_HALF_WIDTH_M,
-        "overflow_sigma_m": 0.005,
     }
     base.update(extra)
     return base
@@ -556,36 +526,33 @@ class _SafetyRewardsCfg:
 
 @configclass
 class RewardsGraspPhaseCfg():
-    """Grasp phase reward stack — three additive terms.
+    """Grasp phase reward stack.
 
-    Design rationale:
+    Signals on the gripper joint are cleanly separated so the closing gradient is strong and
+    not diluted by the geometric straddle factors:
 
     * ``finger_proximity`` (weight 2.0): ungated dense approach signal.  Both jaws are pulled
-      toward their ±½-thickness targets throughout the full approach.  Keeps gradients alive
-      even when ``pcb_between_fingers`` is still zero (gripper open, not yet straddling).
+      toward their ±½-thickness targets throughout the full approach.  Active from step 1.
 
-    * ``jaw_rail_vertical`` (weight 2.5): orientation shaping so the jaw rail stays ∥ world +Z
-      throughout the episode; corrects gravity sag early.
+    * ``jaw_rail_vertical`` (weight 2.5): orientation shaping so the jaw rail stays ∥ world +Z;
+      corrects gravity sag early.
 
-    * ``pcb_between_fingers`` (weight 8.0): **single unified grasp term** — five multiplicative
-      factors that ALL must be satisfied simultaneously before any reward is given:
-
+    * ``pcb_between_fingers`` (weight 80.0): straddle quality, **position only** — four
+      multiplicative factors:
         1. ``is_graspable``  — hard gate: one jaw above, one below PCB thickness plane.
         2. ``between_jaws``  — hard gate: PCB centre within jaw-span projection.
         3. ``prox``          — smooth: both jaws near their ±½-thickness targets (σ=40 mm).
         4. ``width_centre``  — smooth: jaws centred on PCB short-edge centre (σ=20 mm).
-        5. ``closedness``    — smooth: gripper closing from open_width toward board thickness.
+      No closedness factor here — it would fight the grip once the jaws hug the board.
 
-      Putting closedness inside this term (not as a separate additive reward) removes the
-      shortcut where the policy closes early — closing only pays when it is simultaneously
-      straddling, spanning, aligned, and centred.
+    * ``gripper_closing`` (weight +60.0): ``is_straddled × closedness``.  Zero during the
+      open-jaw approach, then a strong, clean "close now" signal once one jaw is on each face.
 
-    * ``grasp_success_bonus`` (weight 5.0): sparse bonus for a held valid edge-centre pinch.
+    * ``premature_close`` (weight -8.0): ``(1 − is_straddled) × closedness``.  Penalty for
+      closing before straddling.  Net gripper-joint gradient: −8·closedness when not straddled
+      (stay open), +60·closedness when straddled (close firmly).
 
-    * ``premature_close`` (weight -3.0): **penalty** for closing the gripper while not yet
-      straddling. During approach, ``pcb_between_fingers = 0`` so there is no gradient on
-      the gripper joint at all — the policy may close by random exploration and PPO locks
-      it in. This penalty gives an explicit negative signal: stay open until straddled.
+    * ``grasp_success_bonus`` (weight 15.0): sparse bonus for a held valid edge-centre pinch.
     """
 
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.0002)
@@ -602,25 +569,40 @@ class RewardsGraspPhaseCfg():
         params=_grasp_orientation_base_params(),
         weight=2.5,
     )
-    # Unified grasp: straddle × span × approach × width-centering × closing — multiplicative.
-    # No shortcut to close early: ALL five factors must peak together.
+    # Straddle quality (position only, no closedness): straddle × span × approach × width-centering.
     pcb_between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers,
         params=_grasp_between_fingers_params(),
         weight=100.0,
+    )
+    # Closing — gated on straddle.  Separate from position so the closing gradient is strong.
+    gripper_closing = RewardTermCfg(
+        func=gripper_closing_reward,
+        params=_grasp_closing_params(),
+        weight=15.0,
     )
     # Penalty for closing before straddling — fills the zero-gradient gap during approach.
     # Value = closedness when NOT straddled; paired with negative weight → stay open.
     premature_close = RewardTermCfg(
         func=premature_close_penalty,
         params=_grasp_premature_close_params(),
-        weight=-50.0,
+        weight=-8.0,
     )
     # Sparse success bonus for a completed, held pinch on the trailing edge centre.
     grasp_success_bonus = RewardTermCfg(
         func=grasp_success_bonus_reward,
         params=_grasp_termination_params(),
-        weight=5.0,
+        weight=15.0,
+    )
+    # Penalize sliding the PCB toward the slot (+Y) during grasp — keep the board at the trailing edge.
+    pcb_push_displacement = RewardTermCfg(
+        func=pcb_push_axis_displacement_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "initial_y_env": _PCB_INIT_POS[1],
+            "max_displacement_m": _PCB_MAX_PUSH_DISPLACEMENT_M,
+        },
+        weight=-12.0,
     )
 
 
