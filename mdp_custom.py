@@ -1031,6 +1031,78 @@ def pcb_between_gripper_fingers(
     return is_graspable * between_jaws * prox * width_centre
 
 
+# Consecutive env steps with straddle quality + gripper closedness above hold thresholds.
+_GRASP_HOLD_STEPS: torch.Tensor | None = None
+
+
+def pcb_between_gripper_fingers_hold_reward(
+    env: ManagerBasedRLEnv,
+    proximity_sigma_m: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    gripper_joint_cfg: SceneEntityCfg,
+    open_width_m: float,
+    pcb_half_thickness_m: float = 0.00125,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    min_span_frac: float = 0.05,
+    width_sigma_m: float = 0.020,
+    hold_threshold: float = 0.25,
+    min_closedness: float = 0.35,
+    max_hold_steps: int = 80,
+) -> torch.Tensor:
+    """Sustained **grasp** bonus: ramps while straddle quality stays high **and** the gripper closes.
+
+    Straddle-only hold would let the policy earn bonus with open jaws.  The hold counter runs only
+    when **both**:
+
+    * ``quality >= hold_threshold`` — PCB between jaws (``pcb_between_gripper_fingers``).
+    * ``closedness >= min_closedness`` — carriage has closed enough to pinch the board.
+
+    Reward each step: ``quality × closedness × (hold_steps / max_hold_steps)``.  Counter resets
+    when either condition fails or the episode restarts.
+
+    Sequence: approach → straddle → close → **hold closed grasp** (this term).
+    """
+    global _GRASP_HOLD_STEPS
+    quality = pcb_between_gripper_fingers(
+        env,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m,
+        wrist_body_cfg,
+        min_span_frac,
+        width_sigma_m,
+    )
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    closedness = (1.0 - gq / float(open_width_m)).clamp(0.0, 1.0)
+
+    first_step = env.episode_length_buf == 1
+    grasping = (quality >= float(hold_threshold)) & (closedness >= float(min_closedness))
+    if (
+        _GRASP_HOLD_STEPS is None
+        or _GRASP_HOLD_STEPS.shape[0] != env.num_envs
+        or _GRASP_HOLD_STEPS.device != env.device
+    ):
+        _GRASP_HOLD_STEPS = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    _GRASP_HOLD_STEPS = torch.where(
+        first_step | (~grasping),
+        torch.zeros_like(_GRASP_HOLD_STEPS),
+        _GRASP_HOLD_STEPS + 1,
+    )
+    hold_frac = (
+        _GRASP_HOLD_STEPS.to(dtype=quality.dtype) / float(max(max_hold_steps, 1))
+    ).clamp(0.0, 1.0)
+    return torch.where(grasping, quality * closedness * hold_frac, torch.zeros_like(quality))
+
+
 def gripper_closing_reward(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -1860,6 +1932,48 @@ def reset_robot_joints_to_values(
     joint_vel = joint_vel.clamp(-vlim, vlim)
     robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
     # Refresh link poses so a following reset term reads current FK (same reset cycle, no physics step yet).
+    robot.update(0.0)
+
+
+def reset_robot_joints_to_values_randomized(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    joint_positions: dict[str, float],
+    joint_position_ranges: dict[str, tuple[float, float]],
+    velocity_scale: float = 0.0,
+) -> None:
+    """Set listed joints to nominal positions plus uniform per-env offsets (domain randomization).
+
+    For each joint in ``joint_positions``, samples
+    ``nominal + Uniform(lo, hi)`` independently per environment.  Joints omitted from
+    ``joint_position_ranges`` default to zero offset.  Use ``(0.0, 0.0)`` to keep a joint
+    fixed (e.g. gripper open at reset).
+
+    Values are clamped to soft joint limits before writing to the simulator.
+    """
+    robot = env.scene[asset_cfg.name]
+    joint_pos = robot.data.default_joint_pos[env_ids].clone()
+    joint_vel = robot.data.default_joint_vel[env_ids].clone() * velocity_scale
+    name_to_idx = {n: i for i, n in enumerate(robot.joint_names)}
+    n = len(env_ids)
+    device = env.device
+    dtype = joint_pos.dtype
+
+    for name, nominal in joint_positions.items():
+        idx = name_to_idx[name]
+        lo, hi = joint_position_ranges.get(name, (0.0, 0.0))
+        if abs(lo) < 1e-12 and abs(hi) < 1e-12:
+            joint_pos[:, idx] = float(nominal)
+        else:
+            offset = torch.empty(n, device=device, dtype=dtype).uniform_(float(lo), float(hi))
+            joint_pos[:, idx] = float(nominal) + offset
+
+    lim = robot.data.soft_joint_pos_limits[env_ids]
+    joint_pos = joint_pos.clamp(lim[..., 0], lim[..., 1])
+    vlim = robot.data.soft_joint_vel_limits[env_ids]
+    joint_vel = joint_vel.clamp(-vlim, vlim)
+    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
     robot.update(0.0)
 
 

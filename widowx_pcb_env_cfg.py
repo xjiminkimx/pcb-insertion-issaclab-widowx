@@ -44,6 +44,7 @@ from .mdp_custom import (
     gripper_wrist_carriage_push_axis_shaping,
     gripper_jaw_rail_horizontal_penalty,
     pcb_between_gripper_fingers,
+    pcb_between_gripper_fingers_hold_reward,
     pcb_finger_object_proximity,
     gripper_closing_reward,
     premature_close_penalty,
@@ -52,6 +53,7 @@ from .mdp_custom import (
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
     reset_robot_joints_to_values,
+    reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
     pcb_dropped_from_gripper,
     pcb_root_height_below_env_minimum,
@@ -120,6 +122,17 @@ _ROBOT_HOME_JOINT_POS = {
     "joint_4": 0.0,  # wrist roll ≈ −90° — jaw rail vertical (⊥ XY), not level carriage
     "joint_5": 1.5,    # wrist yaw — face toward conveyor (+Y approach)
     "left_carriage_joint": 0.020,  # open
+}
+# Per-joint uniform offset ranges (rad) for grasp-phase domain randomization at reset.
+# Nominal pose + Uniform(lo, hi) per env; gripper stays open (zero range).
+_ROBOT_HOME_JOINT_POS_RANGES = {
+    "joint_0": (-0.12, 0.12),
+    "joint_1": (-0.15, 0.15),
+    "joint_2": ( 0.10, 0.50),
+    "joint_3": (-0.20, 0.20),
+    "joint_4": (-0.15, 0.15),
+    "joint_5": ( 1.00, 1.50),
+    "left_carriage_joint": (0.015, 0.025),
 }
 # Insert-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
 _INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": PCB_Z * 0.5}
@@ -261,6 +274,23 @@ def _grasp_between_fingers_params(**extra) -> dict:
         # Width-centring: 0.37 at 20 mm off, 0.78 at 5 mm off, 1.0 centred.
         "width_sigma_m": 0.020,
         **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _grasp_between_fingers_hold_params(**extra) -> dict:
+    """Kwargs for pcb_between_gripper_fingers_hold_reward (sustained grasp bonus)."""
+    base = {
+        **_grasp_between_fingers_params(),
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        # Straddle quality must exceed this to count toward hold.
+        "hold_threshold": 0.25,
+        # Gripper must be at least this closed (0=open, 1=fully closed) to count as grasping.
+        "min_closedness": 0.001,
+        # Ramp to full bonus over this many env steps (~80 × 8 ms ≈ 0.64 s at decimation 4).
+        "max_hold_steps": 20,
     }
     base.update(extra)
     return base
@@ -558,22 +588,28 @@ class RewardsGraspPhaseCfg():
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.0002)
 
     # Dense approach gradient — ungated so learning starts immediately from the home pose.
-    finger_proximity = RewardTermCfg(
-        func=pcb_finger_object_proximity,
-        params=_grasp_finger_proximity_params(),
-        weight=2.0,
-    )
-    # Orientation — jaw rail ∥ world +Z.
-    jaw_rail_vertical = RewardTermCfg(
-        func=gripper_jaw_rail_vertical_shaping,
-        params=_grasp_orientation_base_params(),
-        weight=2.5,
-    )
+    # finger_proximity = RewardTermCfg(
+    #     func=pcb_finger_object_proximity,
+    #     params=_grasp_finger_proximity_params(),
+    #     weight=2.0,
+    # )
+    # # Orientation — jaw rail ∥ world +Z.
+    # jaw_rail_vertical = RewardTermCfg(
+    #     func=gripper_jaw_rail_vertical_shaping,
+    #     params=_grasp_orientation_base_params(),
+    #     weight=2.5,
+    # )
     # Straddle quality (position only, no closedness): straddle × span × approach × width-centering.
     pcb_between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers,
         params=_grasp_between_fingers_params(),
         weight=100.0,
+    )
+    # Sustained grasp — ramps while straddle quality stays high AND gripper stays closed.
+    pcb_between_fingers_hold = RewardTermCfg(
+        func=pcb_between_gripper_fingers_hold_reward,
+        params=_grasp_between_fingers_hold_params(),
+        weight=50.0,
     )
     # Closing — gated on straddle.  Separate from position so the closing gradient is strong.
     gripper_closing = RewardTermCfg(
@@ -592,7 +628,7 @@ class RewardsGraspPhaseCfg():
     grasp_success_bonus = RewardTermCfg(
         func=grasp_success_bonus_reward,
         params=_grasp_termination_params(),
-        weight=15.0,
+        weight=50.0,
     )
     # Penalize sliding the PCB toward the slot (+Y) during grasp — keep the board at the trailing edge.
     pcb_push_displacement = RewardTermCfg(
@@ -653,7 +689,7 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
 
 @configclass
 class EventCfgGrasp:
-    """Phase 1 reset: PCB on rail, gripper open, arm at home."""
+    """Phase 1 reset: PCB on rail, gripper open, arm at randomized home pose."""
 
     reset_pcb_on_conveyor = EventTermCfg(
         func=reset_pcb_on_guide_rails,
@@ -666,13 +702,13 @@ class EventCfgGrasp:
         },
     )
     reset_robot_home = EventTermCfg(
-        func=reset_robot_joints_to_values,
+        func=reset_robot_joints_to_values_randomized,
         mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
             "joint_positions": _ROBOT_HOME_JOINT_POS,
+            "joint_position_ranges": _ROBOT_HOME_JOINT_POS_RANGES,
             "velocity_scale": 0.0,
-            "use_current_joint_pos": False,
         },
     )
 
