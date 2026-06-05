@@ -137,7 +137,11 @@ _ROBOT_HOME_JOINT_POS_RANGES = {
 # Insert-phase reset: same arm pose but closed gripper; PCB is snapped to the jaws afterward.
 _INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": PCB_Z * 0.5}
 # Must match the joint value when the gripper is fully open (same as left_carriage_joint above).
-_GRIPPER_OPEN_WIDTH_M = 0.020
+_GRIPPER_OPEN_WIDTH_M = 0.001
+# Carriage joint value when jaws pinch the board (one jaw travels half the PCB thickness).
+_GRIPPER_CLOSED_TARGET_M = PCB_Z * 0.5
+# Normalized closedness (0=open, 1=at closed target) required for grasp success / hold.
+_GRIPPER_MIN_CLOSEDNESS = 0.85
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (env_v3 FK at _MAG_POS above)
@@ -199,16 +203,14 @@ _MIN_STRADDLE_SEP_M = PCB_Z * 0.20
 # on the trailing edge, but sim contact/damping and PCB thickness limit how far the
 # carriage can physically close.
 #
-# ``closed_threshold``: gq < threshold * open_width.  PCB is 2.5 mm thick, one jaw travels
-#   half that = 1.25 mm from centre, so carriage closes to ~1.25 mm.  With open_width=10 mm,
-#   threshold = 0.75 means gq < 7.5 mm → generous, fires once gripper starts to bite.
-#   Use 0.60 (< 6 mm) as a stricter but still reachable target.
+# ``closed_target_m`` / ``min_closedness``: carriage closes to ~PCB_Z/2; success requires
+#   normalized closedness ≥ min_closedness (see ``_gripper_closedness_to_target``).
 # ``width_frac``: each jaw Y-error < half_width * frac.  half_width = 38.75 mm.
-#   0.15 → < 5.8 mm lateral offset; enough to reward centring without being unreachable.
-# ``gate_dist_m``: jaw-mid distance to trailing edge < this.  20 mm is generous.
-# ``min_pinch_ready``: pinch_readiness score ≥ 0.10 (very easy).
+# ``gate_dist_m``: jaw-mid distance to trailing edge < this.
+# ``min_pinch_ready``: pinch_readiness score ≥ this.
 _GRASP_CHECK_KWARGS = {
-    "closed_threshold": 0.85,
+    "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+    "min_closedness": _GRIPPER_MIN_CLOSEDNESS,
     "gate_dist_m": 0.030,
     "width_frac": 0.30,
     "min_pinch_ready": 0.10,
@@ -285,10 +287,11 @@ def _grasp_between_fingers_hold_params(**extra) -> dict:
         **_grasp_between_fingers_params(),
         "gripper_joint_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         # Straddle quality must exceed this to count toward hold.
         "hold_threshold": 0.25,
-        # Gripper must be at least this closed (0=open, 1=fully closed) to count as grasping.
-        "min_closedness": 0.001,
+        # Gripper must pinch tightly (same closedness scale as grasp success).
+        "min_closedness": _GRIPPER_MIN_CLOSEDNESS,
         # Ramp to full bonus over this many env steps (~80 × 8 ms ≈ 0.64 s at decimation 4).
         "max_hold_steps": 20,
     }
@@ -305,6 +308,7 @@ def _grasp_closing_params(**extra) -> dict:
     base = {
         "asset_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         # Enable the straddle gate (w_left * w_right < 0 → close only when straddling).
         "pcb_cfg": _PCB_ENT,
         "left_finger_cfg": _LEFT_FINGER,
@@ -335,6 +339,7 @@ def _grasp_premature_close_params(**extra) -> dict:
     base = {
         "asset_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         "pcb_cfg": _PCB_ENT,
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
@@ -778,12 +783,12 @@ class TerminationsSharedCfg:
 
 @configclass
 class TerminationsGraspCfg(TerminationsSharedCfg):
-    """Pre-grasp PCB pose failures only.
+    """Pre-grasp PCB pose failures and episode end on successful edge-centre grasp."""
 
-    Grasp success does **not** terminate the episode: the policy should reach the grasp and *hold*
-    it, so holding accumulates reward (``grasp_success_bonus``) up to time-out. Terminating on
-    success would make stalling in a partial pose competitive with completing the grasp.
-    """
+    grasp_success = TerminationTermCfg(
+        func=grasp_edge_center_achieved,
+        params=_grasp_termination_params(),
+    )
 
     # Stricter than shared defaults; guard against the board tipping while the jaws approach.
     pcb_tilt_excessive = TerminationTermCfg(

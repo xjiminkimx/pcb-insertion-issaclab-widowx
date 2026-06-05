@@ -87,6 +87,20 @@ def _gripper_tip_params(
     return {"tip_offset_m": tip_offset_m, "wrist_body_cfg": wrist_body_cfg}
 
 
+def _gripper_closedness_to_target(
+    gq: torch.Tensor,
+    open_width_m: float,
+    closed_target_m: float,
+) -> torch.Tensor:
+    """Normalized closedness in ``[0, 1]``: 0 at ``open_width_m``, 1 at ``closed_target_m``.
+
+    ``closed_target_m`` should match the carriage joint value when the jaws pinch the PCB
+    (typically ``PCB_Z * 0.5`` for symmetric carriage travel).
+    """
+    denom = max(float(open_width_m) - float(closed_target_m), 1e-6)
+    return ((float(open_width_m) - gq) / denom).clamp(0.0, 1.0)
+
+
 def _world_z_up_batch(env: ManagerBasedRLEnv, dtype: torch.dtype) -> torch.Tensor:
     """Unit world +Z (vertical, normal to the env XY plane), shape ``(num_envs, 3)``."""
     return torch.tensor((0.0, 0.0, 1.0), device=env.device, dtype=dtype).unsqueeze(0).expand(env.num_envs, 3)
@@ -754,7 +768,8 @@ def grasp_edge_center_achieved(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_threshold: float = 0.35,
+    closed_target_m: float = 0.00125,
+    min_closedness: float = 0.85,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
@@ -791,7 +806,8 @@ def grasp_edge_center_achieved(
     )
     robot = env.scene[gripper_joint_cfg.name]
     gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closed = gq < float(closed_threshold) * float(open_width_m)
+    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
+    closed = closedness >= float(min_closedness)
     near = dist < float(gate_dist_m)
     centered = (torch.abs(geom["width_l"]) < float(half_width_m) * float(width_frac)) & (
         torch.abs(geom["width_r"]) < float(half_width_m) * float(width_frac)
@@ -822,7 +838,8 @@ def grasp_success_bonus_reward(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_threshold: float = 0.35,
+    closed_target_m: float = 0.00125,
+    min_closedness: float = 0.85,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
@@ -845,7 +862,8 @@ def grasp_success_bonus_reward(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_threshold=closed_threshold,
+        closed_target_m=closed_target_m,
+        min_closedness=min_closedness,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1044,13 +1062,14 @@ def pcb_between_gripper_fingers_hold_reward(
     half_length_m: float,
     gripper_joint_cfg: SceneEntityCfg,
     open_width_m: float,
+    closed_target_m: float = 0.00125,
     pcb_half_thickness_m: float = 0.00125,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.05,
     width_sigma_m: float = 0.020,
     hold_threshold: float = 0.25,
-    min_closedness: float = 0.35,
+    min_closedness: float = 0.85,
     max_hold_steps: int = 80,
 ) -> torch.Tensor:
     """Sustained **grasp** bonus: ramps while straddle quality stays high **and** the gripper closes.
@@ -1082,7 +1101,7 @@ def pcb_between_gripper_fingers_hold_reward(
     )
     robot = env.scene[gripper_joint_cfg.name]
     gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closedness = (1.0 - gq / float(open_width_m)).clamp(0.0, 1.0)
+    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
 
     first_step = env.episode_length_buf == 1
     grasping = (quality >= float(hold_threshold)) & (closedness >= float(min_closedness))
@@ -1107,6 +1126,7 @@ def gripper_closing_reward(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     open_width_m: float,
+    closed_target_m: float = 0.00125,
     pcb_cfg: SceneEntityCfg | None = None,
     left_finger_cfg: SceneEntityCfg | None = None,
     right_finger_cfg: SceneEntityCfg | None = None,
@@ -1128,7 +1148,7 @@ def gripper_closing_reward(
     """
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = (1.0 - gq / float(open_width_m)).clamp(0.0, 1.0)
+    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
 
     if pcb_cfg is None or left_finger_cfg is None or right_finger_cfg is None:
         return closedness
@@ -1147,6 +1167,7 @@ def premature_close_penalty(
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    closed_target_m: float = 0.00125,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
@@ -1167,7 +1188,7 @@ def premature_close_penalty(
     """
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = (1.0 - gq / float(open_width_m)).clamp(0.0, 1.0)
+    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
     w_left, w_right = _finger_thickness_offsets(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
@@ -1761,7 +1782,8 @@ def _grasp_not_yet_achieved(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_threshold: float = 0.35,
+    closed_target_m: float = 0.00125,
+    min_closedness: float = 0.85,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.40,
@@ -1784,7 +1806,8 @@ def _grasp_not_yet_achieved(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_threshold=closed_threshold,
+        closed_target_m=closed_target_m,
+        min_closedness=min_closedness,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1807,7 +1830,8 @@ def pcb_tilt_before_grasp_termination(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_threshold: float = 0.35,
+    closed_target_m: float = 0.00125,
+    min_closedness: float = 0.85,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.30,
     min_pinch_ready: float = 0.40,
@@ -1833,7 +1857,8 @@ def pcb_tilt_before_grasp_termination(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_threshold=closed_threshold,
+        closed_target_m=closed_target_m,
+        min_closedness=min_closedness,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1857,7 +1882,8 @@ def pcb_xy_plane_rotation_before_grasp_termination(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_threshold: float = 0.35,
+    closed_target_m: float = 0.00125,
+    min_closedness: float = 0.85,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.30,
     min_pinch_ready: float = 0.40,
@@ -1885,7 +1911,8 @@ def pcb_xy_plane_rotation_before_grasp_termination(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_threshold=closed_threshold,
+        closed_target_m=closed_target_m,
+        min_closedness=min_closedness,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
