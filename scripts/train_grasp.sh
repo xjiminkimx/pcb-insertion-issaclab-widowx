@@ -13,5 +13,5 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
 fi
 
 cd "${WORKSPACE_DIR}"
-echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/"
+echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_grasp/"
 exec python "${TRAIN_PY}" --task Isaac-WidowX-PCB-Grasp-v0 "$@"

@@ -44,10 +44,11 @@ WidowXPcbPPOBaseCfg = {
         },
         
         "config": {
-            "name": "WidowX_PCB_Base_RL",
-            "full_experiment_name": "widowx_pcb_base",
+            # ``name`` is the log folder under ``logs/rl_games/<name>/``.
+            # ``full_experiment_name`` is ``"."`` so Isaac Lab does not add a redundant nested run dir.
+            "name": "widowx_pcb_base",
+            "full_experiment_name": ".",
             # rl-games writes TensorBoard summaries under the experiment log directory.
-            # This name appears in the path and helps you filter runs in TensorBoard UI.
             "env_name": "rlgpu", # env_name은 config 내부에 있는 것이 표준입니다.
             "device": "cuda:0",  # GPU 강제 할당
             "ppo": True,
@@ -123,8 +124,8 @@ WidowXPcbGraspPPOCfg = {
         },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "WidowX_PCB_Grasp_RL",
-            "full_experiment_name": "widowx_pcb_grasp",
+            "name": "widowx_pcb_grasp",
+            "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
             "entropy_coef": 8e-3,
             "reward_shaper": {"scale_value": 1.0},
@@ -153,8 +154,8 @@ WidowXPcbGraspGripperTestPPOCfg = {
         },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "WidowX_PCB_Grasp_GripperTest_RL",
-            "full_experiment_name": "widowx_pcb_grasp_gripper_test",
+            "name": "widowx_pcb_grasp_gripper_test",
+            "full_experiment_name": ".",
             "entropy_coef": 1e-2,
             "reward_shaper": {"scale_value": 0.2},
             "horizon_length": 64,
@@ -168,8 +169,8 @@ WidowXPcbInsertPPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "WidowX_PCB_Insert_RL",
-            "full_experiment_name": "widowx_pcb_insert",
+            "name": "widowx_pcb_insert",
+            "full_experiment_name": ".",
         },
     },
 }

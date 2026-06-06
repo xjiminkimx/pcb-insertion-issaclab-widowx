@@ -7,9 +7,11 @@ Grasp and insert are separate registered envs (``Isaac-WidowX-PCB-Grasp-v0``,
 """
 
 import torch
+import numpy as np
 import isaaclab.utils.math as math_utils
 from dataclasses import MISSING
 from collections.abc import Sequence
+from pathlib import Path
 
 import isaaclab.utils.string as string_utils
 from isaaclab.assets.articulation import Articulation
@@ -2209,3 +2211,172 @@ def pcb_dropped_from_gripper(
         geom_error = torch.abs(dist_to_gripper - expected_center_distance)
         is_far = geom_error > distance_tolerance
     return is_far | is_low
+
+
+# ---------------------------------------------------------------------------
+# Policy-chaining reset: sample terminal states from Phase-1 buffer
+# (Sequential Dexterity, Chen et al. CoRL 2023, §3.2)
+# ---------------------------------------------------------------------------
+
+# Module-level cache — loaded once on first call.
+_GRASP_STATE_BUFFER: dict | None = None
+_GRASP_BUFFER_PATH: str | None = None
+
+
+def _load_grasp_state_buffer(path: str) -> dict:
+    """Load (or re-use cached) grasp terminal state .npz file."""
+    global _GRASP_STATE_BUFFER, _GRASP_BUFFER_PATH
+    if _GRASP_STATE_BUFFER is not None and _GRASP_BUFFER_PATH == path:
+        return _GRASP_STATE_BUFFER
+    data = np.load(path, allow_pickle=True)
+    _GRASP_STATE_BUFFER = {
+        "joint_pos":   torch.from_numpy(data["joint_pos"].astype(np.float32)),
+        "pcb_pos_env": torch.from_numpy(data["pcb_pos_env"].astype(np.float32)),
+        "pcb_quat":    torch.from_numpy(data["pcb_quat"].astype(np.float32)),
+        "joint_names": list(data["joint_names"]),
+    }
+    _GRASP_BUFFER_PATH = path
+    n = _GRASP_STATE_BUFFER["joint_pos"].shape[0]
+    print(f"[GraspStateBuffer] Loaded {n} terminal states from '{path}'")
+    return _GRASP_STATE_BUFFER
+
+
+def reset_from_grasp_states(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    grasp_states_path: str,
+    velocity_scale: float = 0.0,
+) -> None:
+    """Reset **robot joints only** by sampling from the saved grasp terminal-state buffer.
+
+    Implements the Phase-2 initial-state distribution from Sequential Dexterity
+    (Chen et al. CoRL 2023): the terminal state distribution of Phase 1 (Grasp)
+    becomes the initial state distribution of Phase 2 (Insert).
+
+    The PCB must be placed separately using ``snap_pcb_root_to_short_edge_grasp``
+    **after** this term runs so the board is positioned exactly at the FK jaw
+    midpoint — writing a stored PCB position does not guarantee physical contact.
+
+    Parameters
+    ----------
+    grasp_states_path:
+        Path to the .npz produced by ``scripts/collect_grasp_states.py``.
+    """
+    buf = _load_grasp_state_buffer(grasp_states_path)
+    n_buf = buf["joint_pos"].shape[0]
+    n_reset = len(env_ids)
+    device = env.device
+    dtype = torch.float32
+
+    # Sample with replacement from the buffer.
+    idx = torch.randint(0, n_buf, (n_reset,), device="cpu")
+
+    # ── Robot joints ──────────────────────────────────────────────────────────
+    robot = env.scene[asset_cfg.name]
+    joint_pos_buf = buf["joint_pos"][idx].to(device=device, dtype=dtype)   # (n_reset, n_joints)
+
+    buf_names: list[str] = buf["joint_names"]
+    robot_names: list[str] = robot.joint_names
+    name_to_buf_col = {n: i for i, n in enumerate(buf_names)}
+
+    # Map buffer columns → robot joint indices (buffer may be a subset of joints).
+    joint_pos_new = robot.data.default_joint_pos[env_ids].clone()
+    for robot_col, robot_name in enumerate(robot_names):
+        if robot_name in name_to_buf_col:
+            buf_col = name_to_buf_col[robot_name]
+            joint_pos_new[:, robot_col] = joint_pos_buf[:, buf_col]
+
+    # Clamp to soft limits.
+    lim = robot.data.soft_joint_pos_limits[env_ids]
+    joint_pos_new = joint_pos_new.clamp(lim[..., 0], lim[..., 1])
+    joint_vel_new = torch.zeros_like(joint_pos_new) * velocity_scale
+    robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
+    robot.update(0.0)
+
+
+# ---------------------------------------------------------------------------
+# SDF-based dense insertion reward (IndustReal, Tang et al. RSS 2023, §3.2)
+# ---------------------------------------------------------------------------
+
+def pcb_insertion_sdf_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_center_xyz_env: tuple[float, float, float],
+    slot_half_dims_xyz: tuple[float, float, float],
+    align_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
+    pos_sigma_m: float = 0.06,
+    align_coef: float = 0.3,
+    depth_coef: float = 0.7,
+) -> torch.Tensor:
+    """SDF-inspired dense reward for PCB-slot insertion (IndustReal §3.2).
+
+    Three components combined into one reward in ``[0, 1]``:
+
+    1. **Proximity** — Gaussian kernel on the distance from the PCB leading-edge
+       center to the slot entrance center (env-local).  Provides a smooth
+       landscape across the entire workspace.
+
+    2. **Alignment** — ``|cos θ|`` between the PCB long axis and the slot
+       push direction.  Keeps the board parallel before and during entry.
+
+    3. **Depth** — Linear fraction of how far the leading edge has penetrated
+       past the slot mouth along the push axis.  Zero outside the slot,
+       ramps to 1 at ``2 × half_length_m`` (full insertion).
+
+    The SDF analogy (from IndustReal): the signed distance from the PCB leading
+    edge to the target slot box is approximated by the proximity + depth terms
+    — negative (rewarded) inside the slot, positive (penalised via the shape)
+    outside.  Unlike an exact SDF, this formulation requires no USD SDF queries
+    and works entirely on articulation state tensors.
+
+    Parameters
+    ----------
+    slot_center_xyz_env:
+        Env-local (X, Y, Z) of the **center** of the first slot opening.
+        Measure in Isaac Sim after loading the scene.
+    slot_half_dims_xyz:
+        Half-extents (dx, dy, dz) of the slot opening box in meters.
+        Used to compute the depth fraction; also sets the XZ containment gate.
+    align_axis_world:
+        World-frame insertion direction (typically +Y).
+    pos_sigma_m:
+        Gaussian width for the proximity term.  Set to ~2–3× the slot width
+        so the gradient is non-zero well before contact.
+    align_coef, depth_coef:
+        Fractional weights; must sum to ≤ 1 (remaining goes to proximity).
+    """
+    pcb = env.scene[pcb_cfg.name]
+    device = env.device
+    dtype = pcb.data.root_pos_w.dtype
+
+    # ── Leading edge position (env-local) ─────────────────────────────────────
+    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
+    lead_env = lead_w - env.scene.env_origins[:, :3]
+
+    slot_ctr = torch.tensor(slot_center_xyz_env, device=device, dtype=dtype)  # (3,)
+    slot_half = torch.tensor(slot_half_dims_xyz, device=device, dtype=dtype)  # (3,)
+
+    # ── 1. Proximity: 3-D Gaussian on distance to slot center ─────────────────
+    dist = torch.norm(lead_env - slot_ctr.unsqueeze(0), dim=-1)
+    prox = torch.exp(-dist / (float(pos_sigma_m) + 1e-9))
+
+    # ── 2. Alignment: PCB long axis ∥ insertion axis ──────────────────────────
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    a = torch.tensor(align_axis_world, device=device, dtype=dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    align = torch.abs(torch.sum(x_w * a.unsqueeze(0).expand_as(x_w), dim=-1))
+
+    # ── 3. Depth: leading edge penetration past slot mouth in push-axis coord ──
+    # Project leading edge onto the push axis; slot mouth is at slot_ctr − slot_half along axis.
+    slot_mouth_along_axis = torch.dot(slot_ctr, a) - slot_half[1]  # slot_half[1] ≈ half-depth
+    lead_along_axis = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+    depth_frac = torch.clamp(
+        (lead_along_axis - slot_mouth_along_axis) / (2.0 * float(half_length_m) + 1e-9),
+        min=0.0, max=1.0,
+    )
+
+    prox_coef = 1.0 - float(align_coef) - float(depth_coef)
+    reward = prox_coef * prox + float(align_coef) * align + float(depth_coef) * depth_frac
+    return reward.clamp(0.0, 1.0)

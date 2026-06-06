@@ -53,6 +53,8 @@ from .mdp_custom import (
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
     reset_pcb_on_guide_rails_randomized,
+    reset_from_grasp_states,
+    pcb_insertion_sdf_reward,
     reset_robot_joints_to_values,
     reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
@@ -184,6 +186,22 @@ _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV = (
     _SLOT_MOUTH_Y_ENV,
     _PCB_CENTER_Z_ENV,
 )
+
+# SDF insertion reward: slot box geometry (env-local, meters).
+# _SLOT_CENTER_XYZ_ENV  — center of the first slot opening (X-centred on conveyor,
+#   Y at slot mouth + half the slot depth, Z same as PCB on rail).
+#   TUNE these after confirming slot geometry in Isaac Sim.
+_SLOT_DEPTH_M = 0.050          # depth of the slot (along push axis +Y)
+_SLOT_CENTER_XYZ_ENV = (
+    _CONVEYOR_CENTER_X_ENV,
+    _SLOT_MOUTH_Y_ENV + _SLOT_DEPTH_M * 0.5,
+    _PCB_CENTER_Z_ENV,
+)
+# Half-extents of the slot opening box: (X-width/2, depth/2, Z-height/2)
+_SLOT_HALF_DIMS_XYZ = (PCB_Y * 0.55, _SLOT_DEPTH_M * 0.5, PCB_Z * 2.0)
+
+# Path to the grasp terminal-state buffer (produced by scripts/collect_grasp_states.py).
+_GRASP_STATES_PATH = os.path.join(ASSET_DIR, "data", "grasp_terminal_states.npz")
 
 # Shared SceneEntityCfg snippets (reward / event params).
 _PCB_ENT = SceneEntityCfg("pcb")
@@ -443,8 +461,8 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
                 restitution_combine_mode="multiply",
-                static_friction=2.0,
-                dynamic_friction=1.6,
+                static_friction=2.0*100,
+                dynamic_friction=1.6*100,
                 restitution=0.0,
             ),
             mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
@@ -656,13 +674,41 @@ class RewardsGraspPhaseCfg():
 
 @configclass
 class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
-    """Phase 2 — insert grasped PCB along +Y into the slot."""
+    """Phase 2 — insert grasped PCB along +Y into the slot.
 
-    insert_axis_align = RewardTermCfg(
-        func=pcb_long_axis_parallel_to_push_reward,
-        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=2.0,
+    Reward design follows IndustReal (Tang et al. RSS 2023) §3.2:
+    an SDF-inspired dense reward that provides gradient from anywhere
+    in the workspace via three additive components:
+
+    * **Proximity** (weight fraction ``1 - align - depth``): Gaussian
+      kernel on 3-D distance from PCB leading edge to slot center.
+      Non-zero everywhere → the policy always has a gradient signal.
+
+    * **Alignment** (``align_coef = 0.20``): |cos θ| between PCB long
+      axis and the push direction.  Corrects orientation before contact.
+
+    * **Depth** (``depth_coef = 0.60``): fraction of leading-edge
+      penetration past the slot mouth (0 → 1 at full insertion).
+
+    Plus legacy velocity and lateral-slide terms kept for stability.
+    """
+
+    sdf_insert = RewardTermCfg(
+        func=pcb_insertion_sdf_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "slot_center_xyz_env": _SLOT_CENTER_XYZ_ENV,
+            "slot_half_dims_xyz": _SLOT_HALF_DIMS_XYZ,
+            "align_axis_world": PUSH_AXIS_WORLD,
+            # σ ≈ 60 mm: gradient extends ~2–3× the slot width → non-zero at home pose.
+            "pos_sigma_m": 0.06,
+            "align_coef": 0.20,
+            "depth_coef": 0.60,
+        },
+        weight=80.0,
     )
+    # Velocity toward the slot: keeps the policy moving rather than hovering.
     insert_y_toward_slot = RewardTermCfg(
         func=pcb_lin_vel_y_toward_lead_target_y,
         params={
@@ -670,32 +716,12 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
             "half_length_m": _HALF_LENGTH_M,
             "target_lead_y_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV[1],
         },
-        weight=35.0,
-    )
-    insertion_proximity = RewardTermCfg(
-        func=pcb_leading_edge_insertion_proximity_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "target_lead_xyz_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV,
-            "sigma_m": 0.06,
-        },
-        weight=6.0,
-    )
-    insertion_depth = RewardTermCfg(
-        func=pcb_insertion_depth_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
-            "max_depth_m": 0.20,
-        },
-        weight=50.0,
+        weight=20.0,
     )
     lateral_slide_penalty = RewardTermCfg(
         func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=-2.5,
+        weight=-5.0,
     )
 
 
@@ -729,32 +755,43 @@ class EventCfgGrasp:
 
 @configclass
 class EventCfgInsert:
-    """Phase 2 reset: arm at home with closed gripper, PCB kinematically snapped to jaws."""
+    """Phase 2 reset: sample a successful Phase-1 terminal state (policy chaining).
 
-    reset_robot_grasp_hold = EventTermCfg(
-        func=reset_robot_joints_to_values,
+    Two-step reset (order matters):
+      1. ``reset_robot_from_grasp`` — set robot joints from a random buffer row.
+      2. ``snap_pcb_to_jaws``       — teleport PCB root to the FK jaw midpoint.
+
+    Step 2 must run *after* step 1 so the FK reflects the sampled arm pose.
+    Isaac Lab runs event terms in definition order within the same mode.
+
+    Kinematic snapping guarantees zero gap between PCB and fingers at episode
+    start — loading a stored PCB position from the buffer leaves a sub-mm gap
+    that PhysX cannot close in one step, causing the board to fall immediately.
+    """
+
+    reset_robot_from_grasp = EventTermCfg(
+        func=reset_from_grasp_states,
         mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
-            "joint_positions": _INSERT_INIT_JOINT_POS,
+            "grasp_states_path": _GRASP_STATES_PATH,
             "velocity_scale": 0.0,
-            "use_current_joint_pos": False,
         },
     )
-    snap_pcb_to_jaws = EventTermCfg(
-        func=snap_pcb_root_to_short_edge_grasp,
-        mode="reset",
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "half_length_m": _HALF_LENGTH_M,
-            "rot_wxyz": _PCB_INIT_ROT_WXYZ,
-            "velocity_scale": 0.0,
-            "min_center_z_env_local": _PCB_CENTER_Z_ENV,
-            **_gripper_kinematics_kwargs(),
-        },
-    )
+    # snap_pcb_to_jaws = EventTermCfg(
+    #     func=snap_pcb_root_to_short_edge_grasp,
+    #     mode="reset",
+    #     params={
+    #         "pcb_cfg": _PCB_ENT,
+    #         "left_finger_cfg": _LEFT_FINGER,
+    #         "right_finger_cfg": _RIGHT_FINGER,
+    #         "half_length_m": _HALF_LENGTH_M,
+    #         "rot_wxyz": _PCB_INIT_ROT_WXYZ,
+    #         "velocity_scale": 0.0,
+    #         "min_center_z_env_local": _PCB_CENTER_Z_ENV,
+    #         **_gripper_kinematics_kwargs(),
+    #     },
+    # )
 
 
 @configclass
@@ -774,20 +811,20 @@ class TerminationsSharedCfg:
         func=pcb_root_height_below_env_minimum,
         params={"pcb_cfg": _PCB_ENT, "min_height_env": _PCB_TERMINATE_MIN_HEIGHT_ENV},
     )
-    pcb_dropped = TerminationTermCfg(
-        func=pcb_dropped_from_gripper,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "check_grasp_geometry": False,
-            "min_height": 0.025,
-        },
-    )
-    pcb_moving_backward = TerminationTermCfg(
-        func=pcb_moving_backward_termination,
-        params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 20},
-    )
+    # pcb_dropped = TerminationTermCfg(
+    #     func=pcb_dropped_from_gripper,
+    #     params={
+    #         "pcb_cfg": _PCB_ENT,
+    #         "left_finger_cfg": _LEFT_FINGER,
+    #         "right_finger_cfg": _RIGHT_FINGER,
+    #         "check_grasp_geometry": False,
+    #         "min_height": 0.025,
+    #     },
+    # )
+    # pcb_moving_backward = TerminationTermCfg(
+    #     func=pcb_moving_backward_termination,
+    #     params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 20},
+    # )
 
 
 @configclass
@@ -799,17 +836,17 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
         params=_grasp_termination_params(),
     )
 
-    # Stricter than shared defaults; guard against the board tipping while the jaws approach.
-    pcb_tilt_excessive = TerminationTermCfg(
-        func=pcb_tilt_before_grasp_termination,
-        params={**_grasp_termination_params(max_tilt_penalty=0.1)},
-    )
-    pcb_long_axis_not_horizontal = TerminationTermCfg(
-        func=pcb_xy_plane_rotation_before_grasp_termination,
-        params={
-            **_grasp_termination_params(min_xy_alignment=0.995, axis_world=PUSH_AXIS_WORLD),
-        },
-    )
+    # # Stricter than shared defaults; guard against the board tipping while the jaws approach.
+    # pcb_tilt_excessive = TerminationTermCfg(
+    #     func=pcb_tilt_before_grasp_termination,
+    #     params={**_grasp_termination_params(max_tilt_penalty=0.1)},
+    # )
+    # pcb_long_axis_not_horizontal = TerminationTermCfg(
+    #     func=pcb_xy_plane_rotation_before_grasp_termination,
+    #     params={
+    #         **_grasp_termination_params(min_xy_alignment=0.995, axis_world=PUSH_AXIS_WORLD),
+    #     },
+    # )
 
 
 @configclass

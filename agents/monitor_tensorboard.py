@@ -23,9 +23,9 @@ except ImportError:
 
 # Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
 WIDOWX_RL_RUNS = (
-    ("Grasp", "WidowX_PCB_Grasp_RL/widowx_pcb_grasp/summaries"),
-    ("Grasp gripper test", "WidowX_PCB_Grasp_GripperTest_RL/widowx_pcb_grasp_gripper_test/summaries"),
-    ("Insert", "WidowX_PCB_Insert_RL/widowx_pcb_insert/summaries"),
+    ("Grasp", "widowx_pcb_grasp/summaries"),
+    ("Grasp gripper test", "widowx_pcb_grasp_gripper_test/summaries"),
+    ("Insert", "widowx_pcb_insert/summaries"),
 )
 
 
@@ -150,9 +150,9 @@ def main() -> int:
     print("      - entropy")
     print("      - KL / approx_kl")
     print()
-    print("[TIP] Run selector names in TensorBoard:")
-    print("      - WidowX_PCB_Grasp_RL  (phase 1 grasp)")
-    print("      - WidowX_PCB_Insert_RL   (phase 2 insert)")
+    print("[TIP] Run folders under logs/rl_games/:")
+    print("      - widowx_pcb_grasp   (phase 1 grasp)")
+    print("      - widowx_pcb_insert  (phase 2 insert)")
     print()
 
     cmd = [
