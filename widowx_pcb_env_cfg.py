@@ -52,6 +52,7 @@ from .mdp_custom import (
     grasp_edge_center_achieved,
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
+    reset_pcb_on_guide_rails_randomized,
     reset_robot_joints_to_values,
     reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
@@ -124,6 +125,12 @@ _ROBOT_HOME_JOINT_POS = {
     "left_carriage_joint": 0.020,  # open
 }
 # Per-joint uniform offset ranges (rad) for grasp-phase domain randomization at reset.
+# PCB pose offsets (env-local m / world-Z yaw rad) applied on top of ``_PCB_INIT_POS`` / ``_PCB_INIT_ROT_WXYZ``.
+_PCB_POS_OFFSET_RANGES = {
+    "x": (-0.005, 0.005),
+    "y": (-0.015, 0.015),
+}
+_PCB_YAW_OFFSET_RANGE = (-0.005, 0.005)
 # Nominal pose + Uniform(lo, hi) per env; gripper stays open (zero range).
 _ROBOT_HOME_JOINT_POS_RANGES = {
     "joint_0": (-0.12, 0.12),
@@ -140,8 +147,10 @@ _INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": PCB_Z 
 _GRIPPER_OPEN_WIDTH_M = 0.001
 # Carriage joint value when jaws pinch the board (one jaw travels half the PCB thickness).
 _GRIPPER_CLOSED_TARGET_M = PCB_Z * 0.5
-# Normalized closedness (0=open, 1=at closed target) required for grasp success / hold.
+# Normalized closedness (0=open, 1=at closed target) required for sustained grasp hold reward.
 _GRIPPER_MIN_CLOSEDNESS = 0.85
+# Grasp success (bonus + termination): ``left_carriage_joint`` gap must be below this.
+_GRASP_MAX_GRIPPER_GAP_M = PCB_Z
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (env_v3 FK at _MAG_POS above)
@@ -183,7 +192,7 @@ _LEFT_FINGER = SceneEntityCfg("robot", body_names="gripper_left")
 _RIGHT_FINGER = SceneEntityCfg("robot", body_names="gripper_right")
 _GRIPPER_JOINT = SceneEntityCfg("robot", joint_names=["left_carriage_joint"])
 # wxai ``gripper_left``/``gripper_right`` body origins sit on the carriage; pad tips are ~6 cm distally.
-_GRIPPER_TIP_OFFSET_M = 0.00
+_GRIPPER_TIP_OFFSET_M = 0.02
 _WRIST_BODY = SceneEntityCfg("robot", body_names="link_6")
 _HALF_LENGTH_M = PCB_X * 0.5
 
@@ -203,14 +212,12 @@ _MIN_STRADDLE_SEP_M = PCB_Z * 0.20
 # on the trailing edge, but sim contact/damping and PCB thickness limit how far the
 # carriage can physically close.
 #
-# ``closed_target_m`` / ``min_closedness``: carriage closes to ~PCB_Z/2; success requires
-#   normalized closedness ≥ min_closedness (see ``_gripper_closedness_to_target``).
+# ``max_gripper_gap_m``: grasp success when ``left_carriage_joint`` < PCB_Z * 1.1 (tight pinch).
 # ``width_frac``: each jaw Y-error < half_width * frac.  half_width = 38.75 mm.
 # ``gate_dist_m``: jaw-mid distance to trailing edge < this.
 # ``min_pinch_ready``: pinch_readiness score ≥ this.
 _GRASP_CHECK_KWARGS = {
-    "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
-    "min_closedness": _GRIPPER_MIN_CLOSEDNESS,
+    "max_gripper_gap_m": _GRASP_MAX_GRIPPER_GAP_M,
     "gate_dist_m": 0.030,
     "width_frac": 0.30,
     "min_pinch_ready": 0.10,
@@ -293,7 +300,7 @@ def _grasp_between_fingers_hold_params(**extra) -> dict:
         # Gripper must pinch tightly (same closedness scale as grasp success).
         "min_closedness": _GRIPPER_MIN_CLOSEDNESS,
         # Ramp to full bonus over this many env steps (~80 × 8 ms ≈ 0.64 s at decimation 4).
-        "max_hold_steps": 20,
+        "max_hold_steps": 10,
     }
     base.update(extra)
     return base
@@ -633,7 +640,7 @@ class RewardsGraspPhaseCfg():
     grasp_success_bonus = RewardTermCfg(
         func=grasp_success_bonus_reward,
         params=_grasp_termination_params(),
-        weight=50.0,
+        weight=200.0,
     )
     # Penalize sliding the PCB toward the slot (+Y) during grasp — keep the board at the trailing edge.
     pcb_push_displacement = RewardTermCfg(
@@ -694,15 +701,17 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
 
 @configclass
 class EventCfgGrasp:
-    """Phase 1 reset: PCB on rail, gripper open, arm at randomized home pose."""
+    """Phase 1 reset: randomized PCB pose on conveyor, gripper open, arm at randomized home pose."""
 
     reset_pcb_on_conveyor = EventTermCfg(
-        func=reset_pcb_on_guide_rails,
+        func=reset_pcb_on_guide_rails_randomized,
         mode="reset",
         params={
             "pcb_cfg": _PCB_ENT,
             "pos_env_local": _PCB_INIT_POS,
             "rot_wxyz": _PCB_INIT_ROT_WXYZ,
+            "pos_offset_ranges": _PCB_POS_OFFSET_RANGES,
+            "yaw_offset_range": _PCB_YAW_OFFSET_RANGE,
             "velocity_scale": 0.0,
         },
     )

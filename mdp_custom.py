@@ -101,6 +101,11 @@ def _gripper_closedness_to_target(
     return ((float(open_width_m) - gq) / denom).clamp(0.0, 1.0)
 
 
+def _gripper_gap_below_threshold(gq: torch.Tensor, max_gripper_gap_m: float) -> torch.Tensor:
+    """True when the carriage joint opening is below ``max_gripper_gap_m``."""
+    return gq < float(max_gripper_gap_m)
+
+
 def _world_z_up_batch(env: ManagerBasedRLEnv, dtype: torch.dtype) -> torch.Tensor:
     """Unit world +Z (vertical, normal to the env XY plane), shape ``(num_envs, 3)``."""
     return torch.tensor((0.0, 0.0, 1.0), device=env.device, dtype=dtype).unsqueeze(0).expand(env.num_envs, 3)
@@ -768,8 +773,7 @@ def grasp_edge_center_achieved(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_target_m: float = 0.00125,
-    min_closedness: float = 0.85,
+    max_gripper_gap_m: float = 0.00055,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
@@ -782,7 +786,10 @@ def grasp_edge_center_achieved(
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """True when the gripper has a valid closed pinch on the trailing short-edge centre."""
+    """True when the gripper has a valid closed pinch on the trailing short-edge centre.
+
+    Closedness is ``left_carriage_joint < max_gripper_gap_m`` (typically ``PCB_Z * 1.1``).
+    """
     dist = gripper_mid_to_pcb_trailing_edge_distance(
         env,
         pcb_cfg,
@@ -806,8 +813,7 @@ def grasp_edge_center_achieved(
     )
     robot = env.scene[gripper_joint_cfg.name]
     gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    closed = closedness >= float(min_closedness)
+    closed = _gripper_gap_below_threshold(gq, max_gripper_gap_m)
     near = dist < float(gate_dist_m)
     centered = (torch.abs(geom["width_l"]) < float(half_width_m) * float(width_frac)) & (
         torch.abs(geom["width_r"]) < float(half_width_m) * float(width_frac)
@@ -838,8 +844,7 @@ def grasp_success_bonus_reward(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_target_m: float = 0.00125,
-    min_closedness: float = 0.85,
+    max_gripper_gap_m: float = 0.00055,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.55,
@@ -862,8 +867,7 @@ def grasp_success_bonus_reward(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_target_m=closed_target_m,
-        min_closedness=min_closedness,
+        max_gripper_gap_m=max_gripper_gap_m,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1782,8 +1786,7 @@ def _grasp_not_yet_achieved(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_target_m: float = 0.00125,
-    min_closedness: float = 0.85,
+    max_gripper_gap_m: float = 0.00055,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.10,
     min_pinch_ready: float = 0.40,
@@ -1806,8 +1809,7 @@ def _grasp_not_yet_achieved(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_target_m=closed_target_m,
-        min_closedness=min_closedness,
+        max_gripper_gap_m=max_gripper_gap_m,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1830,8 +1832,7 @@ def pcb_tilt_before_grasp_termination(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_target_m: float = 0.00125,
-    min_closedness: float = 0.85,
+    max_gripper_gap_m: float = 0.00055,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.30,
     min_pinch_ready: float = 0.40,
@@ -1857,8 +1858,7 @@ def pcb_tilt_before_grasp_termination(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_target_m=closed_target_m,
-        min_closedness=min_closedness,
+        max_gripper_gap_m=max_gripper_gap_m,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -1882,8 +1882,7 @@ def pcb_xy_plane_rotation_before_grasp_termination(
     half_length_m: float,
     half_width_m: float,
     open_width_m: float,
-    closed_target_m: float = 0.00125,
-    min_closedness: float = 0.85,
+    max_gripper_gap_m: float = 0.00055,
     gate_dist_m: float = 0.06,
     width_frac: float = 0.30,
     min_pinch_ready: float = 0.40,
@@ -1911,8 +1910,7 @@ def pcb_xy_plane_rotation_before_grasp_termination(
         half_length_m,
         half_width_m,
         open_width_m,
-        closed_target_m=closed_target_m,
-        min_closedness=min_closedness,
+        max_gripper_gap_m=max_gripper_gap_m,
         gate_dist_m=gate_dist_m,
         width_frac=width_frac,
         min_pinch_ready=min_pinch_ready,
@@ -2074,12 +2072,59 @@ def reset_pcb_on_guide_rails(
     Use the same ``pos`` / ``rot`` as ``RigidObjectCfg.init_state`` so the rigid body default and
     reset stay consistent — PCB rests on the kinematic rails instead of floating at the gripper.
     """
+    reset_pcb_on_guide_rails_randomized(
+        env,
+        env_ids,
+        pcb_cfg,
+        pos_env_local,
+        rot_wxyz,
+        pos_offset_ranges={},
+        yaw_offset_range=(0.0, 0.0),
+        velocity_scale=velocity_scale,
+    )
+
+
+def reset_pcb_on_guide_rails_randomized(
+    env: ManagerBasedRLEnv,
+    env_ids: torch.Tensor,
+    pcb_cfg: SceneEntityCfg,
+    pos_env_local: tuple[float, float, float],
+    rot_wxyz: tuple[float, float, float, float],
+    pos_offset_ranges: dict[str, tuple[float, float]] | None = None,
+    yaw_offset_range: tuple[float, float] = (0.0, 0.0),
+    velocity_scale: float = 0.0,
+) -> None:
+    """Place PCB root at nominal rail pose plus uniform XY offsets and world-Z yaw (domain rand).
+
+    ``pos_offset_ranges`` keys ``"x"`` / ``"y"`` give per-env uniform offsets in env-local axes.
+    ``yaw_offset_range`` is a uniform world +Z rotation (radians) applied on top of ``rot_wxyz``.
+    """
     pcb = env.scene[pcb_cfg.name]
-    N = len(env_ids)
+    n = len(env_ids)
+    device = env.device
     dtype = pcb.data.root_pos_w.dtype
-    pl = torch.tensor(pos_env_local, device=env.device, dtype=dtype).unsqueeze(0).expand(N, -1)
+    ranges = pos_offset_ranges or {}
+
+    pl = torch.tensor(pos_env_local, device=device, dtype=dtype).unsqueeze(0).expand(n, -1).clone()
+    lo_x, hi_x = ranges.get("x", (0.0, 0.0))
+    lo_y, hi_y = ranges.get("y", (0.0, 0.0))
+    if abs(lo_x) > 1e-12 or abs(hi_x) > 1e-12:
+        pl[:, 0] += torch.empty(n, device=device, dtype=dtype).uniform_(float(lo_x), float(hi_x))
+    if abs(lo_y) > 1e-12 or abs(hi_y) > 1e-12:
+        pl[:, 1] += torch.empty(n, device=device, dtype=dtype).uniform_(float(lo_y), float(hi_y))
+
     target_pos = pl + env.scene.env_origins[env_ids]
-    q = torch.tensor(rot_wxyz, device=env.device, dtype=dtype).unsqueeze(0).expand(N, -1)
+
+    q_base = torch.tensor(rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    yaw_lo, yaw_hi = yaw_offset_range
+    if abs(yaw_lo) > 1e-12 or abs(yaw_hi) > 1e-12:
+        yaw = torch.empty(n, device=device, dtype=dtype).uniform_(float(yaw_lo), float(yaw_hi))
+        z_axis = torch.tensor((0.0, 0.0, 1.0), device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+        q_yaw = math_utils.quat_from_angle_axis(yaw, z_axis)
+        q = math_utils.quat_mul(q_yaw, q_base)
+    else:
+        q = q_base
+
     root_pose = torch.cat([target_pos, q], dim=-1)
 
     default_root_state = pcb.data.default_root_state[env_ids].clone()
