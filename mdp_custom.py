@@ -1688,6 +1688,28 @@ def pcb_height_below_reference(
     return torch.clamp(min_height - h, min=0.0)
 
 
+def insert_success(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    magazine_center_y_env: float,
+    margin_m: float = 0.01,
+) -> torch.Tensor:
+    """True when the PCB long-edge centre is within ``margin_m`` of the magazine Y centre.
+
+    The "long-edge centre" of the PCB is its root position along the push axis (world +Y).
+    Success is declared when the PCB centre has reached the magazine's Y midpoint, which
+    means the entire PCB footprint (XY-plane) is seated inside the magazine area.
+
+    Args:
+        pcb_cfg:              Scene entity for the PCB rigid body.
+        magazine_center_y_env: Target Y position of the magazine centre in env-local frame.
+        margin_m:             Half-width of the acceptance window in metres (default 0.01 m).
+    """
+    pcb = env.scene[pcb_cfg.name]
+    pcb_y_env = pcb.data.root_pos_w[:, 1] - env.scene.env_origins[:, 1]
+    return (pcb_y_env - magazine_center_y_env).abs() < margin_m
+
+
 def pcb_root_height_below_env_minimum(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2011,7 +2033,7 @@ def snap_pcb_root_to_short_edge_grasp(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
-    rot_wxyz: tuple[float, float, float, float],
+    rot_wxyz: tuple[float, float, float, float] | None = None,
     velocity_scale: float = 0.0,
     center_offset_body_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
     min_center_z_env_local: float | None = None,
@@ -2038,7 +2060,15 @@ def snap_pcb_root_to_short_edge_grasp(
     n = len(env_ids)
     dtype = mid.dtype
     device = env.device
-    q = torch.tensor(rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    if rot_wxyz is not None:
+        q = torch.tensor(rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
+    elif hasattr(env, "_sampled_pcb_quat"):
+        q = env._sampled_pcb_quat[env_ids].to(device=device, dtype=dtype)
+    else:
+        raise RuntimeError(
+            "snap_pcb_root_to_short_edge_grasp requires rot_wxyz or a prior "
+            "reset_from_grasp_states call that sets env._sampled_pcb_quat."
+        )
     local_x = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
     x_w = math_utils.quat_apply(q, local_x)
     push = torch.tensor(_DEFAULT_PUSH_AXIS_WORLD, device=device, dtype=dtype)
@@ -2167,6 +2197,75 @@ def pcb_moving_backward_termination(
     return _PCB_BACKWARD_COUNT >= int(min_steps)
 
 
+def pcb_detached_from_gripper(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    max_edge_dist_m: float = 0.040,
+    max_finger_dist_m: float = 0.030,
+    min_straddle_sep_m: float = 0.0012,
+    pcb_half_thickness_m: float = 0.00025,
+    width_weight: float = 3.0,
+    min_height_env: float | None = None,
+    min_episode_steps: int = 2,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """True when the PCB is no longer kinematically held by the gripper.
+
+    Uses the same trailing-edge grasp geometry as :func:`grasp_edge_center_achieved`, but with
+    **looser** detach thresholds so minor insertion wobble does not false-trigger while a real
+    slip / drop does.
+
+    Detach is declared when any of the following hold (after ``min_episode_steps``):
+    * jaw midpoint is too far from the trailing short-edge centre;
+    * either jaw tip is too far from its trailing-edge grasp target;
+    * the board is no longer straddled between the jaws (both tips on the same thickness face);
+    * optional: PCB root height (env-local Z) falls below ``min_height_env``.
+    """
+    _, _, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    geom = _fingers_trailing_edge_geometry(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        width_weight,
+        tip_offset_m,
+        wrist_body_cfg,
+    )
+    w_left, w_right = _finger_thickness_offsets(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+
+    lost_edge = edge_dist > float(max_edge_dist_m)
+    lost_fingers = torch.maximum(geom["dist_l"], geom["dist_r"]) > float(max_finger_dist_m)
+    straddled = (w_left * w_right < 0.0) & (torch.abs(w_left - w_right) >= float(min_straddle_sep_m))
+    lost_straddle = ~straddled
+    detached = lost_edge | lost_fingers | lost_straddle
+
+    if min_height_env is not None:
+        pcb = env.scene[pcb_cfg.name]
+        h = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+        detached = detached | (h < float(min_height_env))
+
+    if min_episode_steps > 0:
+        ready = env.episode_length_buf > min_episode_steps
+        detached = detached & ready
+    return detached
+
+
 def pcb_dropped_from_gripper(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2179,38 +2278,36 @@ def pcb_dropped_from_gripper(
     check_grasp_geometry: bool = True,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    half_length_m: float = 0.12,
+    max_edge_dist_m: float = 0.040,
+    max_finger_dist_m: float = 0.030,
+    min_height_env: float | None = None,
 ) -> torch.Tensor:
     """Return True if PCB is considered dropped from the gripper.
 
-    Drop is detected if either:
-    - (when ``check_grasp_geometry``) PCB deviates from expected grasp geometry vs jaw midpoint, or
-    - PCB drops below a minimum height near table level.
+    When ``check_grasp_geometry`` is True (Insert phase), delegates to
+    :func:`pcb_detached_from_gripper` which measures trailing-edge / finger-target separation
+    instead of root-to-midpoint distance (the latter stays ~``half_length_m`` even after a slip).
 
     Set ``check_grasp_geometry=False`` when episodes start with the PCB on guide rails (not in-hand).
     """
-    pcb = env.scene[pcb_cfg.name]  # grasped object
+    if check_grasp_geometry:
+        return pcb_detached_from_gripper(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m=half_length_m,
+            max_edge_dist_m=max_edge_dist_m,
+            max_finger_dist_m=max_finger_dist_m,
+            min_height_env=min_height_env,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+        )
 
-    pcb_pos = pcb.data.root_pos_w
-    gripper_center = gripper_midpoint_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
-
-    pcb_height = pcb_pos[:, 2] - env.scene.env_origins[:, 2]
-    is_low = pcb_height < min_height
-
-    if not check_grasp_geometry:
-        return is_low
-
-    if expected_offset_world is not None:
-        off = torch.tensor(expected_offset_world, device=env.device, dtype=pcb_pos.dtype).unsqueeze(0).expand_as(pcb_pos)
-        expected_pos = gripper_center + off
-        dist_to_grasp = torch.norm(pcb_pos - expected_pos, dim=-1)
-        is_far = dist_to_grasp > distance_tolerance
-    else:
-        dist_to_gripper = torch.norm(pcb_pos - gripper_center, dim=-1)
-        geom_error = torch.abs(dist_to_gripper - expected_center_distance)
-        is_far = geom_error > distance_tolerance
-    return is_far | is_low
+    pcb = env.scene[pcb_cfg.name]
+    pcb_height = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    return pcb_height < min_height
 
 
 # ---------------------------------------------------------------------------
@@ -2293,6 +2390,12 @@ def reset_from_grasp_states(
     joint_vel_new = torch.zeros_like(joint_pos_new) * velocity_scale
     robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
     robot.update(0.0)
+
+    # Store sampled PCB orientation for snap_pcb_root_to_short_edge_grasp (runs next in reset).
+    pcb_quat_buf = buf["pcb_quat"][idx].to(device=device, dtype=dtype)
+    if not hasattr(env, "_sampled_pcb_quat"):
+        env._sampled_pcb_quat = torch.zeros((env.num_envs, 4), device=device, dtype=dtype)
+    env._sampled_pcb_quat[env_ids] = pcb_quat_buf
 
 
 # ---------------------------------------------------------------------------

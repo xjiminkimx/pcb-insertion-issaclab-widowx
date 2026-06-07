@@ -59,6 +59,8 @@ from .mdp_custom import (
     reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
     pcb_dropped_from_gripper,
+    pcb_detached_from_gripper,
+    insert_success,
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
@@ -178,6 +180,8 @@ _PCB_INIT_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
 
 _MIN_PCB_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.005
 _PCB_TERMINATE_MIN_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.025
+# Insert phase: terminate when PCB falls noticeably below the rail grasp height (still on rail OK).
+_INSERT_PCB_MIN_HEIGHT_ENV = _PCB_CENTER_Z_ENV - 0.05
 # Grasp phase: penalize sliding the board toward the slot (+Y) beyond this displacement.
 _PCB_MAX_PUSH_DISPLACEMENT_M = 0.020
 
@@ -374,6 +378,26 @@ def _grasp_premature_close_params(**extra) -> dict:
     return base
 
 
+def _insert_detach_params(**extra) -> dict:
+    """Kwargs for insert-phase PCB detach / drop termination."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "half_length_m": _HALF_LENGTH_M,
+        "pcb_half_thickness_m": PCB_Z * 0.5,
+        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
+        # Looser than grasp-success gate (0.03 m) so valid insertion wobble is tolerated.
+        "max_edge_dist_m": 0.045,
+        "max_finger_dist_m": 0.035,
+        "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV,
+        "min_episode_steps": 2,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
 def _grasp_termination_params(**extra) -> dict:
     """Entity + geometry kwargs shared by grasp-success and pre-grasp terminations."""
     base = {
@@ -503,6 +527,23 @@ class ActionsCfg:
     gripper_action = mdp.JointPositionActionCfg(
         asset_name="robot",
         joint_names=["left_carriage_joint"],
+        scale=1.0,
+        use_default_offset=True,
+    )
+
+
+@configclass
+class ActionsCfgInsert:
+    """Insert phase action space: arm joints only.
+
+    The gripper is held closed at the snapped-grasp position from the reset and must not be
+    actuated during insertion — any opening would drop the PCB.  Removing the gripper from the
+    action space prevents the policy from accidentally learning to open it.
+    """
+
+    arm_action = mdp.JointPositionActionCfg(
+        asset_name="robot",
+        joint_names=["joint_[0-5]"],
         scale=1.0,
         use_default_offset=True,
     )
@@ -716,12 +757,22 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
             "half_length_m": _HALF_LENGTH_M,
             "target_lead_y_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV[1],
         },
-        weight=20.0,
+        weight=50.0,
     )
     lateral_slide_penalty = RewardTermCfg(
         func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
         weight=-5.0,
+    )
+    # Sparse bonus for a completed insertion (PCB centre at magazine Y within ±10 mm).
+    insert_success_bonus = RewardTermCfg(
+        func=insert_success,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "magazine_center_y_env": _SLOT_CENTER_XYZ_ENV[1],
+            "margin_m": 0.01,
+        },
+        weight=200.0,
     )
 
 
@@ -778,20 +829,19 @@ class EventCfgInsert:
             "velocity_scale": 0.0,
         },
     )
-    # snap_pcb_to_jaws = EventTermCfg(
-    #     func=snap_pcb_root_to_short_edge_grasp,
-    #     mode="reset",
-    #     params={
-    #         "pcb_cfg": _PCB_ENT,
-    #         "left_finger_cfg": _LEFT_FINGER,
-    #         "right_finger_cfg": _RIGHT_FINGER,
-    #         "half_length_m": _HALF_LENGTH_M,
-    #         "rot_wxyz": _PCB_INIT_ROT_WXYZ,
-    #         "velocity_scale": 0.0,
-    #         "min_center_z_env_local": _PCB_CENTER_Z_ENV,
-    #         **_gripper_kinematics_kwargs(),
-    #     },
-    # )
+    snap_pcb_to_jaws = EventTermCfg(
+        func=snap_pcb_root_to_short_edge_grasp,
+        mode="reset",
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "half_length_m": _HALF_LENGTH_M,
+            "velocity_scale": 0.0,
+            "min_center_z_env_local": _PCB_CENTER_Z_ENV,
+            **_gripper_kinematics_kwargs(),
+        },
+    )
 
 
 @configclass
@@ -811,20 +861,10 @@ class TerminationsSharedCfg:
         func=pcb_root_height_below_env_minimum,
         params={"pcb_cfg": _PCB_ENT, "min_height_env": _PCB_TERMINATE_MIN_HEIGHT_ENV},
     )
-    # pcb_dropped = TerminationTermCfg(
-    #     func=pcb_dropped_from_gripper,
-    #     params={
-    #         "pcb_cfg": _PCB_ENT,
-    #         "left_finger_cfg": _LEFT_FINGER,
-    #         "right_finger_cfg": _RIGHT_FINGER,
-    #         "check_grasp_geometry": False,
-    #         "min_height": 0.025,
-    #     },
-    # )
-    # pcb_moving_backward = TerminationTermCfg(
-    #     func=pcb_moving_backward_termination,
-    #     params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 20},
-    # )
+    pcb_moving_backward = TerminationTermCfg(
+        func=pcb_moving_backward_termination,
+        params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 4},
+    )
 
 
 @configclass
@@ -836,32 +876,17 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
         params=_grasp_termination_params(),
     )
 
-    # # Stricter than shared defaults; guard against the board tipping while the jaws approach.
-    # pcb_tilt_excessive = TerminationTermCfg(
-    #     func=pcb_tilt_before_grasp_termination,
-    #     params={**_grasp_termination_params(max_tilt_penalty=0.1)},
-    # )
-    # pcb_long_axis_not_horizontal = TerminationTermCfg(
-    #     func=pcb_xy_plane_rotation_before_grasp_termination,
-    #     params={
-    #         **_grasp_termination_params(min_xy_alignment=0.995, axis_world=PUSH_AXIS_WORLD),
-    #     },
-    # )
-
 
 @configclass
 class TerminationsInsertCfg(TerminationsSharedCfg):
-    """Insert phase: stricter drop check once the policy should hold the board."""
+    """Insert phase: terminate on grasp loss, fall, or successful insertion."""
 
-    pcb_dropped = TerminationTermCfg(
-        func=pcb_dropped_from_gripper,
+    insert_success = TerminationTermCfg(
+        func=insert_success,
         params={
             "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
-            "check_grasp_geometry": True,
-            "min_height": 0.025,
-            **_gripper_kinematics_kwargs(),
+            "magazine_center_y_env": _SLOT_CENTER_XYZ_ENV[1],
+            "margin_m": 0.01,
         },
     )
 
@@ -879,8 +904,8 @@ class _WidowXPcbEnvCfgBase(ManagerBasedRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.5,
-            dynamic_friction=1.2,
+            static_friction=1.5*10,
+            dynamic_friction=1.2*10,
             restitution=0.0,
         ),
         physx=sim_utils.PhysxCfg(
@@ -908,17 +933,22 @@ class WidowXPcbGraspEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 8.0
+        self.episode_length_s = 4.0
 
 
 @configclass
 class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
-    """Phase 2 only: learn to insert a pre-grasped PCB into the slot (+Y)."""
+    """Phase 2 only: learn to insert a pre-grasped PCB into the slot (+Y).
 
+    The gripper is excluded from the action space — it is held closed at the grasp pose
+    from the policy-chaining reset.  Only the 6 arm joints are actuated.
+    """
+
+    actions: ActionsCfgInsert = ActionsCfgInsert()
     rewards: RewardsInsertPhaseCfg = RewardsInsertPhaseCfg()
     events: EventCfgInsert = EventCfgInsert()
     terminations: TerminationsInsertCfg = TerminationsInsertCfg()
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 12.0
+        self.episode_length_s = 8.0
