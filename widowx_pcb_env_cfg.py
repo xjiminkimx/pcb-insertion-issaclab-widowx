@@ -37,6 +37,9 @@ from .mdp_custom import (
     action_rate_l2,
     pcb_height_below_reference,
     pcb_push_axis_displacement_penalty,
+    pcb_x_displacement_penalty,
+    pcb_z_displacement_penalty,
+    pcb_velocity_y_purity_reward,
     pcb_thickness_axis_tilt_penalty,
     # --- grasp / push rewards ---
     grasp_success_bonus_reward,
@@ -55,6 +58,7 @@ from .mdp_custom import (
     reset_pcb_on_guide_rails_randomized,
     reset_from_grasp_states,
     pcb_insertion_sdf_reward,
+    pcb_y_progress_reward,
     reset_robot_joints_to_values,
     reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
@@ -390,8 +394,12 @@ def _insert_detach_params(**extra) -> dict:
         # Looser than grasp-success gate (0.03 m) so valid insertion wobble is tolerated.
         "max_edge_dist_m": 0.045,
         "max_finger_dist_m": 0.035,
+        # PCB is only 0.5 mm thick — max physical |w_left - w_right| is 0.5 mm.
+        # Set to 0 so only the sign check (w_left*w_right < 0) is used for straddle.
+        "min_straddle_sep_m": 0.0,
         "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV,
-        "min_episode_steps": 2,
+        # Give physics 10 steps to settle after the kinematic snap before checking detach.
+        "min_episode_steps": 10,
         **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
@@ -734,6 +742,18 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
     Plus legacy velocity and lateral-slide terms kept for stability.
     """
 
+    # Dense Y-progress reward: fraction of the total approach journey completed.
+    # Gives constant positive gradient for all 360 mm of travel to the slot —
+    # no sigma, no proximity decay, just "further along +Y = better".
+    y_progress = RewardTermCfg(
+        func=pcb_y_progress_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "initial_y_env": _PCB_INIT_POS[1],
+            "target_y_env": _SLOT_CENTER_XYZ_ENV[1],
+        },
+        weight=60.0,
+    )
     sdf_insert = RewardTermCfg(
         func=pcb_insertion_sdf_reward,
         params={
@@ -741,10 +761,12 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
             "half_length_m": _HALF_LENGTH_M,
             "slot_center_xyz_env": _SLOT_CENTER_XYZ_ENV,
             "slot_half_dims_xyz": _SLOT_HALF_DIMS_XYZ,
+            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
             "align_axis_world": PUSH_AXIS_WORLD,
-            # σ ≈ 60 mm: gradient extends ~2–3× the slot width → non-zero at home pose.
-            "pos_sigma_m": 0.06,
+            # σ = 150 mm ≈ 385 mm start-distance / 2.5 so gradient is non-zero at start.
+            "pos_sigma_m": 0.15,
             "align_coef": 0.20,
+            # depth normalised by slot depth (50 mm), not half_length (120 mm).
             "depth_coef": 0.60,
         },
         weight=80.0,
@@ -763,6 +785,27 @@ class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
         func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
         weight=-5.0,
+    )
+    # Reward the fraction of PCB velocity directed along +Y (insertion axis).
+    # Peaks at 1.0 when motion is purely in +Y; 0 when stationary or moving off-axis.
+    # This directly enforces >95% Y-axis movement over time.
+    velocity_y_purity = RewardTermCfg(
+        func=pcb_velocity_y_purity_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "min_speed_m_s": 0.002,
+        },
+        weight=30.0,
+    )
+    # Penalize X displacement > 10 mm from the slot centre X.
+    x_displacement_penalty = RewardTermCfg(
+        func=pcb_x_displacement_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "reference_x_env": _CONVEYOR_CENTER_X_ENV,
+            "max_displacement_m": 0.01,
+        },
+        weight=-80.0,
     )
     # Sparse bonus for a completed insertion (PCB centre at magazine Y within ±10 mm).
     insert_success_bonus = RewardTermCfg(
@@ -879,8 +922,23 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
 
 @configclass
 class TerminationsInsertCfg(TerminationsSharedCfg):
-    """Insert phase: terminate on grasp loss, fall, or successful insertion."""
+    """Insert phase: terminate on grasp loss, fall, or successful insertion.
 
+    Overrides the shared height threshold with a tighter one so a PCB that slips
+    back onto the conveyor (~0.233 m) is caught before the episode-end timeout.
+    """
+
+    # Tighter height floor for insert: fire when PCB drops more than 50 mm below grasp height.
+    # This catches the board landing back on the conveyor rail after a slip.
+    pcb_fallen_below_rail = TerminationTermCfg(
+        func=pcb_root_height_below_env_minimum,
+        params={"pcb_cfg": _PCB_ENT, "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV},
+    )
+    # Geometry-based detach: fires when the PCB is no longer kinematically held.
+    pcb_detached = TerminationTermCfg(
+        func=pcb_detached_from_gripper,
+        params=_insert_detach_params(),
+    )
     insert_success = TerminationTermCfg(
         func=insert_success,
         params={
@@ -951,4 +1009,4 @@ class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 8.0
+        self.episode_length_s = 12.0

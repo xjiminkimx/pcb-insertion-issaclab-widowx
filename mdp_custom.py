@@ -1671,6 +1671,65 @@ def pcb_push_axis_displacement_penalty(
     return torch.clamp(dy - float(max_displacement_m), min=0.0)
 
 
+def pcb_x_displacement_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    reference_x_env: float,
+    max_displacement_m: float = 0.01,
+) -> torch.Tensor:
+    """Penalty when the PCB drifts too far in the X-axis from a reference X position.
+
+    During insertion the PCB should travel straight along world +Y (into the slot).
+    Any lateral X displacement means the PCB is being dragged sideways, risking
+    mis-alignment with the slot opening.
+
+    Returns ``relu(|dx| - max_displacement_m)`` — pair with a **negative** weight.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    x_env = pcb.data.root_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    dx = torch.abs(x_env - float(reference_x_env))
+    return torch.clamp(dx - float(max_displacement_m), min=0.0)
+
+
+def pcb_velocity_y_purity_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    min_speed_m_s: float = 0.002,
+) -> torch.Tensor:
+    """Reward the fraction of PCB velocity that is directed along world +Y (insertion axis).
+
+    Returns ``relu(v_y) / (||v|| + ε)`` when the PCB is moving faster than ``min_speed_m_s``,
+    and 0 otherwise.  This peaks at 1.0 only when motion is purely in +Y, and is 0 when moving
+    in −Y or when the PCB is stationary.  Use with a positive weight to enforce >95% Y-purity.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    v = pcb.data.root_lin_vel_w
+    v_y = v[:, 1]
+    speed = torch.norm(v, dim=-1)
+    moving = speed > float(min_speed_m_s)
+    purity = torch.relu(v_y) / (speed + 1e-6)
+    return torch.where(moving, purity, torch.zeros_like(purity))
+
+
+def pcb_z_displacement_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    reference_z_env: float,
+    max_displacement_m: float = 0.010,
+) -> torch.Tensor:
+    """Penalty when the PCB drifts more than ``max_displacement_m`` above or below its grasp height.
+
+    During insertion the PCB should stay at the same Z as when it was grasped — any vertical
+    drift means the policy is lifting or dragging the board, risking contact with slot walls.
+
+    Returns ``relu(|dz| - max_displacement_m)`` — pair with a **negative** weight.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    z_env = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
+    dz = torch.abs(z_env - float(reference_z_env))
+    return torch.clamp(dz - float(max_displacement_m), min=0.0)
+
+
 def pcb_height_below_reference(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2205,7 +2264,7 @@ def pcb_detached_from_gripper(
     half_length_m: float,
     max_edge_dist_m: float = 0.040,
     max_finger_dist_m: float = 0.030,
-    min_straddle_sep_m: float = 0.0012,
+    min_straddle_sep_m: float = 0.0,
     pcb_half_thickness_m: float = 0.00025,
     width_weight: float = 3.0,
     min_height_env: float | None = None,
@@ -2222,7 +2281,9 @@ def pcb_detached_from_gripper(
     Detach is declared when any of the following hold (after ``min_episode_steps``):
     * jaw midpoint is too far from the trailing short-edge centre;
     * either jaw tip is too far from its trailing-edge grasp target;
-    * the board is no longer straddled between the jaws (both tips on the same thickness face);
+    * the board is no longer straddled between the jaws — sign(w_left)*sign(w_right) must differ,
+      AND |w_left - w_right| >= min_straddle_sep_m (set 0.0 to use sign check only, which is
+      required when PCB_Z < 1 mm since the max physical separation equals the board thickness);
     * optional: PCB root height (env-local Z) falls below ``min_height_env``.
     """
     _, _, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
@@ -2402,53 +2463,67 @@ def reset_from_grasp_states(
 # SDF-based dense insertion reward (IndustReal, Tang et al. RSS 2023, §3.2)
 # ---------------------------------------------------------------------------
 
+def pcb_y_progress_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    initial_y_env: float,
+    target_y_env: float,
+) -> torch.Tensor:
+    """Dense reward for cumulative Y-axis progress toward the slot mouth.
+
+    Returns the fraction of the total Y journey already completed:
+    ``clamp((pcb_y - initial_y) / (target_y - initial_y), 0, 1)``.
+
+    This gives a constant positive gradient throughout the entire approach
+    — unlike velocity rewards that are zero when the PCB is stationary, and
+    unlike Gaussian proximity rewards that are near-zero far from the target.
+
+    Range: [0, 1]. Use a positive weight.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    pcb_y = pcb.data.root_pos_w[:, 1] - env.scene.env_origins[:, 1]
+    total = float(target_y_env) - float(initial_y_env) + 1e-9
+    progress = (pcb_y - float(initial_y_env)) / total
+    return progress.clamp(0.0, 1.0)
+
+
 def pcb_insertion_sdf_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
     slot_center_xyz_env: tuple[float, float, float],
     slot_half_dims_xyz: tuple[float, float, float],
+    slot_mouth_y_env: float,
     align_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    pos_sigma_m: float = 0.06,
-    align_coef: float = 0.3,
-    depth_coef: float = 0.7,
+    pos_sigma_m: float = 0.15,
+    align_coef: float = 0.20,
+    depth_coef: float = 0.60,
 ) -> torch.Tensor:
     """SDF-inspired dense reward for PCB-slot insertion (IndustReal §3.2).
 
     Three components combined into one reward in ``[0, 1]``:
 
-    1. **Proximity** — Gaussian kernel on the distance from the PCB leading-edge
-       center to the slot entrance center (env-local).  Provides a smooth
-       landscape across the entire workspace.
+    1. **Proximity** — ``exp(-dist / sigma)`` from PCB leading-edge to slot
+       center.  ``sigma`` must be set to ~½ the approach distance so the
+       gradient is non-zero well before contact.
 
-    2. **Alignment** — ``|cos θ|`` between the PCB long axis and the slot
-       push direction.  Keeps the board parallel before and during entry.
+    2. **Alignment** — ``|cos θ|`` between the PCB long axis and the insertion
+       direction. Incentivises keeping the board parallel to +Y.
 
-    3. **Depth** — Linear fraction of how far the leading edge has penetrated
-       past the slot mouth along the push axis.  Zero outside the slot,
-       ramps to 1 at ``2 × half_length_m`` (full insertion).
-
-    The SDF analogy (from IndustReal): the signed distance from the PCB leading
-    edge to the target slot box is approximated by the proximity + depth terms
-    — negative (rewarded) inside the slot, positive (penalised via the shape)
-    outside.  Unlike an exact SDF, this formulation requires no USD SDF queries
-    and works entirely on articulation state tensors.
+    3. **Depth** — Linear fraction of penetration past the slot mouth,
+       normalised by ``slot_depth = 2 × slot_half_dims_xyz[1]`` (not by
+       ``half_length_m``). Ramps 0→1 over the actual slot depth.
 
     Parameters
     ----------
-    slot_center_xyz_env:
-        Env-local (X, Y, Z) of the **center** of the first slot opening.
-        Measure in Isaac Sim after loading the scene.
-    slot_half_dims_xyz:
-        Half-extents (dx, dy, dz) of the slot opening box in meters.
-        Used to compute the depth fraction; also sets the XZ containment gate.
-    align_axis_world:
-        World-frame insertion direction (typically +Y).
+    slot_mouth_y_env:
+        Env-local Y of the slot entrance plane.  Leading edge must cross this
+        before depth is non-zero.
     pos_sigma_m:
-        Gaussian width for the proximity term.  Set to ~2–3× the slot width
-        so the gradient is non-zero well before contact.
+        Gaussian width for proximity.  Should be ~½ the distance from the PCB
+        start position to the slot center so the gradient reaches the start.
     align_coef, depth_coef:
-        Fractional weights; must sum to ≤ 1 (remaining goes to proximity).
+        Component weights summing to ≤ 1 (remainder goes to proximity).
     """
     pcb = env.scene[pcb_cfg.name]
     device = env.device
@@ -2458,25 +2533,24 @@ def pcb_insertion_sdf_reward(
     lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
     lead_env = lead_w - env.scene.env_origins[:, :3]
 
-    slot_ctr = torch.tensor(slot_center_xyz_env, device=device, dtype=dtype)  # (3,)
-    slot_half = torch.tensor(slot_half_dims_xyz, device=device, dtype=dtype)  # (3,)
+    slot_ctr = torch.tensor(slot_center_xyz_env, device=device, dtype=dtype)
+    slot_half = torch.tensor(slot_half_dims_xyz, device=device, dtype=dtype)
 
-    # ── 1. Proximity: 3-D Gaussian on distance to slot center ─────────────────
+    # ── 1. Proximity: Gaussian on distance to slot center ────────────────────
     dist = torch.norm(lead_env - slot_ctr.unsqueeze(0), dim=-1)
     prox = torch.exp(-dist / (float(pos_sigma_m) + 1e-9))
 
-    # ── 2. Alignment: PCB long axis ∥ insertion axis ──────────────────────────
+    # ── 2. Alignment: PCB long axis ∥ insertion axis ─────────────────────────
     x_w = pcb_body_axis_x_world(env, pcb_cfg)
     a = torch.tensor(align_axis_world, device=device, dtype=dtype)
     a = a / torch.norm(a).clamp_min(1e-9)
     align = torch.abs(torch.sum(x_w * a.unsqueeze(0).expand_as(x_w), dim=-1))
 
-    # ── 3. Depth: leading edge penetration past slot mouth in push-axis coord ──
-    # Project leading edge onto the push axis; slot mouth is at slot_ctr − slot_half along axis.
-    slot_mouth_along_axis = torch.dot(slot_ctr, a) - slot_half[1]  # slot_half[1] ≈ half-depth
-    lead_along_axis = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+    # ── 3. Depth: penetration past slot mouth, normalised by slot depth ───────
+    slot_depth_m = 2.0 * float(slot_half[1])   # actual slot depth in metres
+    lead_y = lead_env[:, 1]
     depth_frac = torch.clamp(
-        (lead_along_axis - slot_mouth_along_axis) / (2.0 * float(half_length_m) + 1e-9),
+        (lead_y - float(slot_mouth_y_env)) / (slot_depth_m + 1e-9),
         min=0.0, max=1.0,
     )
 
