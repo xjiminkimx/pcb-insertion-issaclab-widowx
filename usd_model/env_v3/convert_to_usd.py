@@ -4,7 +4,7 @@ Convert env_v3 URDF (assembly_2) to an IsaacSim-compatible USDA kinematic fixtur
 
 Three-material classification:
   SteelMaterial   — magazine body                   (metallic steel, mu_s 0.55)
-  RailMaterial    — guide-rail bars (Part_1_2.stl)  (hard plastic,   mu_s 0.80)
+  RailMaterial    — guide-rail bars (Part_1_2.stl)  (hard plastic,   mu_s 0.10)
   StandMaterial   — stand + conveyor structure       (brushed steel,  mu_s 0.50)
 
 Guide-rail bars (Part_1_2.stl, full-width) and conveyor belts are kept.
@@ -237,8 +237,8 @@ MESH_TEMPLATE = """\
             rel material:binding         = <{root}/Looks/{mat}>
             rel material:binding:physics = <{root}/Looks/{mat}>
             uniform token physics:approximation = "{approx}"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }}
 """
 
@@ -311,6 +311,8 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
     root_path = "/PCB_Env"
     mesh_blocks: list[str] = []
     bbox_all: list = []
+    # Per-link points for the magazine (used to derive the true slot/insert target centre).
+    mag_points: list = []
 
     for link_name in sorted(STATIC_LINKS):
         if link_name in EXCLUDED_LINKS:
@@ -343,6 +345,8 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
         tris = subsample_triangles(tris, max_tris=10000)
         points, indices = triangles_to_arrays(tris)
         bbox_all.extend(points)
+        if link_name in MAGAZINE_LINKS:
+            mag_points.extend(points)
 
         n_tris = len(indices) // 3
         mat    = mat_for(link_name)
@@ -370,6 +374,25 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
         print(f"  Y: [{min(ys):.4f}, {max(ys):.4f}]  extent {max(ys)-min(ys):.4f} m")
         print(f"  Z: [{min(zs):.4f}, {max(zs):.4f}]  extent {max(zs)-min(zs):.4f} m")
 
+    # Magazine link bbox + centre report — used to set the insert target in env_cfg.
+    # The insert target should be the magazine geometric centre (XY) at PCB rail height (Z).
+    if mag_points:
+        mxs = [p[0] for p in mag_points]
+        mys = [p[1] for p in mag_points]
+        mzs = [p[2] for p in mag_points]
+        mcx = 0.5 * (min(mxs) + max(mxs))
+        mcy = 0.5 * (min(mys) + max(mys))
+        mcz = 0.5 * (min(mzs) + max(mzs))
+        print(f"\nMagazine bounding box in USD root frame:")
+        print(f"  X: [{min(mxs):.4f}, {max(mxs):.4f}]  extent {max(mxs)-min(mxs):.4f} m")
+        print(f"  Y: [{min(mys):.4f}, {max(mys):.4f}]  extent {max(mys)-min(mys):.4f} m")
+        print(f"  Z: [{min(mzs):.4f}, {max(mzs):.4f}]  extent {max(mzs)-min(mzs):.4f} m")
+        print(f"  centre (root): ({mcx:.4f}, {mcy:.4f}, {mcz:.4f})")
+        print(f"  With _MAG_ROT_WXYZ=-90°Z and _MAG_POS=(tx,ty,tz) magazine centre world ≈")
+        print(f"    x = {mcy:.4f} + tx  (root-Y maps to world-X)")
+        print(f"    y = {-mcx:.4f} + ty  (root-X maps to world -Y, inverted)")
+        print(f"    z = {mcz:.4f} + tz")
+
     # Chip / PCB FK reference for env_cfg tuning
     chip_info = links.get("chip")
     if chip_info:
@@ -392,21 +415,21 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
         name="SteelMaterial", root=root_path,
         r=0.58, g=0.60, b=0.63,
         roughness=0.22, metallic=0.92,
-        static_friction=0.55, dynamic_friction=0.42, restitution=0.02,
+        static_friction=0.55, dynamic_friction=0.42, restitution=0.0,
     )
     # guide rail bars: hard dark plastic
     rail_mat = MATERIAL_TEMPLATE.format(
         name="RailMaterial", root=root_path,
         r=0.16, g=0.17, b=0.19,
         roughness=0.78, metallic=0.0,
-        static_friction=0.80, dynamic_friction=0.62, restitution=0.02,
+        static_friction=0.10, dynamic_friction=0.10, restitution=0.0,
     )
     # stand / conveyor structure: matt steel (slightly darker than magazine)
     stand_mat = MATERIAL_TEMPLATE.format(
         name="StandMaterial", root=root_path,
         r=0.45, g=0.47, b=0.50,
         roughness=0.35, metallic=0.85,
-        static_friction=0.50, dynamic_friction=0.38, restitution=0.02,
+        static_friction=0.50, dynamic_friction=0.38, restitution=0.0,
     )
 
     meshes_joined = "\n".join(mesh_blocks)
@@ -440,7 +463,7 @@ def Xform "PCB_Env" (
     print(f"Mesh prims: {len(mesh_blocks)}")
     print("\n--- env_cfg reminders ---")
     print("  steel  (magazine):          SteelMaterial  mu_s=0.55")
-    print("  plastic (guide rails):      RailMaterial   mu_s=0.80")
+    print("  plastic (guide rails):      RailMaterial   mu_s=0.10")
     print("  short axle rods:            omitted (Part_1_4.stl, ~120 mm)")
     print("  width cross-rods:           omitted (Part_1_3.stl)")
     print("  steel  (stand/conveyor):    StandMaterial  mu_s=0.50")

@@ -33,10 +33,14 @@ def apply_patch() -> None:
     def forward(self, input_dict):  # noqa: ANN001
         is_train = input_dict.get("is_train", True)
         prev_actions = input_dict.get("prev_actions", None)
-        input_dict["obs"] = self.norm_obs(input_dict["obs"])
+        obs = input_dict["obs"]
+        if torch.is_tensor(obs):
+            obs = torch.nan_to_num(obs, nan=0.0, posinf=10.0, neginf=-10.0)
+        input_dict["obs"] = self.norm_obs(obs)
         mu, logstd, value, states = self.a2c_network(input_dict)
 
-        # Replace NaNs from bad physics / obs (avoid poisoning Normal).
+        # Replace NaNs from bad physics / obs (avoid poisoning Normal / value loss).
+        value = torch.nan_to_num(value, nan=0.0, posinf=1e4, neginf=-1e4)
         mu = torch.nan_to_num(mu, nan=0.0, posinf=1.0, neginf=-1.0)
         logstd = torch.nan_to_num(logstd, nan=0.0, posinf=5.0, neginf=-20.0)
 

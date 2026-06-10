@@ -29,6 +29,8 @@ import isaaclab.sim as sim_utils
 import isaaclab.envs.mdp as mdp
 from .mdp_custom import (
     gripper_midpoint_position_env,
+    pcb_leading_short_edge_center_env,
+    joint_pos_rel_episode_reset,
     gripper_opening_normalized,
     pcb_long_axis_parallel_to_push_reward,
     pcb_leading_edge_insertion_proximity_reward,
@@ -41,6 +43,7 @@ from .mdp_custom import (
     pcb_z_displacement_penalty,
     pcb_velocity_y_purity_reward,
     pcb_thickness_axis_tilt_penalty,
+    pcb_xy_plane_parallel_shaping,
     # --- grasp / push rewards ---
     grasp_success_bonus_reward,
     gripper_jaw_rail_vertical_shaping,
@@ -51,19 +54,29 @@ from .mdp_custom import (
     pcb_finger_object_proximity,
     gripper_closing_reward,
     premature_close_penalty,
-    pcb_insertion_depth_reward,
     grasp_edge_center_achieved,
     # --- resets & terminations ---
     reset_pcb_on_guide_rails,
     reset_pcb_on_guide_rails_randomized,
     reset_from_grasp_states,
-    pcb_insertion_sdf_reward,
+    reset_pcb_from_grasp_states,
+    hold_gripper_closed,
     pcb_y_progress_reward,
+    pcb_push_axis_progress_reward_gated,
+    pcb_leading_edge_push_axis_approach_progress_gated,
+    pcb_gated_y_velocity_reward,
+    pcb_push_axis_sustained_backward_velocity_penalty,
+    pcb_leading_edge_z_lift_penalty,
+    pcb_lin_vel_y_toward_lead_target_y,
+    pcb_leading_edge_insertion_proximity_reward,
+    pcb_to_target_error_obs,
+    pcb_insertion_orientation_obs,
     reset_robot_joints_to_values,
     reset_robot_joints_to_values_randomized,
     snap_pcb_root_to_short_edge_grasp,
     pcb_dropped_from_gripper,
     pcb_detached_from_gripper,
+    pcb_extreme_drift_from_gripper,
     insert_success,
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
@@ -73,13 +86,15 @@ from .mdp_custom import (
     gripper_mid_thickness_offset_obs,
     gripper_trailing_edge_error_obs,
     gripper_pinch_orientation_cos_obs,
+    RelativeJointPositionActionWithPosLimitsCfg,
     pcb_moving_backward_termination,
 )
 
 # Conversion: mm to meters
 PCB_X = 240.0 * 0.001
-PCB_Y = 77.5 * 0.001
-PCB_Z = 0.0005
+PCB_Y = 79.5 * 0.001
+PCB_Z = 0.003
+PCB_MASS_KG = 0.1
 _PCB_HALF_WIDTH_M = PCB_Y * 0.5
 _SHORT_EDGE_WIDTH_WEIGHT = 3.0
 ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -138,7 +153,7 @@ _PCB_POS_OFFSET_RANGES = {
     "x": (-0.005, 0.005),
     "y": (-0.015, 0.015),
 }
-_PCB_YAW_OFFSET_RANGE = (-0.005, 0.005)
+_PCB_YAW_OFFSET_RANGE = (-0.001, 0.001)
 # Nominal pose + Uniform(lo, hi) per env; gripper stays open (zero range).
 _ROBOT_HOME_JOINT_POS_RANGES = {
     "joint_0": (-0.12, 0.12),
@@ -153,7 +168,7 @@ _ROBOT_HOME_JOINT_POS_RANGES = {
 _INSERT_INIT_JOINT_POS = {**_ROBOT_HOME_JOINT_POS, "left_carriage_joint": PCB_Z * 0.5}
 # Must match the joint value when the gripper is fully open (same as left_carriage_joint above).
 _GRIPPER_OPEN_WIDTH_M = 0.001
-# Carriage joint value when jaws pinch the board (one jaw travels half the PCB thickness).
+# Carriage joint value when jaws pinch the board (half-gap ≈ PCB half-thickness).
 _GRIPPER_CLOSED_TARGET_M = PCB_Z * 0.5
 # Normalized closedness (0=open, 1=at closed target) required for sustained grasp hold reward.
 _GRIPPER_MIN_CLOSEDNESS = 0.85
@@ -166,7 +181,37 @@ _GRASP_MAX_GRIPPER_GAP_M = PCB_Z
 _SLOT_MOUTH_Y_ENV = 0.490          # slot entrance Y (assembly root X-min → world +Y)
 _CONVEYOR_CENTER_X_ENV = 0.050     # chip / conveyor centre X in env frame
 _CONVEYOR_SURFACE_Z = 0.163        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
-_PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 +0.07
+# Grasp-phase spawn height (+70 mm above belt clears guide-rail meshes in the USD).
+_PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 + 0.07
+# Insert / rail contact: PCB centre when the bottom sits on guide rails (~78 mm above belt top).
+_GUIDE_RAIL_TOP_ABOVE_BELT_M = 0.078
+_INSERT_RAIL_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 + _GUIDE_RAIL_TOP_ABOVE_BELT_M
+# Grasp-buffer rows must have PCB Z within this band of the rail contact height.
+_GRASP_BUFFER_MAX_RAIL_Z_DELTA_M = 0.001
+# Only snap centre Z to the rail when buffer Z is already within this band (avoids large teleports).
+_SNAP_Z_TO_RAIL_MAX_DELTA_M = 0.001
+
+# Gripper finger–PCB contact (multiply mode with PCB material in sim).
+_GRIPPER_FINGER_STATIC_FRICTION = 4.0
+_GRIPPER_FINGER_DYNAMIC_FRICTION = 3.2
+_GRIPPER_ACTUATOR_STIFFNESS = 800.0
+_GRIPPER_ACTUATOR_DAMPING = 80.0
+
+# Contact softening — lower depenetration / friction / stiff solver to reduce PCB bounce on rails.
+_PCB_MAX_DEPENETRATION_VELOCITY = 0.05
+_ROBOT_MAX_DEPENETRATION_VELOCITY = 0.05
+_PCB_CONTACT_OFFSET_M = 0.001
+_PCB_REST_OFFSET_M = 0.0003
+_PCB_STATIC_FRICTION = 4.0
+_PCB_DYNAMIC_FRICTION = 3.2
+_PCB_SOLVER_POS_ITERATIONS = 24
+_PCB_SOLVER_VEL_ITERATIONS = 12
+_PCB_LINEAR_DAMPING = 0.4
+_PCB_ANGULAR_DAMPING = 0.45
+_SIM_DEFAULT_STATIC_FRICTION = 2.0
+_SIM_DEFAULT_DYNAMIC_FRICTION = 1.6
+_SIM_MIN_POS_ITERATIONS = 6
+_SIM_MIN_VEL_ITERATIONS = 2
 
 # ---------------------------------------------------------------------------
 # PCB — derived only from conveyor + slot (not from robot / gripper)
@@ -184,29 +229,78 @@ _PCB_INIT_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
 
 _MIN_PCB_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.005
 _PCB_TERMINATE_MIN_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.025
-# Insert phase: terminate when PCB falls noticeably below the rail grasp height (still on rail OK).
-_INSERT_PCB_MIN_HEIGHT_ENV = _PCB_CENTER_Z_ENV - 0.05
+# Insert phase: terminate when PCB falls well below the rail grasp height (tolerate push wobble).
+_INSERT_PCB_MIN_HEIGHT_ENV = _PCB_CENTER_Z_ENV - 0.08
 # Grasp phase: penalize sliding the board toward the slot (+Y) beyond this displacement.
 _PCB_MAX_PUSH_DISPLACEMENT_M = 0.020
 
-_SLOT_MOUTH_LEAD_TARGET_XYZ_ENV = (
-    _CONVEYOR_CENTER_X_ENV,
-    _SLOT_MOUTH_Y_ENV,
-    _PCB_CENTER_Z_ENV,
+# ---------------------------------------------------------------------------
+# Magazine (insert target) geometry — extracted from the USD magazine link by
+# ``usd_model/env_v3/_compute_magazine_center.py`` (magazine bbox baked at _MAG_POS).
+# Env-local frame (meters):
+#   X: [-0.003, 0.091]  centre 0.044   (≈ conveyor lane centre)
+#   Y: [ 0.234, 0.479]  centre 0.356   (opening faces -Y; PCB enters the near face)
+#   Z: [ 0.108, 0.253]  (multi-slot vertical stack; the first usable slot is near the top,
+#                         at the PCB rail height — user requirement: slot shares PCB height)
+#
+# The PCB long edge (0.240 m) just fits the magazine Y extent (0.245 m): when the PCB
+# *centre* reaches the magazine *centre* Y, the whole board footprint is seated inside the
+# magazine.  This is exactly the success criterion ("PCB centre == magazine centre in Y").
+# ---------------------------------------------------------------------------
+_MAG_CENTER_X_ENV = 0.044      # magazine geometric centre X (env-local)
+_MAG_CENTER_Y_ENV = 0.356      # magazine geometric centre Y (env-local)
+_MAG_Y_NEAR_FACE_ENV = 0.234   # face toward the conveyor — PCB leading edge enters here
+_MAG_Y_FAR_FACE_ENV = 0.479    # magazine back wall — PCB leading edge seats just before here
+
+# Insert success / dense-progress target: PCB *centre* at the magazine centre (XY) and at the
+# PCB rail height (Z).  (Z uses the rail/grasp height, NOT the magazine bbox Z centre, because
+# the first slot is at the top of the magazine stack.)
+_SLOT_CENTER_XYZ_ENV = (_MAG_CENTER_X_ENV, _MAG_CENTER_Y_ENV, _PCB_CENTER_Z_ENV)
+
+# SDF proximity target for the PCB *leading* edge: it reaches the magazine far wall when the
+# board is fully seated (centre at the magazine centre, leading edge half a PCB-length ahead).
+_SLOT_MOUTH_LEAD_TARGET_XYZ_ENV = (_MAG_CENTER_X_ENV, _MAG_Y_FAR_FACE_ENV, _PCB_CENTER_Z_ENV)
+# Leading-edge goal at the magazine near face — approach-phase dense rewards / SDF proximity.
+_SLOT_APPROACH_LEAD_XYZ_ENV = (_MAG_CENTER_X_ENV, _MAG_Y_NEAR_FACE_ENV, _PCB_CENTER_Z_ENV)
+
+# Slot entry plane (mouth) + depth the leading edge travels inside the magazine.
+_SLOT_MOUTH_INSERT_Y_ENV = _MAG_Y_NEAR_FACE_ENV
+_SLOT_DEPTH_M = _MAG_Y_FAR_FACE_ENV - _MAG_Y_NEAR_FACE_ENV   # ≈ 0.245 m
+# Half-extents (X-width/2, depth/2, Z-height/2); only depth/2 is used by the SDF reward.
+_SLOT_HALF_DIMS_XYZ = (PCB_Y * 0.55, _SLOT_DEPTH_M * 0.5, PCB_Z * 2.0)
+# Leading-edge +Y target when PCB centre is seated at the magazine centre (flat, long axis ∥ +Y).
+_HALF_LENGTH_M = PCB_X * 0.5
+_LEAD_EDGE_TARGET_Y_ENV = _MAG_CENTER_Y_ENV + _HALF_LENGTH_M
+# Leading-edge centre target when the PCB root is seated at the magazine centre (insert goal obs).
+_LEAD_EDGE_CENTER_TARGET_XYZ_ENV = (
+    _MAG_CENTER_X_ENV,
+    _LEAD_EDGE_TARGET_Y_ENV,
+    _INSERT_RAIL_CENTER_Z_ENV,
 )
 
-# SDF insertion reward: slot box geometry (env-local, meters).
-# _SLOT_CENTER_XYZ_ENV  — center of the first slot opening (X-centred on conveyor,
-#   Y at slot mouth + half the slot depth, Z same as PCB on rail).
-#   TUNE these after confirming slot geometry in Isaac Sim.
-_SLOT_DEPTH_M = 0.050          # depth of the slot (along push axis +Y)
-_SLOT_CENTER_XYZ_ENV = (
-    _CONVEYOR_CENTER_X_ENV,
-    _SLOT_MOUTH_Y_ENV + _SLOT_DEPTH_M * 0.5,
-    _PCB_CENTER_Z_ENV,
-)
-# Half-extents of the slot opening box: (X-width/2, depth/2, Z-height/2)
-_SLOT_HALF_DIMS_XYZ = (PCB_Y * 0.55, _SLOT_DEPTH_M * 0.5, PCB_Z * 2.0)
+# Pure +Y slide gate: max PCB root off-axis speed sqrt(v_x² + v_z²) for state / velocity credit.
+_INSERT_GATED_OFF_AXIS_SPEED_M_S = 0.04
+# Per-step leading-edge +Y progress cap (m) — normalises ΔY to [0, 1] per control step.
+_INSERT_PUSH_APPROACH_MAX_STEP_M = 0.005
+# Leading-edge Z lift above episode start before penalty kicks in; excess clamped for stability.
+_INSERT_LEAD_EDGE_MAX_LIFT_M = 0.007
+_INSERT_LEAD_EDGE_MAX_PENALTY_EXCESS_M = 0.02
+# Per-joint action scale (× clipped policy output) — lower on lift-dominant joints.
+_INSERT_ARM_ACTION_SCALE = {
+    "joint_0": 0.1,
+    "joint_1": 0.5,
+    "joint_2": 0.5,
+    "joint_3": 0.5,
+    "joint_4": 0.5,
+    "joint_5": 0.1,
+}
+
+# Pre-mouth conveyor-rail approach: staged milestones at these fractions of start→mouth travel.
+_RAIL_APPROACH_TIER_FRACTIONS = (0.15, 0.30, 0.50)
+_RAIL_PARALLEL_MAX_LATERAL_X_M = 0.030
+_RAIL_PARALLEL_MIN_FLATNESS = 0.92
+_RAIL_PARALLEL_MIN_LONG_ALIGN = 0.85
+_RAIL_PARALLEL_MIN_QUALITY = 0.25
 
 # Path to the grasp terminal-state buffer (produced by scripts/collect_grasp_states.py).
 _GRASP_STATES_PATH = os.path.join(ASSET_DIR, "data", "grasp_terminal_states.npz")
@@ -220,7 +314,7 @@ _GRIPPER_JOINT = SceneEntityCfg("robot", joint_names=["left_carriage_joint"])
 # wxai ``gripper_left``/``gripper_right`` body origins sit on the carriage; pad tips are ~6 cm distally.
 _GRIPPER_TIP_OFFSET_M = 0.02
 _WRIST_BODY = SceneEntityCfg("robot", body_names="link_6")
-_HALF_LENGTH_M = PCB_X * 0.5
+
 
 
 def _gripper_kinematics_kwargs() -> dict:
@@ -382,6 +476,31 @@ def _grasp_premature_close_params(**extra) -> dict:
     return base
 
 
+def _insert_between_fingers_params(**extra) -> dict:
+    """Kwargs for insert-phase straddle shaping (wider sigmas than grasp for push wobble)."""
+    base = _grasp_between_fingers_params(
+        proximity_sigma_m=0.050,
+        width_sigma_m=0.025,
+    )
+    base.update(extra)
+    return base
+
+
+def _insert_between_fingers_hold_params(**extra) -> dict:
+    """Kwargs for sustained straddle bonus during insert (gripper is always commanded closed)."""
+    base = {
+        **_insert_between_fingers_params(),
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+        "hold_threshold": 0.20,
+        "min_closedness": _GRIPPER_MIN_CLOSEDNESS,
+        "max_hold_steps": 15,
+    }
+    base.update(extra)
+    return base
+
+
 def _insert_detach_params(**extra) -> dict:
     """Kwargs for insert-phase PCB detach / drop termination."""
     base = {
@@ -391,15 +510,50 @@ def _insert_detach_params(**extra) -> dict:
         "half_length_m": _HALF_LENGTH_M,
         "pcb_half_thickness_m": PCB_Z * 0.5,
         "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        # Looser than grasp-success gate (0.03 m) so valid insertion wobble is tolerated.
-        "max_edge_dist_m": 0.045,
-        "max_finger_dist_m": 0.035,
+        # Split along (push-axis lag) vs in-plane (width/thickness wobble) — avoids 3D edge_dist
+        # false-positives during +Y slide while still catching real slip / lift.
+        "max_edge_along_m": 0.100,
+        "max_edge_in_plane_m": 0.075,
+        "max_finger_dist_m": 0.080,
         # PCB is only 0.5 mm thick — max physical |w_left - w_right| is 0.5 mm.
         # Set to 0 so only the sign check (w_left*w_right < 0) is used for straddle.
         "min_straddle_sep_m": 0.0,
         "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV,
-        # Give physics 10 steps to settle after the kinematic snap before checking detach.
-        "min_episode_steps": 10,
+        # Short grace for physics settle; long grace inflated detach% (episodes ended at step ~43).
+        "min_episode_steps": 20,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _insert_extreme_drift_params(**extra) -> dict:
+    """Kwargs for insert-phase extreme PCB drift / escape termination.
+
+  ``pcb_detached`` already catches moderate slip (straddle / edge / finger loss).
+  This term should fire only on **clear escape** — not on normal +Y push wobble.
+  Perpendicular-drift and velocity checks were disabled after they caused ~99% false
+  termination while ``pcb_detached`` stayed below 1%.
+    """
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "half_length_m": _HALF_LENGTH_M,
+        "pcb_half_thickness_m": PCB_Z * 0.5,
+        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
+        # Nominal jaw-mid ↔ PCB-centre ≈ half_length_m (120 mm); +70 mm ⇒ clear escape.
+        "max_extra_sep_m": 0.070,
+        # Looser than ``pcb_detached`` — only table-slide / jaw-release scale gaps.
+        "max_finger_dist_m": 0.100,
+        "max_edge_dist_m": 0.120,
+        # Disable false-positive checks (lateral arm motion, contact velocity spikes).
+        "check_perp_drift": False,
+        "check_flying": False,
+        # Keep a generous vertical jaw↔PCB gap for push tilt; ``pcb_fallen_below_rail`` covers drops.
+        "check_vertical_sep": True,
+        "max_vertical_sep_m": 0.070,
+        "min_episode_steps": 40,
         **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
@@ -441,12 +595,16 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             usd_path=os.path.join(ASSET_DIR, "usd_model", "usd_robot", "wxai", "wxai_follower.usd"),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
-                max_depenetration_velocity=5.0,
+                max_depenetration_velocity=_ROBOT_MAX_DEPENETRATION_VELOCITY,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                contact_offset=_PCB_CONTACT_OFFSET_M,
+                rest_offset=0.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
-                solver_position_iteration_count=8*4,
-                solver_velocity_iteration_count=2*4,
+                solver_position_iteration_count=32,
+                solver_velocity_iteration_count=16,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -464,8 +622,9 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             # right_carriage_joint is a mimic joint in the USD (driven by left_carriage_joint).
             "wxai_gripper": ImplicitActuatorCfg(
                 joint_names_expr=["left_carriage_joint"],
-                stiffness=None,
-                damping=None,
+                # Higher PD than USD defaults — stronger pinch normal force (reduces shear slip).
+                stiffness=_GRIPPER_ACTUATOR_STIFFNESS,
+                damping=_GRIPPER_ACTUATOR_DAMPING,
             ),
         },
         soft_joint_pos_limit_factor=1.0,
@@ -476,28 +635,26 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.CuboidCfg(
             size=(PCB_X, PCB_Y, PCB_Z),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                solver_position_iteration_count=8*4,
-                solver_velocity_iteration_count=2*4,
-                max_depenetration_velocity=0.5,
-                max_linear_velocity=25.0,
-                max_angular_velocity=720.0,
-                linear_damping=0.25,
-                angular_damping=0.35,
+                solver_position_iteration_count=_PCB_SOLVER_POS_ITERATIONS,
+                solver_velocity_iteration_count=_PCB_SOLVER_VEL_ITERATIONS,
+                max_depenetration_velocity=_PCB_MAX_DEPENETRATION_VELOCITY,
+                max_linear_velocity=2.0,
+                max_angular_velocity=90.0,
+                linear_damping=_PCB_LINEAR_DAMPING,
+                angular_damping=_PCB_ANGULAR_DAMPING,
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(
-                # Larger contact band + small rest separation vs kinematic meshes reduces tunneling and
-                # visible z-fighting / overlap with pcb_insertion_env.usd conveyor meshes.
-                contact_offset=0.004,
-                rest_offset=0.0012,
+                contact_offset=_PCB_CONTACT_OFFSET_M,
+                rest_offset=_PCB_REST_OFFSET_M,
             ),
             physics_material=sim_utils.RigidBodyMaterialCfg(
                 friction_combine_mode="multiply",
                 restitution_combine_mode="multiply",
-                static_friction=2.0*100,
-                dynamic_friction=1.6*100,
+                static_friction=_PCB_STATIC_FRICTION,
+                dynamic_friction=_PCB_DYNAMIC_FRICTION,
                 restitution=0.0,
             ),
-            mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+            mass_props=sim_utils.MassPropertiesCfg(mass=PCB_MASS_KG),
             visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.1, 0.4, 0.1)),
         ),
         # Flat on conveyor; front edge 20 mm before slot (see ``_PCB_INIT_POS``).
@@ -542,18 +699,22 @@ class ActionsCfg:
 
 @configclass
 class ActionsCfgInsert:
-    """Insert phase action space: arm joints only.
+    """Insert phase action space: arm joints only (relative joint deltas).
 
-    The gripper is held closed at the snapped-grasp position from the reset and must not be
-    actuated during insertion — any opening would drop the PCB.  Removing the gripper from the
-    action space prevents the policy from accidentally learning to open it.
+    Uses :class:`~isaaclab.envs.mdp.actions.joint_actions.RelativeJointPositionAction` so
+    each command is ``q_target = q_current + action`` — consistent with the per-episode grasp
+    pose from the buffer reset (``JointPositionAction`` + ``use_default_offset`` would always
+    target ``default_joint_pos`` and fight the reset pose).
+
+    The gripper is excluded from actions; ``hold_gripper_closed`` runs at reset and each step.
     """
 
-    arm_action = mdp.JointPositionActionCfg(
+    arm_action = mdp.RelativeJointPositionActionCfg(
         asset_name="robot",
         joint_names=["joint_[0-5]"],
-        scale=1.0,
-        use_default_offset=True,
+        preserve_order=True,
+        scale=_INSERT_ARM_ACTION_SCALE,
+        use_zero_offset=True,
     )
 
 
@@ -567,7 +728,10 @@ class ObservationsCfg:
         joint_pos = ObservationTermCfg(func=mdp.joint_pos_rel)
         joint_vel = ObservationTermCfg(func=mdp.joint_vel_rel)
 
-        object_pos = ObservationTermCfg(func=mdp.root_pos_w, params={"asset_cfg": SceneEntityCfg("pcb")})
+        object_pos = ObservationTermCfg(
+            func=pcb_leading_short_edge_center_env,
+            params={"pcb_cfg": _PCB_ENT, "half_length_m": _HALF_LENGTH_M},
+        )
 
         # EE: midpoint of WidowX AI jaw tips (gripper_left/right) — actual contact surface.
         ee_pos = ObservationTermCfg(
@@ -613,6 +777,65 @@ class ObservationsCfg:
                 ),
             },
         )
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
+class ObservationsCfgInsert:
+    """Insert-phase observations: goal-relative signals so the policy can generalise.
+
+    Unlike the grasp observations (which describe the jaw\u2013PCB relationship), the insert
+    policy needs to know where the **slot** is relative to the board, and how the board is
+    oriented, so a single policy adapts to varied initial arm poses / grasp orientations.
+    """
+
+    @configclass
+    class PolicyCfg(ObservationGroupCfg):
+        joint_pos = ObservationTermCfg(
+            func=joint_pos_rel_episode_reset,
+            params={"asset_cfg": _ROBOT_ENT},
+        )
+        joint_vel = ObservationTermCfg(
+            func=mdp.joint_vel_rel,
+            clip=(-20.0, 20.0),
+        )
+
+        # Leading short-edge centre in env-local frame (consistent with push rewards / goal error).
+        object_pos = ObservationTermCfg(
+            func=pcb_leading_short_edge_center_env,
+            params={"pcb_cfg": _PCB_ENT, "half_length_m": _HALF_LENGTH_M},
+        )
+
+        # EE midpoint (env-local) — where the grasped board is held.
+        ee_pos = ObservationTermCfg(
+            func=gripper_midpoint_position_env,
+            params={
+                "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
+                "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+                **_gripper_kinematics_kwargs(),
+            },
+        )
+
+        # ── Goal signals (the key additions for generalisation) ──────────────
+        # Error vector from leading-edge centre to the seated leading-edge goal (env-local, scaled).
+        pcb_to_slot_error = ObservationTermCfg(
+            func=pcb_to_target_error_obs,
+            params={
+                "pcb_cfg": _PCB_ENT,
+                "target_xyz_env": _LEAD_EDGE_CENTER_TARGET_XYZ_ENV,
+                "scale_xyz_m": (0.05, 0.40, 0.05),
+                "half_length_m": _HALF_LENGTH_M,
+            },
+        )
+        # PCB orientation: cos(long axis, +Y) and cos(thickness axis, world up).
+        pcb_orientation = ObservationTermCfg(
+            func=pcb_insertion_orientation_obs,
+            params={
+                "pcb_cfg": _PCB_ENT,
+                "align_axis_world": PUSH_AXIS_WORLD,
+            },
+        )
+
     policy: PolicyCfg = PolicyCfg()
 
 
@@ -722,101 +945,113 @@ class RewardsGraspPhaseCfg():
 
 
 @configclass
-class RewardsInsertPhaseCfg(_SafetyRewardsCfg):
-    """Phase 2 — insert grasped PCB along +Y into the slot.
+class RewardsInsertPhaseCfg:
+    """Phase 2 insert rewards: leading-edge +Y push, pure +Y slide only (state + velocity)."""
 
-    Reward design follows IndustReal (Tang et al. RSS 2023) §3.2:
-    an SDF-inspired dense reward that provides gradient from anywhere
-    in the workspace via three additive components:
-
-    * **Proximity** (weight fraction ``1 - align - depth``): Gaussian
-      kernel on 3-D distance from PCB leading edge to slot center.
-      Non-zero everywhere → the policy always has a gradient signal.
-
-    * **Alignment** (``align_coef = 0.20``): |cos θ| between PCB long
-      axis and the push direction.  Corrects orientation before contact.
-
-    * **Depth** (``depth_coef = 0.60``): fraction of leading-edge
-      penetration past the slot mouth (0 → 1 at full insertion).
-
-    Plus legacy velocity and lateral-slide terms kept for stability.
-    """
-
-    # Dense Y-progress reward: fraction of the total approach journey completed.
-    # Gives constant positive gradient for all 360 mm of travel to the slot —
-    # no sigma, no proximity decay, just "further along +Y = better".
-    y_progress = RewardTermCfg(
-        func=pcb_y_progress_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "initial_y_env": _PCB_INIT_POS[1],
-            "target_y_env": _SLOT_CENTER_XYZ_ENV[1],
-        },
-        weight=60.0,
+    # Maintain trailing-edge straddle while sliding — reduces detach-driven early termination.
+    pcb_between_fingers = RewardTermCfg(
+        func=pcb_between_gripper_fingers,
+        params=_insert_between_fingers_params(),
+        weight=35.0,
     )
-    sdf_insert = RewardTermCfg(
-        func=pcb_insertion_sdf_reward,
+    pcb_between_fingers_hold = RewardTermCfg(
+        func=pcb_between_gripper_fingers_hold_reward,
+        params=_insert_between_fingers_hold_params(),
+        weight=20.0,
+    )
+
+    # Per-step ΔY of leading short-edge centre — primary credit for millimetre-scale rail slide.
+    push_axis_step_progress = RewardTermCfg(
+        func=pcb_leading_edge_push_axis_approach_progress_gated,
         params={
             "pcb_cfg": _PCB_ENT,
             "half_length_m": _HALF_LENGTH_M,
-            "slot_center_xyz_env": _SLOT_CENTER_XYZ_ENV,
-            "slot_half_dims_xyz": _SLOT_HALF_DIMS_XYZ,
-            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
-            "align_axis_world": PUSH_AXIS_WORLD,
-            # σ = 150 mm ≈ 385 mm start-distance / 2.5 so gradient is non-zero at start.
-            "pos_sigma_m": 0.15,
-            "align_coef": 0.20,
-            # depth normalised by slot depth (50 mm), not half_length (120 mm).
-            "depth_coef": 0.60,
+            "axis_world": PUSH_AXIS_WORLD,
+            "max_step_m": _INSERT_PUSH_APPROACH_MAX_STEP_M,
+            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
         },
         weight=80.0,
     )
-    # Velocity toward the slot: keeps the policy moving rather than hovering.
-    insert_y_toward_slot = RewardTermCfg(
-        func=pcb_lin_vel_y_toward_lead_target_y,
+
+    # State: leading short-edge centre — fraction of start→target travel along +Y [0, 1].
+    # Zero while PCB root skids (X) or lifts/drops (Z): sqrt(v_x² + v_z²) must stay below gate.
+    push_axis_state = RewardTermCfg(
+        func=pcb_push_axis_progress_reward_gated,
         params={
             "pcb_cfg": _PCB_ENT,
+            "target_proj_env": _LEAD_EDGE_TARGET_Y_ENV,
+            "axis_world": PUSH_AXIS_WORLD,
             "half_length_m": _HALF_LENGTH_M,
-            "target_lead_y_env": _SLOT_MOUTH_LEAD_TARGET_XYZ_ENV[1],
+            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
         },
         weight=50.0,
     )
-    lateral_slide_penalty = RewardTermCfg(
-        func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
-        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=-5.0,
-    )
-    # Reward the fraction of PCB velocity directed along +Y (insertion axis).
-    # Peaks at 1.0 when motion is purely in +Y; 0 when stationary or moving off-axis.
-    # This directly enforces >95% Y-axis movement over time.
-    velocity_y_purity = RewardTermCfg(
-        func=pcb_velocity_y_purity_reward,
+
+    # Velocity: relu(v_y) only when off-axis root speed is low (pure +Y slide).
+    push_axis_velocity = RewardTermCfg(
+        func=pcb_gated_y_velocity_reward,
         params={
             "pcb_cfg": _PCB_ENT,
-            "min_speed_m_s": 0.002,
+            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
+            "min_y_speed_m_s": 0.002,
         },
-        weight=30.0,
+        weight=100.0,
     )
-    # Penalize X displacement > 10 mm from the slot centre X.
-    x_displacement_penalty = RewardTermCfg(
-        func=pcb_x_displacement_penalty,
+
+    # Penalise sustained −Y slide (brief slip transients ignored).
+    push_axis_backward_velocity = RewardTermCfg(
+        func=pcb_push_axis_sustained_backward_velocity_penalty,
         params={
             "pcb_cfg": _PCB_ENT,
-            "reference_x_env": _CONVEYOR_CENTER_X_ENV,
-            "max_displacement_m": 0.01,
+            "min_backward_speed_m_s": 0.003,
+            "min_consecutive_steps": 3,
         },
-        weight=-80.0,
+        weight=-25.0,
     )
-    # Sparse bonus for a completed insertion (PCB centre at magazine Y within ±10 mm).
-    insert_success_bonus = RewardTermCfg(
-        func=insert_success,
+
+    # Leading short-edge centre: fraction of reset→magazine far-face travel along +Y [0, 1].
+    leading_edge_far_face_progress = RewardTermCfg(
+        func=pcb_push_axis_progress_reward_gated,
         params={
             "pcb_cfg": _PCB_ENT,
-            "magazine_center_y_env": _SLOT_CENTER_XYZ_ENV[1],
-            "margin_m": 0.01,
+            "target_proj_env": _MAG_Y_FAR_FACE_ENV,
+            "axis_world": PUSH_AXIS_WORLD,
+            "half_length_m": _HALF_LENGTH_M,
+            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
         },
-        weight=200.0,
+        weight=50.0,
     )
+
+    # Bounded quadratic penalty when leading-edge Z rises >7 mm above reset (no expm1 blow-up).
+    leading_edge_z_lift = RewardTermCfg(
+        func=pcb_leading_edge_z_lift_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "max_lift_m": _INSERT_LEAD_EDGE_MAX_LIFT_M,
+            "max_penalty_excess_m": _INSERT_LEAD_EDGE_MAX_PENALTY_EXCESS_M,
+        },
+        weight=-2.0,
+    )
+
+    # Keep PCB ∥ world XY: thickness ∥ +Z and long axis in the horizontal plane.
+    pcb_xy_parallel = RewardTermCfg(
+        func=pcb_xy_plane_parallel_shaping,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "axis_world": PUSH_AXIS_WORLD,
+            "flat_coef": 0.55,
+            "long_horizontal_coef": 0.45,
+            "long_align_coef": 0.0,
+        },
+        weight=12.0,
+    )
+    pcb_tilt_penalty = RewardTermCfg(
+        func=pcb_thickness_axis_tilt_penalty,
+        params={"pcb_cfg": _PCB_ENT},
+        weight=-10.0,
+    )
+    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.003)
 
 
 @configclass
@@ -852,17 +1087,33 @@ class EventCfgInsert:
     """Phase 2 reset: sample a successful Phase-1 terminal state (policy chaining).
 
     Two-step reset (order matters):
-      1. ``reset_robot_from_grasp`` — set robot joints from a random buffer row.
-      2. ``snap_pcb_to_jaws``       — teleport PCB root to the FK jaw midpoint.
+      1. ``reset_robot_from_grasp`` — robot joints from a random buffer row + gripper PD target.
+      2. ``reset_pcb_from_grasp``  — PCB root pose from the **same** buffer row.
 
-    Step 2 must run *after* step 1 so the FK reflects the sampled arm pose.
-    Isaac Lab runs event terms in definition order within the same mode.
-
-    Kinematic snapping guarantees zero gap between PCB and fingers at episode
-    start — loading a stored PCB position from the buffer leaves a sub-mm gap
-    that PhysX cannot close in one step, causing the board to fall immediately.
+    Gripper PD target is captured at reset (buffer pinch, tightened to ``_GRIPPER_CLOSED_TARGET_M``)
+    and re-applied each control step so contact slip does not drift the carriage open.
+    FK snap was removed — it teleported the board into finger/rail overlap and launched it.
+    Z is snapped to the rail only when buffer Z is already within ``_SNAP_Z_TO_RAIL_MAX_DELTA_M``.
     """
 
+    set_gripper_finger_friction = EventTermCfg(
+        func=mdp.randomize_rigid_body_material,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("robot", body_names=["gripper_left", "gripper_right"]),
+            "static_friction_range": (
+                _GRIPPER_FINGER_STATIC_FRICTION,
+                _GRIPPER_FINGER_STATIC_FRICTION,
+            ),
+            "dynamic_friction_range": (
+                _GRIPPER_FINGER_DYNAMIC_FRICTION,
+                _GRIPPER_FINGER_DYNAMIC_FRICTION,
+            ),
+            "restitution_range": (0.0, 0.0),
+            "num_buckets": 1,
+            "make_consistent": True,
+        },
+    )
     reset_robot_from_grasp = EventTermCfg(
         func=reset_from_grasp_states,
         mode="reset",
@@ -870,19 +1121,43 @@ class EventCfgInsert:
             "asset_cfg": _ROBOT_ENT,
             "grasp_states_path": _GRASP_STATES_PATH,
             "velocity_scale": 0.0,
+            "gripper_joint_name": "left_carriage_joint",
+            "gripper_closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+            "rail_center_z_env": _INSERT_RAIL_CENTER_Z_ENV,
+            "max_rail_z_delta_m": _GRASP_BUFFER_MAX_RAIL_Z_DELTA_M,
         },
     )
-    snap_pcb_to_jaws = EventTermCfg(
-        func=snap_pcb_root_to_short_edge_grasp,
+    reset_pcb_from_grasp = EventTermCfg(
+        func=reset_pcb_from_grasp_states,
         mode="reset",
         params={
             "pcb_cfg": _PCB_ENT,
-            "left_finger_cfg": _LEFT_FINGER,
-            "right_finger_cfg": _RIGHT_FINGER,
+            "grasp_states_path": _GRASP_STATES_PATH,
             "half_length_m": _HALF_LENGTH_M,
             "velocity_scale": 0.0,
-            "min_center_z_env_local": _PCB_CENTER_Z_ENV,
-            **_gripper_kinematics_kwargs(),
+            "rail_center_z_env": _INSERT_RAIL_CENTER_Z_ENV,
+            "snap_z_to_rail": False,
+            "snap_z_max_delta_m": _SNAP_Z_TO_RAIL_MAX_DELTA_M,
+        },
+    )
+    # Re-apply closed gripper PD after PCB teleport (prevents implicit target drift open).
+    reassert_gripper_closed = EventTermCfg(
+        func=hold_gripper_closed,
+        mode="reset",
+        params={
+            "asset_cfg": _ROBOT_ENT,
+            "joint_name": "left_carriage_joint",
+            "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+        },
+    )
+    hold_gripper_closed = EventTermCfg(
+        func=hold_gripper_closed,
+        mode="interval",
+        interval_range_s=(0.008, 0.008),
+        params={
+            "asset_cfg": _ROBOT_ENT,
+            "joint_name": "left_carriage_joint",
+            "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         },
     )
 
@@ -892,6 +1167,13 @@ class TerminationsSharedCfg:
     """Safety terminations shared by all variants."""
 
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
+    
+
+
+@configclass
+class TerminationsGraspCfg(TerminationsSharedCfg):
+    """Pre-grasp PCB pose failures and episode end on successful edge-centre grasp."""
+
     pcb_tilt_excessive = TerminationTermCfg(
         func=pcb_tilt_beyond_limit,
         params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.10},
@@ -909,11 +1191,6 @@ class TerminationsSharedCfg:
         params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 4},
     )
 
-
-@configclass
-class TerminationsGraspCfg(TerminationsSharedCfg):
-    """Pre-grasp PCB pose failures and episode end on successful edge-centre grasp."""
-
     grasp_success = TerminationTermCfg(
         func=grasp_edge_center_achieved,
         params=_grasp_termination_params(),
@@ -928,16 +1205,33 @@ class TerminationsInsertCfg(TerminationsSharedCfg):
     back onto the conveyor (~0.233 m) is caught before the episode-end timeout.
     """
 
-    # Tighter height floor for insert: fire when PCB drops more than 50 mm below grasp height.
-    # This catches the board landing back on the conveyor rail after a slip.
+    # Height floor for insert: fire when PCB drops more than 80 mm below grasp height.
+    # Tolerates push wobble; still catches a slip back onto the conveyor rail.
     pcb_fallen_below_rail = TerminationTermCfg(
         func=pcb_root_height_below_env_minimum,
         params={"pcb_cfg": _PCB_ENT, "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV},
+    )
+    pcb_tilt_excessive = TerminationTermCfg(
+        func=pcb_tilt_beyond_limit,
+        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.12},
+    )
+    pcb_long_axis_not_horizontal = TerminationTermCfg(
+        func=pcb_long_axis_vertical_component_exceeds,
+        params={"pcb_cfg": _PCB_ENT, "max_abs_z": 0.25},
     )
     # Geometry-based detach: fires when the PCB is no longer kinematically held.
     pcb_detached = TerminationTermCfg(
         func=pcb_detached_from_gripper,
         params=_insert_detach_params(),
+    )
+    # Clear escape only (large geometry gap). Moderate slip is ``pcb_detached``.
+    pcb_extreme_drift = TerminationTermCfg(
+        func=pcb_extreme_drift_from_gripper,
+        params=_insert_extreme_drift_params(),
+    )
+    pcb_moving_backward = TerminationTermCfg(
+        func=pcb_moving_backward_termination,
+        params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 8},
     )
     insert_success = TerminationTermCfg(
         func=insert_success,
@@ -962,15 +1256,26 @@ class _WidowXPcbEnvCfgBase(ManagerBasedRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
             restitution_combine_mode="multiply",
-            static_friction=1.5*10,
-            dynamic_friction=1.2*10,
+            static_friction=_SIM_DEFAULT_STATIC_FRICTION,
+            dynamic_friction=_SIM_DEFAULT_DYNAMIC_FRICTION,
             restitution=0.0,
         ),
         physx=sim_utils.PhysxCfg(
+            # CCD prevents fast-moving thin objects from tunneling through meshes.
             enable_ccd=True,
+            # Solve articulation contacts after rigid-rigid so the gripper
+            # joints feel the PCB contact force before clamping further.
             solve_articulation_contact_last=True,
-            gpu_max_rigid_contact_count=2**22,
-            gpu_max_rigid_patch_count=2**19,
+            # Stabilization pass: adds a damping term to contacts that are
+            # nearly-resolved, preventing the PCB from jittering on the
+            # conveyor or inside the gripper.
+            enable_stabilization=True,
+            min_position_iteration_count=_SIM_MIN_POS_ITERATIONS,
+            min_velocity_iteration_count=_SIM_MIN_VEL_ITERATIONS,
+            # Larger GPU buffers for the increased contact count from the
+            # higher contact_offset on PCB and robot.
+            gpu_max_rigid_contact_count=2**23,
+            gpu_max_rigid_patch_count=2**20,
         ),
     )
 
@@ -998,10 +1303,11 @@ class WidowXPcbGraspEnvCfg(_WidowXPcbEnvCfgBase):
 class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
     """Phase 2 only: learn to insert a pre-grasped PCB into the slot (+Y).
 
-    The gripper is excluded from the action space — it is held closed at the grasp pose
-    from the policy-chaining reset.  Only the 6 arm joints are actuated.
+    Arm commands are **relative joint deltas** from the buffer grasp pose (not HOME offset).
+    Gripper is held closed at reset; only 6 arm joints are actuated.
     """
 
+    observations: ObservationsCfgInsert = ObservationsCfgInsert()
     actions: ActionsCfgInsert = ActionsCfgInsert()
     rewards: RewardsInsertPhaseCfg = RewardsInsertPhaseCfg()
     events: EventCfgInsert = EventCfgInsert()
@@ -1009,4 +1315,4 @@ class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 12.0
+        self.episode_length_s = 6.0

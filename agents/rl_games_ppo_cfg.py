@@ -163,14 +163,58 @@ WidowXPcbGraspGripperTestPPOCfg = {
     },
 }
 
+# ---------------------------------------------------------------------------
+# Phase 2 — Insert (arm-only, 6 DoF).
+#
+# This is a *separate* tuned config (per user request).  The insert task differs
+# from grasp in important ways, so the hyper-parameters are tuned accordingly:
+#
+#   * Action space is 6 arm joints only (gripper is held closed) → a lower-noise,
+#     more deterministic goal-reaching problem than the grasp phase.
+#   * Reward weights are O(1-200) (see RewardsInsertPhaseCfg) → ``reward_shaper``
+#     must be strong enough for credit assignment over ~370 mm travel, but below 1.0
+#     to keep value targets finite (NaN at 1.0 with dense penalties).
+#   * Early training needs broader exploration (higher ``entropy_coef``, ``sigma_init``,
+#     ``clip_actions``) to discover the +Y push joint combination from varied grasp poses.
+#   * ``horizon_length`` is raised toward 2 s of control steps so GAE sees more of each
+#     12 s episode before the delayed insertion-success signal.
+#   * Insertion is a longer-horizon skill and must generalise over varied grasp states.
+# ---------------------------------------------------------------------------
 WidowXPcbInsertPPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {
         **WidowXPcbPPOBaseCfg["params"],
+        "env": {
+            **WidowXPcbPPOBaseCfg["params"]["env"],
+            # Tighter clip + per-joint scales in ActionsCfgInsert — limit lift amplitude.
+            "clip_actions": 0.15,
+        },
+        "network": {
+            **WidowXPcbPPOBaseCfg["params"]["network"],
+            "space": {
+                **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
+                "continuous": {
+                    **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
+                    # Lower action std — less jitter / detach-prone exploration.
+                    "sigma_init": {"name": "const_initializer", "val": -1.2},
+                },
+            },
+        },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
             "name": "widowx_pcb_insert",
             "full_experiment_name": ".",
+            # Stronger shaper for sparse +Y state/velocity terms (weights 50–100 in env cfg).
+            "reward_shaper": {"scale_value": 0.25},
+            # explained_variance diagnostic divides by ~0 early on → TensorBoard NaN warnings.
+            "use_diagnostics": False,
+            # Reduced from 3e-2 after early +Y discovery — less noisy detach-prone exploration.
+            "entropy_coef": 1e-2,
+            # Longer training for the harder, generalising insert skill.
+            "max_epochs": 1500,
+            # ~2 s of control steps (256 × 8 ms) per rollout chunk vs 1 s at 128.
+            "horizon_length": 256,
+            "mini_epochs": 8,
         },
     },
 }

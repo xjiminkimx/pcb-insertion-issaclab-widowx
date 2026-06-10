@@ -23,7 +23,7 @@ def Xform "PCB_Env" (
             token outputs:surface.connect = </PCB_Env/Looks/SteelMaterial/Shader.outputs:surface>
             float physics:staticFriction    = 0.550
             float physics:dynamicFriction   = 0.420
-            float physics:restitution       = 0.020
+            float physics:restitution       = 0.000
             uniform token physxMaterial:frictionCombineMode     = "multiply"
             uniform token physxMaterial:restitutionCombineMode  = "multiply"
 
@@ -42,9 +42,9 @@ def Xform "PCB_Env" (
         )
         {
             token outputs:surface.connect = </PCB_Env/Looks/RailMaterial/Shader.outputs:surface>
-            float physics:staticFriction    = 0.800
-            float physics:dynamicFriction   = 0.620
-            float physics:restitution       = 0.020
+            float physics:staticFriction    = 0.100
+            float physics:dynamicFriction   = 0.100
+            float physics:restitution       = 0.000
             uniform token physxMaterial:frictionCombineMode     = "multiply"
             uniform token physxMaterial:restitutionCombineMode  = "multiply"
 
@@ -65,7 +65,7 @@ def Xform "PCB_Env" (
             token outputs:surface.connect = </PCB_Env/Looks/StandMaterial/Shader.outputs:surface>
             float physics:staticFriction    = 0.500
             float physics:dynamicFriction   = 0.380
-            float physics:restitution       = 0.020
+            float physics:restitution       = 0.000
             uniform token physxMaterial:frictionCombineMode     = "multiply"
             uniform token physxMaterial:restitutionCombineMode  = "multiply"
 
@@ -95,8 +95,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/SteelMaterial>
             rel material:binding:physics = </PCB_Env/Looks/SteelMaterial>
             uniform token physics:approximation = "convexDecomposition"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1" (
@@ -111,8 +111,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_1" (
@@ -127,8 +127,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_10" (
@@ -143,8 +143,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/RailMaterial>
             rel material:binding:physics = </PCB_Env/Looks/RailMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_11" (
@@ -159,8 +159,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_12" (
@@ -175,8 +175,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexDecomposition"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_13" (
@@ -191,8 +191,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_14" (
@@ -207,8 +207,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_2" (
@@ -223,8 +223,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/RailMaterial>
             rel material:binding:physics = </PCB_Env/Looks/RailMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_3" (
@@ -239,8 +239,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_6" (
@@ -255,8 +255,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexHull"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
         def Mesh "part_1_7" (
@@ -271,8 +271,8 @@ def Xform "PCB_Env" (
             rel material:binding         = </PCB_Env/Looks/StandMaterial>
             rel material:binding:physics = </PCB_Env/Looks/StandMaterial>
             uniform token physics:approximation = "convexDecomposition"
-            float physxCollision:contactOffset  = 0.004
-            float physxCollision:restOffset     = 0.0012
+            float physxCollision:contactOffset  = 0.002
+            float physxCollision:restOffset     = 0.0003
         }
 
     }
