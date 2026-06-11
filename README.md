@@ -35,6 +35,7 @@ See [Policy chaining (Grasp → Insert)](#policy-chaining-grasp--insert) for the
 | `scripts/collect_grasp_states.py` | Roll out Grasp policy; save successful terminal states to `.npz`. |
 | `scripts/train_grasp.sh` / `scripts/train_insert.sh` | Workspace training entry points (logs under `logs/`). |
 | `scripts/play_grasp.sh` / `scripts/play_insert.sh` | Evaluate checkpoints from workspace `logs/rl_games/`. |
+| `scripts/record_insert_videos.py` / `scripts/record_insert_videos.sh` | Record Insert rollout videos (tuned camera, fast headless capture). |
 | `data/grasp_terminal_states.npz` | Grasp terminal-state buffer (created by the collection script; required for Insert training). |
 | `agents/` | PPO configs (`WidowXPcbGraspPPOCfg` / `WidowXPcbInsertPPOCfg`), log-std safety helper, TensorBoard monitor script. |
 
@@ -217,7 +218,7 @@ Checkpoints live under this workspace (when you train with `scripts/train_*.sh`)
 | Grasp | `logs/rl_games/widowx_pcb_grasp/` | `nn/widowx_pcb_grasp.pth` |
 | Insert | `logs/rl_games/widowx_pcb_insert/` | `nn/widowx_pcb_insert.pth` |
 
-**Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to the **current working directory**. Run from **`/path/to/widowx_pcb`** (this workspace), not from the Isaac Lab repo root — otherwise it6 will not find workspace checkpoints.
+**Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to the **current working directory**. Run from **`/path/to/widowx_pcb`** (this workspace), not from the Isaac Lab repo root — otherwise it will not find workspace checkpoints.
 
 ### Grasp policy (recommended)
 
@@ -235,7 +236,7 @@ bash scripts/play_insert.sh --num_envs 16
 
 Without `--checkpoint`, `play.py` auto-loads the best model from `logs/rl_games/widowx_pcb_<phase>/nn/<phase>.pth`.
 Use `--use_last_checkpoint` for the most recent epoch file instead of the best one.
-`--video` enables `--real-time` automatically (use `--no-real-time` to disable). Videos are saved at 30 fps so playback matches on-screen speed.
+Add `--real-time` to throttle stepping to wall clock during interactive play.
 
 ### Load a specific checkpoint
 
@@ -256,17 +257,83 @@ bash scripts/play_insert.sh \
 
 ### Record a video of the rollout
 
+#### Insert policy (recommended — `record_insert_videos`)
+
+For Insert rollouts, use the workspace script instead of `play.py --video`. It loads the latest best checkpoint, uses a **playback camera** that frames the robot arm + PCB + slot (set in `WidowXPcbInsertEnvCfg.viewer`), and records headless with faster defaults (854×480, one frame every 4 sim steps, 30 fps output).
+
+**Prerequisites:** `conda activate isaac-sim` (or your Isaac Lab env). **Pause Insert training** while recording — a second Isaac Sim on the same GPU is very slow.
+
+```bash
+cd /path/to/widowx_pcb
+bash scripts/record_insert_videos.sh
+```
+
+Default output: `logs/rl_games/widowx_pcb_insert/videos/play/insert-episode-<HHMMSS>.mp4`
+
+**Custom output path** (e.g. workspace root):
+
+```bash
+bash scripts/record_insert_videos.sh --out insert-episode-latest.mp4
+```
+
+**Specific checkpoint:**
+
+```bash
+bash scripts/record_insert_videos.sh \
+    --checkpoint logs/rl_games/widowx_pcb_insert/nn/widowx_pcb_insert.pth \
+    --out insert-episode-latest.mp4
+```
+
+**Most recent epoch file** (not best):
+
+```bash
+bash scripts/record_insert_videos.sh --use_last_checkpoint
+```
+
+**Python equivalent:**
+
+```bash
+python scripts/record_insert_videos.py \
+    --headless \
+    --num_episodes 1 \
+    --checkpoint logs/rl_games/widowx_pcb_insert/nn/widowx_pcb_insert.pth \
+    --out insert-episode-latest.mp4
+```
+
+| Argument | Default | Meaning |
+|----------|---------|---------|
+| `--checkpoint` | `logs/.../nn/widowx_pcb_insert.pth` | Trained Insert `.pth` |
+| `--num_episodes` | `1` | Episodes to record |
+| `--out` | *(auto)* | Output `.mp4` path |
+| `--use_last_checkpoint` | off | Use latest `last_*.pth` instead of best |
+| `--video_fps` | `30` | Playback frame rate (readable speed) |
+| `--render_stride` | `4` | Capture every N env steps (higher = faster recording) |
+| `--video_width` / `--video_height` | `854` / `480` | Render resolution (lower = faster) |
+| `--seed` | `42` | Reset seed (change for a different rollout) |
+
+Faster capture (lower quality):
+
+```bash
+bash scripts/record_insert_videos.sh \
+    --render_stride 6 \
+    --video_width 640 \
+    --video_height 360
+```
+
+Episode length is up to 6 s (~750 env steps). The video ends when the episode terminates (detach, tilt, success, etc.) or hits the timeout.
+
+#### Grasp policy (`play.py --video`)
+
 ```bash
 cd /path/to/widowx_pcb
 bash scripts/play_grasp.sh \
     --num_envs 4 \
+    --headless \
     --video \
     --video_length 500
 ```
 
 Videos are saved under `logs/rl_games/widowx_pcb_<phase>/videos/play/`.
-`--video` turns on real-time stepping and records at **30 fps** (readable wall-clock speed).
-Add `--headless` to render off-screen without the Isaac Sim GUI window.
 
 To fix an already-recorded fast video (sim-tagged 125 fps):
 

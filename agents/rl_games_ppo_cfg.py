@@ -210,8 +210,8 @@ WidowXPcbInsertPPOCfg = {
             "use_diagnostics": False,
             # Reduced from 3e-2 after early +Y discovery — less noisy detach-prone exploration.
             "entropy_coef": 1e-2,
-            # Longer training for the harder, generalising insert skill.
-            "max_epochs": 1500,
+            # Max epochs for insert training (scripts/train_insert.sh uses this unless --max_iterations).
+            "max_epochs": 200,
             # ~2 s of control steps (256 × 8 ms) per rollout chunk vs 1 s at 128.
             "horizon_length": 256,
             "mini_epochs": 8,

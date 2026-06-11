@@ -1976,6 +1976,39 @@ def pcb_x_displacement_penalty(
     return torch.clamp(dx - float(max_displacement_m), min=0.0)
 
 
+def pcb_x_lane_boundary_exponential_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    lane_center_x_env: float,
+    inner_half_width_m: float,
+    exponential_scale_m: float = 0.004,
+    max_excess_m: float = 0.020,
+) -> torch.Tensor:
+    """Exponential penalty when the PCB centre leaves the conveyor / rail lane in env-local X.
+
+    Inside ``|x - lane_center| <= inner_half_width_m`` the penalty is zero.  Beyond that
+    boundary, ``excess = |x - centre| - inner_half_width`` drives ``expm1(excess / scale)``
+    (capped at ``max_excess_m`` for value stability).  The return value is normalized to
+    approximately ``[0, 1]``.  Pair with a **negative** weight.
+
+    Use this to discourage lateral skidding off the belt / guide rails while the policy
+    chases dense +Y push rewards.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    x_env = pcb.data.root_pos_w[:, 0] - env.scene.env_origins[:, 0]
+    lateral = torch.abs(x_env - float(lane_center_x_env))
+    excess = torch.clamp(
+        lateral - float(inner_half_width_m),
+        min=0.0,
+        max=float(max_excess_m),
+    )
+    scale = float(exponential_scale_m) + 1e-9
+    cap = float(max_excess_m)
+    raw = torch.expm1(excess / scale)
+    norm = torch.expm1(torch.tensor(cap / scale, device=excess.device, dtype=excess.dtype)) + 1e-9
+    return raw / norm
+
+
 def pcb_velocity_y_purity_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -3335,6 +3368,67 @@ def pcb_leading_edge_push_axis_approach_progress(
     return delta / (float(max_step_m) + 1e-9)
 
 
+def _insert_straddle_gate_mask(
+    env: ManagerBasedRLEnv,
+    min_straddle_quality: float,
+    proximity_sigma_m: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_sigma_m: float = 0.010,
+) -> torch.Tensor:
+    """``1.0`` where :func:`pcb_between_gripper_fingers` exceeds ``min_straddle_quality``, else ``0.0``."""
+    q = pcb_between_gripper_fingers(
+        env,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_sigma_m=width_sigma_m,
+    )
+    return (q > float(min_straddle_quality)).to(dtype=q.dtype)
+
+
+def _apply_insert_straddle_gate(
+    env: ManagerBasedRLEnv,
+    reward: torch.Tensor,
+    min_straddle_quality: float,
+    proximity_sigma_m: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg | None,
+    right_finger_cfg: SceneEntityCfg | None,
+    half_length_m: float,
+    pcb_half_thickness_m: float,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_sigma_m: float = 0.010,
+) -> torch.Tensor:
+    if float(min_straddle_quality) <= 0.0 or left_finger_cfg is None or right_finger_cfg is None:
+        return reward
+    gate = _insert_straddle_gate_mask(
+        env,
+        min_straddle_quality,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_sigma_m=width_sigma_m,
+    )
+    return reward * gate
+
+
 def pcb_leading_edge_push_axis_approach_progress_gated(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -3342,13 +3436,35 @@ def pcb_leading_edge_push_axis_approach_progress_gated(
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     max_step_m: float = 0.005,
     max_off_axis_speed_m_s: float = 0.04,
+    min_straddle_quality: float = 0.0,
+    proximity_sigma_m: float = 0.050,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    pcb_half_thickness_m: float = 0.00075,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_sigma_m: float = 0.025,
 ) -> torch.Tensor:
     """Like :func:`pcb_leading_edge_push_axis_approach_progress`, zero when PCB skids or lifts."""
     step = pcb_leading_edge_push_axis_approach_progress(
         env, pcb_cfg, half_length_m, axis_world, max_step_m
     )
     pure = _pcb_off_axis_speed(env, pcb_cfg) < float(max_off_axis_speed_m_s)
-    return torch.where(pure, step, torch.zeros_like(step))
+    out = torch.where(pure, step, torch.zeros_like(step))
+    return _apply_insert_straddle_gate(
+        env,
+        out,
+        min_straddle_quality,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_sigma_m=width_sigma_m,
+    )
 
 
 def pcb_push_axis_progress_reward_gated(
@@ -3360,6 +3476,14 @@ def pcb_push_axis_progress_reward_gated(
     use_episode_start: bool = True,
     fallback_initial_proj_env: float | None = None,
     max_off_axis_speed_m_s: float = 0.008,
+    min_straddle_quality: float = 0.0,
+    proximity_sigma_m: float = 0.050,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    pcb_half_thickness_m: float = 0.00075,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_sigma_m: float = 0.025,
 ) -> torch.Tensor:
     """Like :func:`pcb_push_axis_progress_reward`, zero while PCB moves in X or Z."""
     progress = pcb_push_axis_progress_reward(
@@ -3372,7 +3496,71 @@ def pcb_push_axis_progress_reward_gated(
         fallback_initial_proj_env,
     )
     pure = _pcb_off_axis_speed(env, pcb_cfg) < float(max_off_axis_speed_m_s)
-    return torch.where(pure, progress, torch.zeros_like(progress))
+    out = torch.where(pure, progress, torch.zeros_like(progress))
+    if half_length_m is None:
+        return out
+    return _apply_insert_straddle_gate(
+        env,
+        out,
+        min_straddle_quality,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_sigma_m=width_sigma_m,
+    )
+
+
+def pcb_rail_parallel_approach_progress_straddle_gated(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    slot_mouth_y_env: float,
+    rail_center_x_env: float,
+    max_lateral_x_m: float = 0.030,
+    min_flatness: float = 0.92,
+    min_long_align: float = 0.85,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_step_m: float = 0.010,
+    min_straddle_quality: float = 0.0,
+    proximity_sigma_m: float = 0.050,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    half_length_m: float = 0.12,
+    pcb_half_thickness_m: float = 0.00075,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_sigma_m: float = 0.025,
+) -> torch.Tensor:
+    """Per-step +Y progress gated on lane-parallel pose and optional straddle quality."""
+    step = pcb_rail_parallel_approach_progress(
+        env,
+        pcb_cfg,
+        slot_mouth_y_env,
+        rail_center_x_env,
+        max_lateral_x_m,
+        min_flatness,
+        min_long_align,
+        axis_world,
+        max_step_m,
+    )
+    return _apply_insert_straddle_gate(
+        env,
+        step,
+        min_straddle_quality,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_sigma_m=width_sigma_m,
+    )
 
 
 def pcb_leading_edge_z_lift_penalty(

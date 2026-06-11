@@ -237,7 +237,7 @@ MESH_TEMPLATE = """\
             rel material:binding         = <{root}/Looks/{mat}>
             rel material:binding:physics = <{root}/Looks/{mat}>
             uniform token physics:approximation = "{approx}"
-            float physxCollision:contactOffset  = 0.002
+            float physxCollision:contactOffset  = 0.001
             float physxCollision:restOffset     = 0.0003
         }}
 """

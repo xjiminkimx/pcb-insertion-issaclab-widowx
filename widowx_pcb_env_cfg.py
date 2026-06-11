@@ -40,6 +40,7 @@ from .mdp_custom import (
     pcb_height_below_reference,
     pcb_push_axis_displacement_penalty,
     pcb_x_displacement_penalty,
+    pcb_x_lane_boundary_exponential_penalty,
     pcb_z_displacement_penalty,
     pcb_velocity_y_purity_reward,
     pcb_thickness_axis_tilt_penalty,
@@ -64,7 +65,7 @@ from .mdp_custom import (
     pcb_y_progress_reward,
     pcb_push_axis_progress_reward_gated,
     pcb_leading_edge_push_axis_approach_progress_gated,
-    pcb_gated_y_velocity_reward,
+    pcb_rail_parallel_approach_progress_straddle_gated,
     pcb_push_axis_sustained_backward_velocity_penalty,
     pcb_leading_edge_z_lift_penalty,
     pcb_lin_vel_y_toward_lead_target_y,
@@ -92,8 +93,8 @@ from .mdp_custom import (
 
 # Conversion: mm to meters
 PCB_X = 240.0 * 0.001
-PCB_Y = 79.5 * 0.001
-PCB_Z = 0.003
+PCB_Y = 78.5 * 0.001
+PCB_Z = 0.001
 PCB_MASS_KG = 0.1
 _PCB_HALF_WIDTH_M = PCB_Y * 0.5
 _SHORT_EDGE_WIDTH_WEIGHT = 3.0
@@ -200,7 +201,7 @@ _GRIPPER_ACTUATOR_DAMPING = 80.0
 # Contact softening — lower depenetration / friction / stiff solver to reduce PCB bounce on rails.
 _PCB_MAX_DEPENETRATION_VELOCITY = 0.05
 _ROBOT_MAX_DEPENETRATION_VELOCITY = 0.05
-_PCB_CONTACT_OFFSET_M = 0.001
+_PCB_CONTACT_OFFSET_M = 0.0005
 _PCB_REST_OFFSET_M = 0.0003
 _PCB_STATIC_FRICTION = 4.0
 _PCB_DYNAMIC_FRICTION = 3.2
@@ -291,7 +292,8 @@ _INSERT_ARM_ACTION_SCALE = {
     "joint_1": 0.5,
     "joint_2": 0.5,
     "joint_3": 0.5,
-    "joint_4": 0.5,
+    # Wrist roll — keep jaw rail near vertical; lower scale reduces slip-prone wrist kink.
+    "joint_4": 0.2,
     "joint_5": 0.1,
 }
 
@@ -301,6 +303,13 @@ _RAIL_PARALLEL_MAX_LATERAL_X_M = 0.030
 _RAIL_PARALLEL_MIN_FLATNESS = 0.92
 _RAIL_PARALLEL_MIN_LONG_ALIGN = 0.85
 _RAIL_PARALLEL_MIN_QUALITY = 0.25
+# Conveyor / rail lane in env-local X — exponential lateral penalty beyond inner half-width.
+_LANE_CENTER_X_ENV = _CONVEYOR_CENTER_X_ENV
+_LANE_INNER_HALF_WIDTH_M = 0.025
+_LANE_X_EXP_SCALE_M = 0.004
+_LANE_X_MAX_EXCESS_M = 0.020
+# Push credit only when trailing-edge straddle quality exceeds this (``pcb_between_gripper_fingers``).
+_INSERT_STRADDLE_GATE_MIN = 0.3
 
 # Path to the grasp terminal-state buffer (produced by scripts/collect_grasp_states.py).
 _GRASP_STATES_PATH = os.path.join(ASSET_DIR, "data", "grasp_terminal_states.npz")
@@ -482,6 +491,17 @@ def _insert_between_fingers_params(**extra) -> dict:
         proximity_sigma_m=0.050,
         width_sigma_m=0.025,
     )
+    base.update(extra)
+    return base
+
+
+def _insert_push_straddle_gate_params(**extra) -> dict:
+    """Kwargs merged into push rewards — +Y credit only when straddle quality is high enough."""
+    base = {
+        **_insert_between_fingers_params(),
+        "min_straddle_quality": _INSERT_STRADDLE_GATE_MIN,
+        "half_length_m": _HALF_LENGTH_M,
+    }
     base.update(extra)
     return base
 
@@ -952,7 +972,7 @@ class RewardsInsertPhaseCfg:
     pcb_between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers,
         params=_insert_between_fingers_params(),
-        weight=35.0,
+        weight=55.0,
     )
     pcb_between_fingers_hold = RewardTermCfg(
         func=pcb_between_gripper_fingers_hold_reward,
@@ -965,10 +985,10 @@ class RewardsInsertPhaseCfg:
         func=pcb_leading_edge_push_axis_approach_progress_gated,
         params={
             "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
             "axis_world": PUSH_AXIS_WORLD,
             "max_step_m": _INSERT_PUSH_APPROACH_MAX_STEP_M,
             "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
+            **_insert_push_straddle_gate_params(),
         },
         weight=80.0,
     )
@@ -981,21 +1001,27 @@ class RewardsInsertPhaseCfg:
             "pcb_cfg": _PCB_ENT,
             "target_proj_env": _LEAD_EDGE_TARGET_Y_ENV,
             "axis_world": PUSH_AXIS_WORLD,
-            "half_length_m": _HALF_LENGTH_M,
             "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
+            **_insert_push_straddle_gate_params(),
         },
         weight=50.0,
     )
 
-    # Velocity: relu(v_y) only when off-axis root speed is low (pure +Y slide).
-    push_axis_velocity = RewardTermCfg(
-        func=pcb_gated_y_velocity_reward,
+    # Per-step +Y on lane (X on-rail, flat, long axis ∥ +Y) — replaces raw v_y reward.
+    rail_parallel_push_progress = RewardTermCfg(
+        func=pcb_rail_parallel_approach_progress_straddle_gated,
         params={
             "pcb_cfg": _PCB_ENT,
-            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
-            "min_y_speed_m_s": 0.002,
+            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
+            "rail_center_x_env": _LANE_CENTER_X_ENV,
+            "max_lateral_x_m": _RAIL_PARALLEL_MAX_LATERAL_X_M,
+            "min_flatness": _RAIL_PARALLEL_MIN_FLATNESS,
+            "min_long_align": _RAIL_PARALLEL_MIN_LONG_ALIGN,
+            "axis_world": PUSH_AXIS_WORLD,
+            "max_step_m": _INSERT_PUSH_APPROACH_MAX_STEP_M,
+            **_insert_push_straddle_gate_params(),
         },
-        weight=100.0,
+        weight=50.0,
     )
 
     # Penalise sustained −Y slide (brief slip transients ignored).
@@ -1016,8 +1042,8 @@ class RewardsInsertPhaseCfg:
             "pcb_cfg": _PCB_ENT,
             "target_proj_env": _MAG_Y_FAR_FACE_ENV,
             "axis_world": PUSH_AXIS_WORLD,
-            "half_length_m": _HALF_LENGTH_M,
             "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
+            **_insert_push_straddle_gate_params(),
         },
         weight=50.0,
     )
@@ -1050,6 +1076,24 @@ class RewardsInsertPhaseCfg:
         func=pcb_thickness_axis_tilt_penalty,
         params={"pcb_cfg": _PCB_ENT},
         weight=-10.0,
+    )
+    # Exponential penalty when PCB centre crosses conveyor / rail lane boundary in X.
+    pcb_x_lane_escape = RewardTermCfg(
+        func=pcb_x_lane_boundary_exponential_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "lane_center_x_env": _LANE_CENTER_X_ENV,
+            "inner_half_width_m": _LANE_INNER_HALF_WIDTH_M,
+            "exponential_scale_m": _LANE_X_EXP_SCALE_M,
+            "max_excess_m": _LANE_X_MAX_EXCESS_M,
+        },
+        weight=-18.0,
+    )
+    # Lateral root velocity orthogonal to +Y (includes X skidding while pushing).
+    pcb_lateral_velocity = RewardTermCfg(
+        func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
+        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+        weight=-8.0,
     )
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.003)
 
@@ -1316,3 +1360,15 @@ class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
     def __post_init__(self):
         super().__post_init__()
         self.episode_length_s = 6.0
+        # Playback camera: elevated side view (+X) — push along +Y readable in profile.
+        _rb_x, _rb_y, _ = _ROBOT_BASE_POS
+        self.viewer.eye = (
+            _rb_x + 0.82,
+            _rb_y + 0.08,
+            _INSERT_RAIL_CENTER_Z_ENV + 0.28,
+        )
+        self.viewer.lookat = (
+            _CONVEYOR_CENTER_X_ENV,
+            0.28,
+            _INSERT_RAIL_CENTER_Z_ENV,
+        )
