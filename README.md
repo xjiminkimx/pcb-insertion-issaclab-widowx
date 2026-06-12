@@ -2,24 +2,27 @@
 
 This package is an **Isaac Lab** manager-based RL task: a robot arm interacts with a **PCB** on a **magazine + conveyor** assembly (single aligned USD). Side guide-rail rods are omitted from the fixture USD. Training uses **rl-games** (PPO).
 
-Two simulation variants are registered:
+Three simulation variants are registered (policy chaining):
 
-| Robot | Task ID | Env config |
-|--------|---------|------------|
-| **WidowX** (Trossen `usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-Grasp-v0` | Phase 1 — grasp trailing short-edge centre |
-| | `Isaac-WidowX-PCB-Insert-v0` | Phase 2 — insert grasped PCB along +Y into slot |
+| Robot | Task ID | Phase |
+|--------|---------|--------|
+| **WidowX** (`usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-Grasp-v0` | 1 — grasp trailing short-edge centre |
+| | `Isaac-WidowX-PCB-Slide-v0` | 2 — slide on guide rails to slot **mouth** |
+| | `Isaac-WidowX-PCB-Insert-v0` | 3 — insert through mouth into magazine (SDF reward) |
 
-Robot runtime assets now live under `usd_model/usd_robot/`, and environment fixtures plus conversion sources live under `usd_model/usd_env/`.
+Robot runtime assets live under `usd_model/usd_robot/`; fixtures under `usd_model/usd_env/`.
 
-**High-level episode flow (two-phase curriculum with policy chaining):**
+**High-level pipeline:**
 
-1. **Phase 1 — Grasp** (`Isaac-WidowX-PCB-Grasp-v0`): PCB on the conveyor, gripper open. Rewards shape approach, straddle, and tight closure on the trailing short-edge centre. The episode ends on successful grasp or timeout.
-2. **Collect terminal states**: Roll out the trained Grasp policy and save robot + PCB poses at every successful grasp termination into `data/grasp_terminal_states.npz`.
-3. **Phase 2 — Insert** (`Isaac-WidowX-PCB-Insert-v0`): Each episode reset **samples** a saved Grasp terminal state (robot joints + PCB pose). A dense SDF-style reward shapes motion of the leading edge toward the first magazine slot along +Y.
+1. **Grasp** — open gripper, approach, pinch trailing edge (`grasp_success`).
+2. **Collect** → `data/grasp_terminal_states.npz`
+3. **Slide** — reset from grasp buffer; +Y rail push until leading edge reaches slot mouth (`slide_success`). **No SDF insert reward.**
+4. **Collect** → `data/slide_terminal_states.npz`
+5. **Insert** — reset from slide buffer; SDF-shaped reward seats PCB in magazine (`insert_success`).
 
-Recommended training order: **Grasp → collect states → Insert**.
+Recommended order: **Grasp → collect → Slide → collect → Insert**.
 
-See [Policy chaining (Grasp → Insert)](#policy-chaining-grasp--insert) for the full workflow and file formats.
+See [Policy chaining (Grasp → Slide → Insert)](#policy-chaining-grasp--slide--insert).
 
 ---
 
@@ -27,17 +30,17 @@ See [Policy chaining (Grasp → Insert)](#policy-chaining-grasp--insert) for the
 
 | Path | Role |
 |------|------|
-| `__init__.py` | Registers grasp/insert envs and applies the rl-games log-std safety patch. |
-| `widowx_pcb_env_cfg.py` | WidowX scene, actions, observations, rewards, events, terminations, magazine/rail geometry. |
-| `usd_model/env_v3/` | URDF + meshes + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` (short axle rods / width cross-rods omitted) |
-| `usd_model/usd_robot/` | Robot USD bundles (wxai follower). |
-| `mdp_custom.py` | Custom MDP terms (grasp/insert rewards, rail reset, policy-chaining reset, SDF insertion reward). |
-| `scripts/collect_grasp_states.py` | Roll out Grasp policy; save successful terminal states to `.npz`. |
-| `scripts/train_grasp.sh` / `scripts/train_insert.sh` | Workspace training entry points (logs under `logs/`). |
-| `scripts/play_grasp.sh` / `scripts/play_insert.sh` | Evaluate checkpoints from workspace `logs/rl_games/`. |
-| `scripts/record_insert_videos.py` / `scripts/record_insert_videos.sh` | Record Insert rollout videos (tuned camera, fast headless capture). |
-| `data/grasp_terminal_states.npz` | Grasp terminal-state buffer (created by the collection script; required for Insert training). |
-| `agents/` | PPO configs (`WidowXPcbGraspPPOCfg` / `WidowXPcbInsertPPOCfg`), log-std safety helper, TensorBoard monitor script. |
+| `__init__.py` | Registers grasp / slide / insert envs; rl-games log-std safety patch. |
+| `widowx_pcb_env_cfg.py` | Scene, per-phase rewards/events/terminations, magazine geometry. |
+| `usd_model/env_v3/` | URDF + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` |
+| `mdp_custom.py` | Grasp/slide/insert MDP terms, terminal-state resets, `pcb_insertion_sdf_reward`. |
+| `scripts/collect_grasp_states.py` | Grasp → `data/grasp_terminal_states.npz` |
+| `scripts/collect_slide_states.py` | Slide → `data/slide_terminal_states.npz` |
+| `scripts/train_grasp.sh` / `train_slide.sh` / `train_insert.sh` | Training entry points (`logs/rl_games/`). |
+| `scripts/play_grasp.sh` / `play_slide.sh` / `play_insert.sh` | Play trained checkpoints. |
+| `scripts/record_insert_videos.py` | Record Insert rollout videos. |
+| `data/*.npz` | Terminal-state buffers for policy chaining (see `data/README.md`). |
+| `agents/` | `WidowXPcbGraspPPOCfg`, `WidowXPcbSlidePPOCfg`, `WidowXPcbInsertPPOCfg`. |
 
 A local `trossen_ai_isaac/` directory (if present) is intentionally **not** tracked: it is a separate clone with its own `.git`. Track it as a **submodule** or symlink if your workflow depends on it.
 
@@ -78,7 +81,13 @@ cd /path/to/widowx_pcb   # this workspace
 bash scripts/train_grasp.sh --num_envs 4096 --headless
 ```
 
-**Phase 2 — insert only** (requires `data/grasp_terminal_states.npz`; see [Policy chaining](#policy-chaining-grasp--insert)):
+**Phase 2 — slide** (requires `data/grasp_terminal_states.npz`):
+
+```bash
+bash scripts/train_slide.sh --num_envs 4096 --headless
+```
+
+**Phase 3 — insert** (requires `data/slide_terminal_states.npz`; see [Policy chaining](#policy-chaining-grasp--slide--insert)):
 
 ```bash
 bash scripts/train_insert.sh --num_envs 4096 --headless
@@ -99,113 +108,91 @@ python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-
 
 ---
 
-## Policy chaining (Grasp → Insert)
+## Policy chaining (Grasp → Slide → Insert)
 
-This task trains two separate policies and chains them using ideas from **Sequential Dexterity** ([Chen et al., CoRL 2023](https://arxiv.org/abs/2309.00987)): the *terminal state distribution* of Phase 1 becomes the *initial state distribution* of Phase 2. Insert-phase rewards use an SDF-inspired dense shaping term inspired by **IndustReal** ([Tang et al., RSS 2023](https://arxiv.org/abs/2305.17110)).
+Three policies are trained and chained using **Sequential Dexterity** ([Chen et al., CoRL 2023](https://arxiv.org/abs/2309.00987)): each phase’s terminal state distribution becomes the next phase’s reset distribution.
 
-### Why chain policies?
-
-Training Insert from a fixed “ideal” grasp pose (e.g. kinematic snap to closed jaws) creates a **distribution mismatch**: the Insert policy never sees the small pose errors, gripper gaps, and PCB offsets that a real Grasp policy produces. Sampling resets from recorded Grasp successes exposes Insert training to that same distribution and improves transfer when the two policies are run back-to-back.
+**Slide** and **Insert** are split because contact at the slot mouth differs from deep magazine insertion — slide learns open-rail +Y pushing and alignment; insert learns SDF-shaped seating inside the slot ([IndustReal](https://arxiv.org/abs/2305.17110)-style dense reward).
 
 ### End-to-end workflow
 
 ```text
-  ┌─────────────────┐     ┌──────────────────────────┐     ┌─────────────────┐
-  │  Train Grasp    │────▶│  collect_grasp_states.py │────▶│  Train Insert   │
-  │  (Phase 1 RL)   │     │  → grasp_terminal_states │     │  (Phase 2 RL)   │
-  └─────────────────┘     └──────────────────────────┘     └─────────────────┘
+  Train Grasp ──▶ collect_grasp_states ──▶ Train Slide ──▶ collect_slide_states ──▶ Train Insert
+                  grasp_terminal_states              slide_terminal_states
 ```
 
-**Step 1 — Train the Grasp policy**
+**Step 1 — Grasp**
 
 ```bash
-cd /path/to/widowx_pcb
 bash scripts/train_grasp.sh --num_envs 2048 --headless
 ```
 
-Checkpoint example: `logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth`
-
-**Step 2 — Collect successful terminal states**
-
-Roll out the Grasp checkpoint in parallel envs. Whenever an episode terminates on **`grasp_success`** (not timeout), the script records the robot joint positions and PCB root pose at that step.
+**Step 2 — Collect grasp terminal states** (`grasp_success` only)
 
 ```bash
 python scripts/collect_grasp_states.py \
     --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth \
-    --num_envs 256 \
-    --num_states 2000 \
-    --out data/grasp_terminal_states.npz \
-    --headless
+    --num_envs 256 --num_states 2000 --headless
 ```
 
-| Argument | Default | Meaning |
-|----------|---------|---------|
-| `--checkpoint` | *(required)* | Path to the trained Grasp `.pth` |
-| `--num_envs` | `256` | Parallel rollout environments |
-| `--num_states` | `2000` | Target count of **successful** terminal states to save |
-| `--out` | `data/grasp_terminal_states.npz` | Output file |
-| `--max_steps` | `20000` | Safety cap on total env steps |
+**Step 3 — Slide** (resets from `data/grasp_terminal_states.npz`)
 
-`--num_states` counts individual successful grasp terminations (not full episodes). With many parallel envs, several successes can occur in the same step, so collection finishes faster than running `--num_states` sequential episodes.
+```bash
+bash scripts/train_slide.sh --num_envs 2048 --headless
+```
 
-**Step 3 — Train the Insert policy**
+Slide rewards (`RewardsSlidePhaseCfg`): straddle hold, +Y step/state progress toward **`_MAG_Y_NEAR_FACE_ENV`** (slot mouth plane), rail-parallel push, lane penalties. **No `sdf_insert`.** Episode ends on **`slide_success`** when the leading edge reaches the mouth.
 
-`scripts/train_insert.sh` checks that `data/grasp_terminal_states.npz` exists, then launches Insert training. On every episode reset, `reset_from_grasp_states` samples one row from the buffer and writes it to the robot and PCB.
+**Step 4 — Collect slide terminal states** (`slide_success` only)
+
+```bash
+python scripts/collect_slide_states.py \
+    --checkpoint logs/rl_games/widowx_pcb_slide/nn/widowx_pcb_slide.pth \
+    --num_envs 256 --num_states 2000 --headless
+```
+
+**Step 5 — Insert** (resets from `data/slide_terminal_states.npz`)
 
 ```bash
 bash scripts/train_insert.sh --num_envs 2048 --headless
 ```
 
-### Saved state format (`grasp_terminal_states.npz`)
+### Terminal state format (both `.npz` files)
 
 | Key | Shape | Description |
 |-----|-------|-------------|
-| `joint_pos` | `(N, n_joints)` | Robot joint positions at grasp success (rad / m) |
-| `pcb_pos_env` | `(N, 3)` | PCB root position in **env-local** coordinates (m) |
-| `pcb_quat` | `(N, 4)` | PCB root orientation quaternion **(w, x, y, z)** |
-| `joint_names` | list of str | Joint name for each column of `joint_pos` |
+| `joint_pos` | `(N, n_joints)` | Robot joints at phase success |
+| `pcb_pos_env` | `(N, 3)` | PCB root position (env-local, m) |
+| `pcb_quat` | `(N, 4)` | PCB orientation **(w, x, y, z)** |
+| `joint_names` | list | Joint names matching `joint_pos` columns |
 
-`N` is the number of collected successes (≤ `--num_states`). The Insert reset maps `joint_names` onto the live articulation by name, so column order stays consistent across runs.
-
-### How Insert reset uses the buffer
-
-Implemented in `mdp_custom.reset_from_grasp_states`, wired as `EventCfgInsert.reset_from_grasp`:
-
-1. Load `data/grasp_terminal_states.npz` once (cached for the process).
-2. For each env being reset, draw a random index with replacement.
-3. Write sampled `joint_pos` to the robot (clamped to soft limits, zero velocity).
-4. Write sampled `pcb_pos_env` + `pcb_quat` to the PCB rigid body (env-local pos + `env_origins` → world).
-
-Path constant in config: `_GRASP_STATES_PATH` in `widowx_pcb_env_cfg.py`.
+Reset helpers: `reset_from_grasp_states` + `reset_pcb_from_grasp_states` (same code path for slide buffer; path constants `_GRASP_STATES_PATH` / `_SLIDE_STATES_PATH`).
 
 ### Insert-phase reward (SDF-inspired)
 
-Phase 2 uses `pcb_insertion_sdf_reward` (`RewardsInsertPhaseCfg.sdf_insert`, weight 80). It combines three terms in `[0, 1]` (no USD SDF queries — purely tensor geometry, following the *spirit* of IndustReal’s signed-distance shaping):
+`RewardsInsertPhaseCfg.sdf_insert` → `pcb_insertion_sdf_reward` (weight 80):
 
 | Component | Coef | Signal |
 |-----------|------|--------|
-| **Proximity** | 0.20 | Gaussian on 3D distance from PCB **leading edge** to slot centre (`exp(-dist / σ)`) |
-| **Alignment** | 0.20 | \|cos θ\| between PCB long axis and world +Y (push direction) |
-| **Depth** | 0.60 | Linear fraction of leading-edge penetration past the slot mouth |
+| Proximity | 0.20 | Gaussian on leading-edge distance to slot centre |
+| Alignment | 0.20 | \|cos θ\| long axis vs +Y |
+| Depth | 0.60 | Leading-edge penetration past mouth (`_MAG_Y_NEAR_FACE_ENV`) |
 
-Supporting terms: velocity toward the slot (`insert_y_toward_slot`) and lateral-slide penalty.
+Also: straddle hold, seated leading-edge proximity, lane / lateral / Z-lift penalties.
 
-Slot geometry constants (tune in Isaac Sim after loading the scene):
+### Phase success criteria
 
-- `_SLOT_CENTER_XYZ_ENV` — env-local centre of the first slot opening
-- `_SLOT_DEPTH_M`, `_SLOT_HALF_DIMS_XYZ` — slot box half-extents
-- `_SLOT_MOUTH_Y_ENV` — slot entrance along +Y
-
-### Grasp success criterion (Phase 1)
-
-Grasp bonus and episode termination fire when `grasp_edge_center_achieved` is true: straddle + edge proximity + centre alignment + pinch readiness, and gripper gap `left_carriage_joint < PCB_Z × 1.1`.
+| Phase | Termination | Criterion |
+|-------|-------------|-----------|
+| Grasp | `grasp_success` | Edge-centre pinch + tight gripper |
+| Slide | `slide_success` | Mouth reached + flat on XY (`tilt ≤ 0.08`, long-axis \|Z\| ≤ 0.15, long-axis ∥ +Y ≥ 0.85) |
+| Insert | `insert_success` | PCB centre Y at magazine centre |
 
 ### Tips
 
-- Collect **more states than you have parallel Insert envs** (e.g. 2000+ states for 2048 envs) so resets stay diverse.
-- If Insert training fails immediately with `FileNotFoundError`, run Step 2 first.
-- Re-collect the buffer whenever you change Grasp checkpoints, success criteria, or domain randomization — the Insert initial distribution should match the Grasp policy you will deploy.
-- After moving the magazine in sim, re-tune `_SLOT_CENTER_XYZ_ENV` and related constants before Insert training.
+- Collect **more states than parallel envs** (e.g. 2000+ for 2048 envs).
+- Re-collect buffers when upstream checkpoints or success criteria change.
+- Tune `_MAG_Y_NEAR_FACE_ENV`, `_SLOT_CENTER_XYZ_ENV` in Isaac Sim after moving the fixture.
 
 ---
 
@@ -216,6 +203,7 @@ Checkpoints live under this workspace (when you train with `scripts/train_*.sh`)
 | Phase | Log folder | Default checkpoint |
 |-------|------------|-------------------|
 | Grasp | `logs/rl_games/widowx_pcb_grasp/` | `nn/widowx_pcb_grasp.pth` |
+| Slide | `logs/rl_games/widowx_pcb_slide/` | `nn/widowx_pcb_slide.pth` |
 | Insert | `logs/rl_games/widowx_pcb_insert/` | `nn/widowx_pcb_insert.pth` |
 
 **Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to the **current working directory**. Run from **`/path/to/widowx_pcb`** (this workspace), not from the Isaac Lab repo root — otherwise it will not find workspace checkpoints.
@@ -225,6 +213,13 @@ Checkpoints live under this workspace (when you train with `scripts/train_*.sh`)
 ```bash
 cd /path/to/widowx_pcb
 bash scripts/play_grasp.sh --num_envs 16
+```
+
+### Slide policy (recommended)
+
+```bash
+cd /path/to/widowx_pcb
+bash scripts/play_slide.sh --num_envs 16
 ```
 
 ### Insert policy (recommended)
@@ -345,22 +340,33 @@ ffmpeg -y -i input.mp4 -vf "setpts=PTS*(125/30)" -r 30 -c:v libx264 -crf 18 -pix
 
 ## TensorBoard
 
-Training with rl-games **automatically** writes TensorBoard event files. No extra flags are required — `use_diagnostics: True` is already set in [`agents/rl_games_ppo_cfg.py`](agents/rl_games_ppo_cfg.py).
+Training with rl-games **automatically** writes TensorBoard event files under each phase's `summaries/` folder. No extra CLI flags are required.
 
-When you use `scripts/train_grasp.sh` / `scripts/train_insert.sh`, logs are written under **this workspace**:
+PPO settings (experiment name, `max_epochs`, `horizon_length`, `use_diagnostics`, `reward_shaper`) live in [`agents/rl_games_ppo_cfg.py`](agents/rl_games_ppo_cfg.py): `WidowXPcbGraspPPOCfg`, `WidowXPcbSlidePPOCfg`, `WidowXPcbInsertPPOCfg`.
 
-| Task | Task ID | Log folder (under workspace) |
-|------|---------|------------------------------|
-| Grasp | `Isaac-WidowX-PCB-Grasp-v0` | `logs/rl_games/widowx_pcb_grasp/` |
-| Insert | `Isaac-WidowX-PCB-Insert-v0` | `logs/rl_games/widowx_pcb_insert/` |
+When you use `scripts/train_grasp.sh` / `train_slide.sh` / `train_insert.sh`, logs are written under **this workspace**:
 
-TensorBoard event files live in each run's `summaries/` subdirectory, e.g.:
+| Phase | Task ID | Train script | Log folder | Checkpoint | `episode_length_s` | `max_epochs` |
+|-------|---------|--------------|------------|------------|--------------------|--------------|
+| 1 Grasp | `Isaac-WidowX-PCB-Grasp-v0` | `train_grasp.sh` | `logs/rl_games/widowx_pcb_grasp/` | `nn/widowx_pcb_grasp.pth` | 4 s | 500 |
+| 2 Slide | `Isaac-WidowX-PCB-Slide-v0` | `train_slide.sh` | `logs/rl_games/widowx_pcb_slide/` | `nn/widowx_pcb_slide.pth` | 8 s | 200 |
+| 3 Insert | `Isaac-WidowX-PCB-Insert-v0` | `train_insert.sh` | `logs/rl_games/widowx_pcb_insert/` | `nn/widowx_pcb_insert.pth` | 5 s | 200 |
 
-`logs/rl_games/widowx_pcb_grasp/summaries/events.out.tfevents.*`
+TensorBoard event files:
+
+```text
+logs/rl_games/widowx_pcb_grasp/summaries/events.out.tfevents.*
+logs/rl_games/widowx_pcb_slide/summaries/events.out.tfevents.*
+logs/rl_games/widowx_pcb_insert/summaries/events.out.tfevents.*
+```
+
+Checkpoints and optional play videos sit beside `summaries/` in the same phase folder (`nn/`, `videos/play/`).
+
+**Diagnostics:** Grasp uses `use_diagnostics: True` (full rl-games loss / KL scalars). Slide and Insert set `use_diagnostics: False` to avoid early `explained_variance` NaN spam in TensorBoard; policy / value / entropy tags still appear.
 
 ### View logs
 
-**Option A — project helper** (defaults to workspace `logs/`):
+**Option A — project helper** (defaults to workspace `logs/`, lists which phase folders exist):
 
 ```bash
 cd /path/to/widowx_pcb
@@ -374,19 +380,54 @@ cd /path/to/IsaacLab
 ./isaaclab.sh -p -m tensorboard.main --logdir=logs --port=6006
 ```
 
-Open <http://127.0.0.1:6006>. In the run selector, pick `widowx_pcb_grasp` or `widowx_pcb_insert`.
+**Option C — TensorBoard directly** on this workspace:
 
-### What to watch
+```bash
+cd /path/to/widowx_pcb
+tensorboard --logdir=logs --port=6006
+```
 
-- Episodic reward / `rewards/episode_rewards` (or similar rl-games tag)
+Open <http://127.0.0.1:6006>. In the run selector you should see all trained phases, e.g. `widowx_pcb_grasp`, `widowx_pcb_slide`, `widowx_pcb_insert` (under `rl_games/…/summaries`).
+
+### What to watch (all phases)
+
+rl-games training scalars (names vary slightly by version):
+
+- Episodic reward / `rewards/episode_rewards` (or `episode_rewards`)
 - Policy / actor loss
 - Value / critic loss
 - Entropy
-- KL / `approx_kl`
+- KL / `approx_kl` (Grasp only when `use_diagnostics: True`)
+
+Isaac Lab manager env extras (when logged per episode):
+
+- `Episode_Reward/<term>` — per reward term from `RewardsGraspPhaseCfg`, `RewardsSlidePhaseCfg`, or `RewardsInsertPhaseCfg`
+- `Episode_Termination/<term>` — success rate for `grasp_success`, `slide_success`, or `insert_success`
+
+### Phase-specific signals
+
+| Phase | Success termination | Reward terms worth watching |
+|-------|---------------------|-----------------------------|
+| Grasp | `grasp_success` | `grasp_success_bonus`, `pcb_between_fingers`, `gripper_closing`, `premature_close` |
+| Slide | `slide_success` | `slide_success_bonus`, `push_axis_step_progress`, `push_axis_state`, `mouth_approach_proximity`, `rail_parallel_push_progress` (no `sdf_insert`) |
+| Insert | `insert_success` | `sdf_insert`, `mouth_approach_proximity`, lane penalties (`pcb_x_lane_escape`, `pcb_lateral_velocity`) |
+
+If mean reward plateaus, compare per-term `Episode_Reward/*` curves against `action_rate_penalty` — a flat success termination while penalties dominate usually means the policy is idling or fighting contact at the slot mouth.
 
 ### Logging frequency
 
-rl-games logs episode-level metrics when episodes **terminate**. With `horizon_length: 128` and `episode_length_s` of 8–12 s, scalar updates may appear every ~15–60 epochs. That is expected rl-games behavior, not a missing-log bug.
+rl-games logs episode-level metrics when episodes **terminate**. With `horizon_length` 128 (Grasp) or 256 (Slide / Insert) and `episode_length_s` of 4–8 s, scalar updates may appear every ~10–60 epochs. That is expected rl-games behavior, not a missing-log bug.
+
+### Clean summaries only (keep checkpoints)
+
+Slide and Insert train scripts accept:
+
+```bash
+bash scripts/train_slide.sh --clean-logs    # deletes summaries/ only
+bash scripts/train_insert.sh --clean-logs
+```
+
+Use `--clean-all` on those scripts to wipe the entire phase log folder (`summaries/`, `nn/`, videos). For Grasp, remove `logs/rl_games/widowx_pcb_grasp/summaries/` manually or re-run with a fresh log dir.
 
 ---
 

@@ -2065,6 +2065,100 @@ def pcb_height_below_reference(
     return torch.clamp(min_height - h, min=0.0)
 
 
+def slide_mouth_reached(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_mouth_y_env: float,
+    margin_m: float = 0.008,
+) -> torch.Tensor:
+    """True when the PCB **leading** short-edge centre reaches the slot mouth plane (+Y)."""
+    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
+    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
+    return lead_y >= float(slot_mouth_y_env) - float(margin_m)
+
+
+def slide_success(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_mouth_y_env: float,
+    margin_m: float = 0.008,
+    min_episode_steps: int = 2,
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_tilt_penalty: float = 0.08,
+    max_long_axis_abs_z: float = 0.15,
+    min_long_axis_xy_align: float = 0.85,
+) -> torch.Tensor:
+    """Slide-phase success: mouth reached + PCB parallel to the world XY plane.
+
+    Combines:
+
+    * **Mouth** — leading short-edge centre Y ≥ slot mouth − margin.
+    * **Thickness flatness** — ``pcb_thickness_axis_tilt_penalty`` ≤ ``max_tilt_penalty``
+      (default 0.08 ⇒ |dot(z_body, up)| ≥ 0.92, matches rail-parallel reward flatness).
+    * **Long-axis horizontal** — |world-Z component of body +X| ≤ ``max_long_axis_abs_z``
+      (long edge lies in the XY plane, not wedged edge-on).
+    * **Long-axis XY alignment** — body +X projected into XY aligns with ``axis_world``
+      (default +Y) by at least ``min_long_axis_xy_align`` (default 0.85).
+    """
+    reached = slide_mouth_reached(
+        env, pcb_cfg, half_length_m, slot_mouth_y_env, margin_m=margin_m,
+    )
+    tilt_ok = pcb_thickness_axis_tilt_penalty(env, pcb_cfg, world_up) <= float(max_tilt_penalty)
+
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    long_horizontal_ok = torch.abs(x_w[:, 2]) <= float(max_long_axis_abs_z)
+
+    x_xy = x_w.clone()
+    x_xy[:, 2] = 0.0
+    x_xy = x_xy / torch.norm(x_xy, dim=-1, keepdim=True).clamp_min(1e-6)
+    a = torch.tensor(axis_world, device=x_w.device, dtype=x_w.dtype)
+    a_xy = a.clone()
+    a_xy[2] = 0.0
+    a_xy = a_xy / torch.norm(a_xy).clamp_min(1e-6)
+    a_xy = a_xy.unsqueeze(0).expand_as(x_xy)
+    long_align = torch.abs(torch.sum(x_xy * a_xy, dim=-1))
+    long_align_ok = long_align >= float(min_long_axis_xy_align)
+
+    success = reached & tilt_ok & long_horizontal_ok & long_align_ok
+    if min_episode_steps > 0:
+        ready = env.episode_length_buf > min_episode_steps
+        success = success & ready
+    return success
+
+
+def slide_success_bonus_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_mouth_y_env: float,
+    margin_m: float = 0.008,
+    min_episode_steps: int = 2,
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_tilt_penalty: float = 0.08,
+    max_long_axis_abs_z: float = 0.15,
+    min_long_axis_xy_align: float = 0.85,
+) -> torch.Tensor:
+    """Bonus (1.0) on steps where slide success criteria are met; mirrors :func:`slide_success`."""
+    achieved = slide_success(
+        env,
+        pcb_cfg,
+        half_length_m,
+        slot_mouth_y_env,
+        margin_m=margin_m,
+        min_episode_steps=min_episode_steps,
+        world_up=world_up,
+        axis_world=axis_world,
+        max_tilt_penalty=max_tilt_penalty,
+        max_long_axis_abs_z=max_long_axis_abs_z,
+        min_long_axis_xy_align=min_long_axis_xy_align,
+    )
+    return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
+
+
 def insert_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,

@@ -20,6 +20,15 @@ gym.register(
 )
 
 gym.register(
+    id="Isaac-WidowX-PCB-Slide-v0",
+    entry_point=_COMMON_KWARGS["entry_point"],
+    kwargs={
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbSlideEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbSlidePPOCfg",
+    },
+)
+
+gym.register(
     id="Isaac-WidowX-PCB-Insert-v0",
     entry_point=_COMMON_KWARGS["entry_point"],
     kwargs={

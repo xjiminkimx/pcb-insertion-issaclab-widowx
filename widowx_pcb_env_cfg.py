@@ -2,13 +2,15 @@ from __future__ import annotations
 
 """Environment configuration for WidowX PCB slot insertion.
 
-Two-phase task design:
+Three-phase task design (policy chaining):
   Phase 1 (Grasp):  approach + pinch the trailing short-edge **centre**.
-  Phase 2 (Insert): slide the grasped PCB along world +Y into the magazine slot.
+  Phase 2 (Slide):  slide the grasped PCB along guide rails to the slot **mouth**.
+  Phase 3 (Insert): insert through the mouth into the magazine slot (SDF-shaped reward).
 
 Registered variants (see ``__init__.py``):
-  - ``Isaac-WidowX-PCB-Grasp-v0``  — phase 1 only (train grasp first)
-  - ``Isaac-WidowX-PCB-Insert-v0`` — phase 2 only (reset with PCB snapped to closed jaws)
+  - ``Isaac-WidowX-PCB-Grasp-v0``  — phase 1
+  - ``Isaac-WidowX-PCB-Slide-v0``  — phase 2 (reset from grasp terminal states)
+  - ``Isaac-WidowX-PCB-Insert-v0`` — phase 3 (reset from slide terminal states)
 """
 
 import os
@@ -47,6 +49,7 @@ from .mdp_custom import (
     pcb_xy_plane_parallel_shaping,
     # --- grasp / push rewards ---
     grasp_success_bonus_reward,
+    slide_success_bonus_reward,
     gripper_jaw_rail_vertical_shaping,
     gripper_wrist_carriage_push_axis_shaping,
     gripper_jaw_rail_horizontal_penalty,
@@ -79,6 +82,8 @@ from .mdp_custom import (
     pcb_detached_from_gripper,
     pcb_extreme_drift_from_gripper,
     insert_success,
+    slide_success,
+    pcb_insertion_sdf_reward,
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
@@ -311,8 +316,15 @@ _LANE_X_MAX_EXCESS_M = 0.020
 # Push credit only when trailing-edge straddle quality exceeds this (``pcb_between_gripper_fingers``).
 _INSERT_STRADDLE_GATE_MIN = 0.3
 
-# Path to the grasp terminal-state buffer (produced by scripts/collect_grasp_states.py).
+# Terminal-state buffers (Sequential Dexterity chaining).
 _GRASP_STATES_PATH = os.path.join(ASSET_DIR, "data", "grasp_terminal_states.npz")
+_SLIDE_STATES_PATH = os.path.join(ASSET_DIR, "data", "slide_terminal_states.npz")
+# Slide success: leading edge within this margin of the magazine near face (env-local Y).
+_SLIDE_MOUTH_MARGIN_M = 0.008
+# Slide success orientation gates (stricter than ``pcb_tilt_excessive`` / ``pcb_long_axis_not_horizontal``).
+_SLIDE_SUCCESS_MAX_TILT_PENALTY = 0.08       # flatness |dot(z_body, up)| ≥ 0.92
+_SLIDE_SUCCESS_MAX_LONG_AXIS_ABS_Z = 0.15    # long axis mostly in XY (fail term uses 0.25)
+_SLIDE_SUCCESS_MIN_LONG_XY_ALIGN = 0.85      # long axis ∥ +Y in the horizontal plane
 
 # Shared SceneEntityCfg snippets (reward / event params).
 _PCB_ENT = SceneEntityCfg("pcb")
@@ -580,6 +592,22 @@ def _insert_extreme_drift_params(**extra) -> dict:
     return base
 
 
+def _slide_success_params(**extra) -> dict:
+    """Kwargs shared by slide success termination and ``slide_success_bonus`` reward."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "half_length_m": _HALF_LENGTH_M,
+        "slot_mouth_y_env": _MAG_Y_NEAR_FACE_ENV,
+        "margin_m": _SLIDE_MOUTH_MARGIN_M,
+        "axis_world": PUSH_AXIS_WORLD,
+        "max_tilt_penalty": _SLIDE_SUCCESS_MAX_TILT_PENALTY,
+        "max_long_axis_abs_z": _SLIDE_SUCCESS_MAX_LONG_AXIS_ABS_Z,
+        "min_long_axis_xy_align": _SLIDE_SUCCESS_MIN_LONG_XY_ALIGN,
+    }
+    base.update(extra)
+    return base
+
+
 def _grasp_termination_params(**extra) -> dict:
     """Entity + geometry kwargs shared by grasp-success and pre-grasp terminations."""
     base = {
@@ -801,6 +829,52 @@ class ObservationsCfg:
 
 
 @configclass
+class ObservationsCfgSlide:
+    """Slide-phase observations: goal is the slot mouth (leading-edge approach target)."""
+
+    @configclass
+    class PolicyCfg(ObservationGroupCfg):
+        joint_pos = ObservationTermCfg(
+            func=joint_pos_rel_episode_reset,
+            params={"asset_cfg": _ROBOT_ENT},
+        )
+        joint_vel = ObservationTermCfg(
+            func=mdp.joint_vel_rel,
+            clip=(-20.0, 20.0),
+        )
+        object_pos = ObservationTermCfg(
+            func=pcb_leading_short_edge_center_env,
+            params={"pcb_cfg": _PCB_ENT, "half_length_m": _HALF_LENGTH_M},
+        )
+        ee_pos = ObservationTermCfg(
+            func=gripper_midpoint_position_env,
+            params={
+                "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
+                "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
+                **_gripper_kinematics_kwargs(),
+            },
+        )
+        pcb_to_slot_error = ObservationTermCfg(
+            func=pcb_to_target_error_obs,
+            params={
+                "pcb_cfg": _PCB_ENT,
+                "target_xyz_env": _SLOT_APPROACH_LEAD_XYZ_ENV,
+                "scale_xyz_m": (0.05, 0.25, 0.05),
+                "half_length_m": _HALF_LENGTH_M,
+            },
+        )
+        pcb_orientation = ObservationTermCfg(
+            func=pcb_insertion_orientation_obs,
+            params={
+                "pcb_cfg": _PCB_ENT,
+                "align_axis_world": PUSH_AXIS_WORLD,
+            },
+        )
+
+    policy: PolicyCfg = PolicyCfg()
+
+
+@configclass
 class ObservationsCfgInsert:
     """Insert-phase observations: goal-relative signals so the policy can generalise.
 
@@ -965,10 +1039,9 @@ class RewardsGraspPhaseCfg():
 
 
 @configclass
-class RewardsInsertPhaseCfg:
-    """Phase 2 insert rewards: leading-edge +Y push, pure +Y slide only (state + velocity)."""
+class RewardsSlidePhaseCfg:
+    """Phase 2 slide rewards: rail +Y push until leading edge reaches slot mouth (no SDF / deep insert)."""
 
-    # Maintain trailing-edge straddle while sliding — reduces detach-driven early termination.
     pcb_between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers,
         params=_insert_between_fingers_params(),
@@ -979,8 +1052,6 @@ class RewardsInsertPhaseCfg:
         params=_insert_between_fingers_hold_params(),
         weight=20.0,
     )
-
-    # Per-step ΔY of leading short-edge centre — primary credit for millimetre-scale rail slide.
     push_axis_step_progress = RewardTermCfg(
         func=pcb_leading_edge_push_axis_approach_progress_gated,
         params={
@@ -992,27 +1063,35 @@ class RewardsInsertPhaseCfg:
         },
         weight=80.0,
     )
-
-    # State: leading short-edge centre — fraction of start→target travel along +Y [0, 1].
-    # Zero while PCB root skids (X) or lifts/drops (Z): sqrt(v_x² + v_z²) must stay below gate.
+    # Leading-edge Y progress toward magazine near face (slot mouth plane).
     push_axis_state = RewardTermCfg(
         func=pcb_push_axis_progress_reward_gated,
         params={
             "pcb_cfg": _PCB_ENT,
-            "target_proj_env": _LEAD_EDGE_TARGET_Y_ENV,
+            "target_proj_env": _MAG_Y_NEAR_FACE_ENV,
             "axis_world": PUSH_AXIS_WORLD,
+            "half_length_m": _HALF_LENGTH_M,
             "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
             **_insert_push_straddle_gate_params(),
         },
         weight=50.0,
     )
-
-    # Per-step +Y on lane (X on-rail, flat, long axis ∥ +Y) — replaces raw v_y reward.
+    # Dense 3D proximity to slot-mouth leading-edge goal.
+    mouth_approach_proximity = RewardTermCfg(
+        func=pcb_leading_edge_insertion_proximity_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "target_lead_xyz_env": _SLOT_APPROACH_LEAD_XYZ_ENV,
+            "sigma_m": 0.10,
+        },
+        weight=40.0,
+    )
     rail_parallel_push_progress = RewardTermCfg(
         func=pcb_rail_parallel_approach_progress_straddle_gated,
         params={
             "pcb_cfg": _PCB_ENT,
-            "slot_mouth_y_env": _SLOT_MOUTH_Y_ENV,
+            "slot_mouth_y_env": _MAG_Y_NEAR_FACE_ENV,
             "rail_center_x_env": _LANE_CENTER_X_ENV,
             "max_lateral_x_m": _RAIL_PARALLEL_MAX_LATERAL_X_M,
             "min_flatness": _RAIL_PARALLEL_MIN_FLATNESS,
@@ -1023,8 +1102,6 @@ class RewardsInsertPhaseCfg:
         },
         weight=50.0,
     )
-
-    # Penalise sustained −Y slide (brief slip transients ignored).
     push_axis_backward_velocity = RewardTermCfg(
         func=pcb_push_axis_sustained_backward_velocity_penalty,
         params={
@@ -1034,21 +1111,6 @@ class RewardsInsertPhaseCfg:
         },
         weight=-25.0,
     )
-
-    # Leading short-edge centre: fraction of reset→magazine far-face travel along +Y [0, 1].
-    leading_edge_far_face_progress = RewardTermCfg(
-        func=pcb_push_axis_progress_reward_gated,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "target_proj_env": _MAG_Y_FAR_FACE_ENV,
-            "axis_world": PUSH_AXIS_WORLD,
-            "max_off_axis_speed_m_s": _INSERT_GATED_OFF_AXIS_SPEED_M_S,
-            **_insert_push_straddle_gate_params(),
-        },
-        weight=50.0,
-    )
-
-    # Bounded quadratic penalty when leading-edge Z rises >7 mm above reset (no expm1 blow-up).
     leading_edge_z_lift = RewardTermCfg(
         func=pcb_leading_edge_z_lift_penalty,
         params={
@@ -1059,8 +1121,6 @@ class RewardsInsertPhaseCfg:
         },
         weight=-2.0,
     )
-
-    # Keep PCB ∥ world XY: thickness ∥ +Z and long axis in the horizontal plane.
     pcb_xy_parallel = RewardTermCfg(
         func=pcb_xy_plane_parallel_shaping,
         params={
@@ -1077,7 +1137,6 @@ class RewardsInsertPhaseCfg:
         params={"pcb_cfg": _PCB_ENT},
         weight=-10.0,
     )
-    # Exponential penalty when PCB centre crosses conveyor / rail lane boundary in X.
     pcb_x_lane_escape = RewardTermCfg(
         func=pcb_x_lane_boundary_exponential_penalty,
         params={
@@ -1089,11 +1148,108 @@ class RewardsInsertPhaseCfg:
         },
         weight=-18.0,
     )
-    # Lateral root velocity orthogonal to +Y (includes X skidding while pushing).
     pcb_lateral_velocity = RewardTermCfg(
         func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
         weight=-8.0,
+    )
+    slide_success_bonus = RewardTermCfg(
+        func=slide_success_bonus_reward,
+        params=_slide_success_params(),
+        weight=150.0,
+    )
+    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.003)
+
+
+@configclass
+class RewardsInsertPhaseCfg:
+    """Phase 3 insert rewards: SDF-shaped slot insertion from the slide terminal distribution."""
+
+    pcb_between_fingers = RewardTermCfg(
+        func=pcb_between_gripper_fingers,
+        params=_insert_between_fingers_params(),
+        weight=55.0,
+    )
+    pcb_between_fingers_hold = RewardTermCfg(
+        func=pcb_between_gripper_fingers_hold_reward,
+        params=_insert_between_fingers_hold_params(),
+        weight=20.0,
+    )
+    sdf_insert = RewardTermCfg(
+        func=pcb_insertion_sdf_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "slot_center_xyz_env": _SLOT_CENTER_XYZ_ENV,
+            "slot_half_dims_xyz": _SLOT_HALF_DIMS_XYZ,
+            "slot_mouth_y_env": _MAG_Y_NEAR_FACE_ENV,
+            "align_axis_world": PUSH_AXIS_WORLD,
+            "pos_sigma_m": 0.12,
+            "align_coef": 0.20,
+            "depth_coef": 0.60,
+        },
+        weight=80.0,
+    )
+    mouth_approach_proximity = RewardTermCfg(
+        func=pcb_leading_edge_insertion_proximity_reward,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "target_lead_xyz_env": _LEAD_EDGE_CENTER_TARGET_XYZ_ENV,
+            "sigma_m": 0.15,
+        },
+        weight=25.0,
+    )
+    leading_edge_z_lift = RewardTermCfg(
+        func=pcb_leading_edge_z_lift_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "max_lift_m": _INSERT_LEAD_EDGE_MAX_LIFT_M,
+            "max_penalty_excess_m": _INSERT_LEAD_EDGE_MAX_PENALTY_EXCESS_M,
+        },
+        weight=-3.0,
+    )
+    pcb_xy_parallel = RewardTermCfg(
+        func=pcb_xy_plane_parallel_shaping,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "axis_world": PUSH_AXIS_WORLD,
+            "flat_coef": 0.55,
+            "long_horizontal_coef": 0.45,
+            "long_align_coef": 0.0,
+        },
+        weight=12.0,
+    )
+    pcb_tilt_penalty = RewardTermCfg(
+        func=pcb_thickness_axis_tilt_penalty,
+        params={"pcb_cfg": _PCB_ENT},
+        weight=-10.0,
+    )
+    pcb_x_lane_escape = RewardTermCfg(
+        func=pcb_x_lane_boundary_exponential_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "lane_center_x_env": _LANE_CENTER_X_ENV,
+            "inner_half_width_m": _LANE_INNER_HALF_WIDTH_M,
+            "exponential_scale_m": _LANE_X_EXP_SCALE_M,
+            "max_excess_m": _LANE_X_MAX_EXCESS_M,
+        },
+        weight=-12.0,
+    )
+    pcb_lateral_velocity = RewardTermCfg(
+        func=pcb_horizontal_velocity_perpendicular_to_axis_penalty,
+        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+        weight=-8.0,
+    )
+    push_axis_backward_velocity = RewardTermCfg(
+        func=pcb_push_axis_sustained_backward_velocity_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "min_backward_speed_m_s": 0.003,
+            "min_consecutive_steps": 3,
+        },
+        weight=-20.0,
     )
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.003)
 
@@ -1126,21 +1282,8 @@ class EventCfgGrasp:
     )
 
 
-@configclass
-class EventCfgInsert:
-    """Phase 2 reset: sample a successful Phase-1 terminal state (policy chaining).
-
-    Two-step reset (order matters):
-      1. ``reset_robot_from_grasp`` — robot joints from a random buffer row + gripper PD target.
-      2. ``reset_pcb_from_grasp``  — PCB root pose from the **same** buffer row.
-
-    Gripper PD target is captured at reset (buffer pinch, tightened to ``_GRIPPER_CLOSED_TARGET_M``)
-    and re-applied each control step so contact slip does not drift the carriage open.
-    FK snap was removed — it teleported the board into finger/rail overlap and launched it.
-    Z is snapped to the rail only when buffer Z is already within ``_SNAP_Z_TO_RAIL_MAX_DELTA_M``.
-    """
-
-    set_gripper_finger_friction = EventTermCfg(
+def _gripper_friction_event() -> EventTermCfg:
+    return EventTermCfg(
         func=mdp.randomize_rigid_body_material,
         mode="startup",
         params={
@@ -1158,6 +1301,26 @@ class EventCfgInsert:
             "make_consistent": True,
         },
     )
+
+
+def _hold_gripper_closed_interval() -> EventTermCfg:
+    return EventTermCfg(
+        func=hold_gripper_closed,
+        mode="interval",
+        interval_range_s=(0.008, 0.008),
+        params={
+            "asset_cfg": _ROBOT_ENT,
+            "joint_name": "left_carriage_joint",
+            "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+        },
+    )
+
+
+@configclass
+class EventCfgSlide:
+    """Phase 2 reset: sample a successful Grasp terminal state."""
+
+    set_gripper_finger_friction = _gripper_friction_event()
     reset_robot_from_grasp = EventTermCfg(
         func=reset_from_grasp_states,
         mode="reset",
@@ -1184,7 +1347,6 @@ class EventCfgInsert:
             "snap_z_max_delta_m": _SNAP_Z_TO_RAIL_MAX_DELTA_M,
         },
     )
-    # Re-apply closed gripper PD after PCB teleport (prevents implicit target drift open).
     reassert_gripper_closed = EventTermCfg(
         func=hold_gripper_closed,
         mode="reset",
@@ -1194,16 +1356,50 @@ class EventCfgInsert:
             "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         },
     )
-    hold_gripper_closed = EventTermCfg(
+    hold_gripper_closed = _hold_gripper_closed_interval()
+
+
+@configclass
+class EventCfgInsert:
+    """Phase 3 reset: sample a successful Slide terminal state (policy chaining)."""
+
+    set_gripper_finger_friction = _gripper_friction_event()
+    reset_robot_from_slide = EventTermCfg(
+        func=reset_from_grasp_states,
+        mode="reset",
+        params={
+            "asset_cfg": _ROBOT_ENT,
+            "grasp_states_path": _SLIDE_STATES_PATH,
+            "velocity_scale": 0.0,
+            "gripper_joint_name": "left_carriage_joint",
+            "gripper_closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+            "rail_center_z_env": _INSERT_RAIL_CENTER_Z_ENV,
+            "max_rail_z_delta_m": _GRASP_BUFFER_MAX_RAIL_Z_DELTA_M,
+        },
+    )
+    reset_pcb_from_slide = EventTermCfg(
+        func=reset_pcb_from_grasp_states,
+        mode="reset",
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "grasp_states_path": _SLIDE_STATES_PATH,
+            "half_length_m": _HALF_LENGTH_M,
+            "velocity_scale": 0.0,
+            "rail_center_z_env": _INSERT_RAIL_CENTER_Z_ENV,
+            "snap_z_to_rail": False,
+            "snap_z_max_delta_m": _SNAP_Z_TO_RAIL_MAX_DELTA_M,
+        },
+    )
+    reassert_gripper_closed = EventTermCfg(
         func=hold_gripper_closed,
-        mode="interval",
-        interval_range_s=(0.008, 0.008),
+        mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
             "joint_name": "left_carriage_joint",
             "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
         },
     )
+    hold_gripper_closed = _hold_gripper_closed_interval()
 
 
 @configclass
@@ -1242,12 +1438,42 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
 
 
 @configclass
-class TerminationsInsertCfg(TerminationsSharedCfg):
-    """Insert phase: terminate on grasp loss, fall, or successful insertion.
+class TerminationsSlideCfg(TerminationsSharedCfg):
+    """Slide phase: terminate on grasp loss, fall, or leading edge reaching slot mouth."""
 
-    Overrides the shared height threshold with a tighter one so a PCB that slips
-    back onto the conveyor (~0.233 m) is caught before the episode-end timeout.
-    """
+    pcb_fallen_below_rail = TerminationTermCfg(
+        func=pcb_root_height_below_env_minimum,
+        params={"pcb_cfg": _PCB_ENT, "min_height_env": _INSERT_PCB_MIN_HEIGHT_ENV},
+    )
+    pcb_tilt_excessive = TerminationTermCfg(
+        func=pcb_tilt_beyond_limit,
+        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.12},
+    )
+    pcb_long_axis_not_horizontal = TerminationTermCfg(
+        func=pcb_long_axis_vertical_component_exceeds,
+        params={"pcb_cfg": _PCB_ENT, "max_abs_z": 0.25},
+    )
+    pcb_detached = TerminationTermCfg(
+        func=pcb_detached_from_gripper,
+        params=_insert_detach_params(),
+    )
+    pcb_extreme_drift = TerminationTermCfg(
+        func=pcb_extreme_drift_from_gripper,
+        params=_insert_extreme_drift_params(),
+    )
+    pcb_moving_backward = TerminationTermCfg(
+        func=pcb_moving_backward_termination,
+        params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 8},
+    )
+    slide_success = TerminationTermCfg(
+        func=slide_success,
+        params=_slide_success_params(),
+    )
+
+
+@configclass
+class TerminationsInsertCfg(TerminationsSharedCfg):
+    """Insert phase: terminate on grasp loss, fall, or successful magazine seating."""
 
     # Height floor for insert: fire when PCB drops more than 80 mm below grasp height.
     # Tolerates push wobble; still catches a slip back onto the conveyor rail.
@@ -1344,11 +1570,36 @@ class WidowXPcbGraspEnvCfg(_WidowXPcbEnvCfgBase):
 
 
 @configclass
-class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
-    """Phase 2 only: learn to insert a pre-grasped PCB into the slot (+Y).
+class WidowXPcbSlideEnvCfg(_WidowXPcbEnvCfgBase):
+    """Phase 2: slide grasped PCB along guide rails to the slot mouth (+Y)."""
 
-    Arm commands are **relative joint deltas** from the buffer grasp pose (not HOME offset).
-    Gripper is held closed at reset; only 6 arm joints are actuated.
+    observations: ObservationsCfgSlide = ObservationsCfgSlide()
+    actions: ActionsCfgInsert = ActionsCfgInsert()
+    rewards: RewardsSlidePhaseCfg = RewardsSlidePhaseCfg()
+    events: EventCfgSlide = EventCfgSlide()
+    terminations: TerminationsSlideCfg = TerminationsSlideCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.episode_length_s = 8.0
+        _rb_x, _rb_y, _ = _ROBOT_BASE_POS
+        self.viewer.eye = (
+            _rb_x + 0.82,
+            _rb_y + 0.08,
+            _INSERT_RAIL_CENTER_Z_ENV + 0.28,
+        )
+        self.viewer.lookat = (
+            _CONVEYOR_CENTER_X_ENV,
+            0.28,
+            _INSERT_RAIL_CENTER_Z_ENV,
+        )
+
+
+@configclass
+class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
+    """Phase 3: insert PCB through slot mouth into magazine (SDF-shaped reward).
+
+    Resets sample slide terminal states. Arm-only relative deltas; gripper held closed.
     """
 
     observations: ObservationsCfgInsert = ObservationsCfgInsert()
@@ -1359,8 +1610,7 @@ class WidowXPcbInsertEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 6.0
-        # Playback camera: elevated side view (+X) — push along +Y readable in profile.
+        self.episode_length_s = 5.0
         _rb_x, _rb_y, _ = _ROBOT_BASE_POS
         self.viewer.eye = (
             _rb_x + 0.82,

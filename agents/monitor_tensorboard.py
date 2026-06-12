@@ -25,6 +25,7 @@ except ImportError:
 WIDOWX_RL_RUNS = (
     ("Grasp", "widowx_pcb_grasp/summaries"),
     ("Grasp gripper test", "widowx_pcb_grasp_gripper_test/summaries"),
+    ("Slide", "widowx_pcb_slide/summaries"),
     ("Insert", "widowx_pcb_insert/summaries"),
 )
 
@@ -102,7 +103,8 @@ def _find_widowx_summary_dirs(logdir: str) -> list[tuple[str, str]]:
 def _print_cwd_hint() -> None:
     if not _is_widowx_package_cwd():
         return
-    print("[HINT] Train with scripts/train_grasp.sh so logs land in ./logs/rl_games/ (this workspace).")
+    print("[HINT] Train with scripts/train_grasp.sh / train_slide.sh / train_insert.sh")
+    print("       so logs land in ./logs/rl_games/ (this workspace).")
     print("       To copy existing Isaac Lab logs: bash scripts/sync_logs_from_isaaclab.sh")
     print()
 
@@ -151,8 +153,14 @@ def main() -> int:
     print("      - KL / approx_kl")
     print()
     print("[TIP] Run folders under logs/rl_games/:")
-    print("      - widowx_pcb_grasp   (phase 1 grasp)")
-    print("      - widowx_pcb_insert  (phase 2 insert)")
+    print("      - widowx_pcb_grasp   (phase 1 — grasp)")
+    print("      - widowx_pcb_slide   (phase 2 — slide to slot mouth)")
+    print("      - widowx_pcb_insert  (phase 3 — SDF insert)")
+    print()
+    print("[TIP] Phase success rates in TensorBoard (when logged):")
+    print("      - Episode_Termination/grasp_success")
+    print("      - Episode_Termination/slide_success")
+    print("      - Episode_Termination/insert_success")
     print()
 
     cmd = [

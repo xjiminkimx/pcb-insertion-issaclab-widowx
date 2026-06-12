@@ -164,7 +164,42 @@ WidowXPcbGraspGripperTestPPOCfg = {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Insert (arm-only, 6 DoF).
+# Phase 2 — Slide (arm-only, 6 DoF): rail +Y push to slot mouth.
+# ---------------------------------------------------------------------------
+WidowXPcbSlidePPOCfg = {
+    **WidowXPcbPPOBaseCfg,
+    "params": {
+        **WidowXPcbPPOBaseCfg["params"],
+        "env": {
+            **WidowXPcbPPOBaseCfg["params"]["env"],
+            "clip_actions": 0.15,
+        },
+        "network": {
+            **WidowXPcbPPOBaseCfg["params"]["network"],
+            "space": {
+                **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
+                "continuous": {
+                    **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
+                    "sigma_init": {"name": "const_initializer", "val": -1.2},
+                },
+            },
+        },
+        "config": {
+            **WidowXPcbPPOBaseCfg["params"]["config"],
+            "name": "widowx_pcb_slide",
+            "full_experiment_name": ".",
+            "reward_shaper": {"scale_value": 0.25},
+            "use_diagnostics": False,
+            "entropy_coef": 1e-2,
+            "max_epochs": 150,
+            "horizon_length": 256,
+            "mini_epochs": 8,
+        },
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Phase 3 — Insert (arm-only, 6 DoF): SDF-shaped slot insertion from slide terminal states.
 #
 # This is a *separate* tuned config (per user request).  The insert task differs
 # from grasp in important ways, so the hyper-parameters are tuned accordingly:

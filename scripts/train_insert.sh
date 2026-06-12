@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Train Insert phase (policy chaining from Grasp).
+# Train Insert phase (policy chaining from Slide).
 # Prerequisites:
-#   1. Train Grasp phase:    bash scripts/train_grasp.sh --num_envs 2048 --headless
-#   2. Collect terminal states:
-#        python scripts/collect_grasp_states.py \
-#            --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth \
+#   1. Train Grasp → collect grasp states → Train Slide → collect slide states
+#   2. Collect slide terminal states:
+#        python scripts/collect_slide_states.py \\
+#            --checkpoint logs/rl_games/widowx_pcb_slide/nn/widowx_pcb_slide.pth \\
 #            --num_envs 256 --num_states 2000 --headless
 #   3. Run this script:      bash scripts/train_insert.sh --num_envs 2048 --headless
 #      Clear TensorBoard only: add --clean-logs  (keeps checkpoints in nn/)
@@ -59,10 +59,10 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
   exit 1
 fi
 
-GRASP_STATES="${WORKSPACE_DIR}/data/grasp_terminal_states.npz"
-if [[ ! -f "${GRASP_STATES}" ]]; then
-  echo "[ERROR] Grasp terminal-state buffer not found: ${GRASP_STATES}" >&2
-  echo "        Run: python scripts/collect_grasp_states.py --checkpoint <path>.pth" >&2
+SLIDE_STATES="${WORKSPACE_DIR}/data/slide_terminal_states.npz"
+if [[ ! -f "${SLIDE_STATES}" ]]; then
+  echo "[ERROR] Slide terminal-state buffer not found: ${SLIDE_STATES}" >&2
+  echo "        Run: python scripts/collect_slide_states.py --checkpoint <slide.pth>" >&2
   exit 1
 fi
 
@@ -77,7 +77,7 @@ else
 fi
 
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_insert/"
-echo "[INFO] Grasp states:   ${GRASP_STATES}"
+echo "[INFO] Slide states:   ${SLIDE_STATES}"
 echo "[INFO] Python:         ${PYTHON}"
 
 "${PYTHON}" "${TRAIN_PY}" \
