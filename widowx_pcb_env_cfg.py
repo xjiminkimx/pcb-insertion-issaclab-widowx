@@ -65,6 +65,7 @@ from .mdp_custom import (
     reset_from_grasp_states,
     reset_pcb_from_grasp_states,
     hold_gripper_closed,
+    RelativeJointPositionActionWithGripperHoldCfg,
     pcb_y_progress_reward,
     pcb_push_axis_progress_reward_gated,
     pcb_leading_edge_push_axis_approach_progress_gated,
@@ -603,6 +604,12 @@ def _slide_success_params(**extra) -> dict:
         "max_tilt_penalty": _SLIDE_SUCCESS_MAX_TILT_PENALTY,
         "max_long_axis_abs_z": _SLIDE_SUCCESS_MAX_LONG_AXIS_ABS_Z,
         "min_long_axis_xy_align": _SLIDE_SUCCESS_MIN_LONG_XY_ALIGN,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "max_gripper_gap_m": _GRASP_MAX_GRIPPER_GAP_M,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "min_straddle_sep_m": 0.0,
+        **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
     return base
@@ -754,15 +761,19 @@ class ActionsCfgInsert:
     pose from the buffer reset (``JointPositionAction`` + ``use_default_offset`` would always
     target ``default_joint_pos`` and fight the reset pose).
 
-    The gripper is excluded from actions; ``hold_gripper_closed`` runs at reset and each step.
+    The gripper is excluded from actions; ``RelativeJointPositionActionWithGripperHold`` re-applies
+    ``hold_gripper_closed`` after each arm command (every physics substep).
     """
 
-    arm_action = mdp.RelativeJointPositionActionCfg(
+    arm_action = RelativeJointPositionActionWithGripperHoldCfg(
         asset_name="robot",
         joint_names=["joint_[0-5]"],
         preserve_order=True,
         scale=_INSERT_ARM_ACTION_SCALE,
         use_zero_offset=True,
+        gripper_hold_asset_cfg=_ROBOT_ENT,
+        gripper_joint_name="left_carriage_joint",
+        gripper_closed_target_m=_GRIPPER_CLOSED_TARGET_M,
     )
 
 
@@ -1303,15 +1314,17 @@ def _gripper_friction_event() -> EventTermCfg:
     )
 
 
-def _hold_gripper_closed_interval() -> EventTermCfg:
+def _reassert_gripper_closed_reset() -> EventTermCfg:
+    """Re-clamp gripper PD after PCB teleport; match sim pinch and refresh cached hold target."""
     return EventTermCfg(
         func=hold_gripper_closed,
-        mode="interval",
-        interval_range_s=(0.008, 0.008),
+        mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
             "joint_name": "left_carriage_joint",
             "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+            "match_sim_state": True,
+            "store_target": True,
         },
     )
 
@@ -1347,16 +1360,7 @@ class EventCfgSlide:
             "snap_z_max_delta_m": _SNAP_Z_TO_RAIL_MAX_DELTA_M,
         },
     )
-    reassert_gripper_closed = EventTermCfg(
-        func=hold_gripper_closed,
-        mode="reset",
-        params={
-            "asset_cfg": _ROBOT_ENT,
-            "joint_name": "left_carriage_joint",
-            "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
-        },
-    )
-    hold_gripper_closed = _hold_gripper_closed_interval()
+    reassert_gripper_closed = _reassert_gripper_closed_reset()
 
 
 @configclass
@@ -1390,16 +1394,7 @@ class EventCfgInsert:
             "snap_z_max_delta_m": _SNAP_Z_TO_RAIL_MAX_DELTA_M,
         },
     )
-    reassert_gripper_closed = EventTermCfg(
-        func=hold_gripper_closed,
-        mode="reset",
-        params={
-            "asset_cfg": _ROBOT_ENT,
-            "joint_name": "left_carriage_joint",
-            "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
-        },
-    )
-    hold_gripper_closed = _hold_gripper_closed_interval()
+    reassert_gripper_closed = _reassert_gripper_closed_reset()
 
 
 @configclass

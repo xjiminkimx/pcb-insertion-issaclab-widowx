@@ -185,7 +185,7 @@ Also: straddle hold, seated leading-edge proximity, lane / lateral / Z-lift pena
 | Phase | Termination | Criterion |
 |-------|-------------|-----------|
 | Grasp | `grasp_success` | Edge-centre pinch + tight gripper |
-| Slide | `slide_success` | Mouth reached + flat on XY (`tilt ≤ 0.08`, long-axis \|Z\| ≤ 0.15, long-axis ∥ +Y ≥ 0.85) |
+| Slide | `slide_success` | Mouth + flat/align + **gripper closed** + straddle |
 | Insert | `insert_success` | PCB centre Y at magazine centre |
 
 ### Tips

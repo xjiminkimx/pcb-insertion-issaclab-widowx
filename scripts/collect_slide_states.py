@@ -140,6 +140,24 @@ def collect(args):
             jp = prev_joint_pos[env_ids].cpu().numpy().astype(np.float32)
             pp = (prev_pcb_pos_w[env_ids] - base_env.scene.env_origins[env_ids]).cpu().numpy().astype(np.float32)
             pq = prev_pcb_quat_w[env_ids].cpu().numpy().astype(np.float32)
+
+            # Defense in depth: drop rows with an open gripper (insert buffer must start pinched).
+            lc_idx = (
+                list(joint_names).index("left_carriage_joint")
+                if "left_carriage_joint" in joint_names
+                else -1
+            )
+            if lc_idx >= 0:
+                keep = jp[:, lc_idx] < float(cfg._GRASP_MAX_GRIPPER_GAP_M)
+                dropped = int(jp.shape[0] - int(keep.sum()))
+                if dropped:
+                    print(f"  [filter] dropped {dropped} slide_success rows with open gripper")
+                if not keep.any():
+                    continue
+                jp = jp[keep]
+                pp = pp[keep]
+                pq = pq[keep]
+
             joint_pos_list.append(jp)
             pcb_pos_list.append(pp)
             pcb_quat_list.append(pq)
@@ -171,6 +189,15 @@ def collect(args):
     joint_pos = np.concatenate(joint_pos_list, axis=0)[: args.num_states]
     pcb_pos = np.concatenate(pcb_pos_list, axis=0)[: args.num_states]
     pcb_quat = np.concatenate(pcb_quat_list, axis=0)[: args.num_states]
+
+    lc_idx = list(joint_names).index("left_carriage_joint") if "left_carriage_joint" in joint_names else -1
+    if lc_idx >= 0:
+        gap = joint_pos[:, lc_idx] * 2.0
+        print(
+            f"[INFO] Gripper gap stats (m)  "
+            f"mean={gap.mean():.4f}  min={gap.min():.4f}  max={gap.max():.4f}  "
+            f"p95={np.percentile(gap, 95):.4f}"
+        )
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez_compressed(

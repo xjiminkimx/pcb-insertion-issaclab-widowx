@@ -2090,8 +2090,15 @@ def slide_success(
     max_tilt_penalty: float = 0.08,
     max_long_axis_abs_z: float = 0.15,
     min_long_axis_xy_align: float = 0.85,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    max_gripper_gap_m: float = 0.001,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    min_straddle_sep_m: float = 0.0,
 ) -> torch.Tensor:
-    """Slide-phase success: mouth reached + PCB parallel to the world XY plane.
+    """Slide-phase success: mouth reached + PCB parallel to the world XY plane + grasp hold.
 
     Combines:
 
@@ -2102,6 +2109,9 @@ def slide_success(
       (long edge lies in the XY plane, not wedged edge-on).
     * **Long-axis XY alignment** — body +X projected into XY aligns with ``axis_world``
       (default +Y) by at least ``min_long_axis_xy_align`` (default 0.85).
+    * **Gripper closed** — ``left_carriage_joint`` < ``max_gripper_gap_m`` when
+      ``gripper_joint_cfg`` is set.
+    * **Straddle** — jaws on opposite faces of the PCB thickness axis when finger cfgs are set.
     """
     reached = slide_mouth_reached(
         env, pcb_cfg, half_length_m, slot_mouth_y_env, margin_m=margin_m,
@@ -2123,6 +2133,22 @@ def slide_success(
     long_align_ok = long_align >= float(min_long_axis_xy_align)
 
     success = reached & tilt_ok & long_horizontal_ok & long_align_ok
+
+    if gripper_joint_cfg is not None:
+        robot = env.scene[gripper_joint_cfg.name]
+        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+        gripper_ok = gq < float(max_gripper_gap_m)
+        success = success & gripper_ok
+
+    if left_finger_cfg is not None and right_finger_cfg is not None:
+        w_left, w_right = _finger_thickness_offsets(
+            env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        )
+        straddle_ok = (w_left * w_right < 0.0) & (
+            torch.abs(w_left - w_right) >= float(min_straddle_sep_m)
+        )
+        success = success & straddle_ok
+
     if min_episode_steps > 0:
         ready = env.episode_length_buf > min_episode_steps
         success = success & ready
@@ -2141,6 +2167,13 @@ def slide_success_bonus_reward(
     max_tilt_penalty: float = 0.08,
     max_long_axis_abs_z: float = 0.15,
     min_long_axis_xy_align: float = 0.85,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    max_gripper_gap_m: float = 0.001,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    min_straddle_sep_m: float = 0.0,
 ) -> torch.Tensor:
     """Bonus (1.0) on steps where slide success criteria are met; mirrors :func:`slide_success`."""
     achieved = slide_success(
@@ -2155,6 +2188,13 @@ def slide_success_bonus_reward(
         max_tilt_penalty=max_tilt_penalty,
         max_long_axis_abs_z=max_long_axis_abs_z,
         min_long_axis_xy_align=min_long_axis_xy_align,
+        gripper_joint_cfg=gripper_joint_cfg,
+        max_gripper_gap_m=max_gripper_gap_m,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        min_straddle_sep_m=min_straddle_sep_m,
     )
     return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 
@@ -3034,8 +3074,9 @@ def hold_gripper_closed(
 
     At reset, pass ``match_sim_state=True`` and ``store_target=True`` so the PD target matches
     the buffer pinch pose but is tightened to ``closed_target_m`` when the buffer row is looser.
-    Per-env targets are cached on ``env._gripper_hold_target_m`` for interval re-application
-    during the episode (contact forces can otherwise drift the implicit target open).
+    Per-env targets are cached on ``env._gripper_hold_target_m`` for re-application during
+    the episode (``RelativeJointPositionActionWithGripperHold`` calls this after each arm
+    command; contact forces can otherwise drift the implicit target open).
     """
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
@@ -3079,6 +3120,37 @@ def hold_gripper_closed(
     zeros = torch.zeros_like(target)
     robot.set_joint_position_target(target, joint_ids=[jid], env_ids=env_ids)
     robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=env_ids)
+
+
+class RelativeJointPositionActionWithGripperHold(joint_actions.RelativeJointPositionAction):
+    """Relative arm deltas, then re-command the gripper closed after each action write.
+
+    Isaac Lab applies interval events after the physics substep loop; arm ``apply_action``
+    runs inside that loop and can leave the carriage joint target stale/open.  Re-applying
+    ``hold_gripper_closed`` here keeps the PD target closed on every physics substep.
+    """
+
+    cfg: "RelativeJointPositionActionWithGripperHoldCfg"
+
+    def apply_actions(self) -> None:
+        super().apply_actions()
+        hold_gripper_closed(
+            self._env,
+            None,
+            self.cfg.gripper_hold_asset_cfg,
+            joint_name=self.cfg.gripper_joint_name,
+            closed_target_m=self.cfg.gripper_closed_target_m,
+        )
+
+
+@configclass
+class RelativeJointPositionActionWithGripperHoldCfg(RelativeJointPositionActionCfg):
+    """Arm-only relative deltas with post-action gripper hold (Slide / Insert phases)."""
+
+    class_type: type[ActionTerm] = RelativeJointPositionActionWithGripperHold
+    gripper_hold_asset_cfg: SceneEntityCfg = MISSING
+    gripper_joint_name: str = "left_carriage_joint"
+    gripper_closed_target_m: float = 0.00025
 
 
 def _sample_grasp_buffer_indices(
