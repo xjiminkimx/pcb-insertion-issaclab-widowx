@@ -75,9 +75,9 @@ WidowXPcbPPOBaseCfg = {
             "lr_schedule": "adaptive",
             "kl_threshold": 0.012,
             "score_to_win": 20000,
-            "max_epochs": 500,
-            "save_best_after": 50,
-            "save_frequency": 25,
+            "max_epochs": 200,
+            "save_best_after": 30,
+            "save_frequency": 15,
             "print_stats": True,
             
             # 미니배치 및 최적화 설정
@@ -127,7 +127,8 @@ WidowXPcbGraspPPOCfg = {
             "name": "widowx_pcb_grasp",
             "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
-            "entropy_coef": 8e-3,
+            "entropy_coef": 2e-2,
+            "max_epochs": 150,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
@@ -157,6 +158,7 @@ WidowXPcbGraspGripperTestPPOCfg = {
             "name": "widowx_pcb_grasp_gripper_test",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
+            "max_epochs": 150,
             "reward_shaper": {"scale_value": 0.2},
             "horizon_length": 64,
         },
