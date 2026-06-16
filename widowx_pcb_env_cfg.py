@@ -49,6 +49,8 @@ from .mdp_custom import (
     pcb_between_gripper_fingers_hold_reward,
     gripper_closing_reward,
     premature_close_penalty,
+    pcb_finger_object_proximity,
+    gripper_jaw_rail_vertical_shaping,
     grasp_edge_center_achieved,
     # --- resets & terminations ---
     reset_pcb_on_guide_rails_randomized,
@@ -303,6 +305,9 @@ _SLIDE_MOUTH_MARGIN_M = 0.008
 _SLIDE_SUCCESS_MAX_TILT_PENALTY = 0.08       # flatness |dot(z_body, up)| ≥ 0.92
 _SLIDE_SUCCESS_MAX_LONG_AXIS_ABS_Z = 0.15    # long axis mostly in XY (fail term uses 0.25)
 _SLIDE_SUCCESS_MIN_LONG_XY_ALIGN = 0.85      # long axis ∥ +Y in the horizontal plane
+# Grasp failure terminations — slightly looser than the old 0.10 / 0.40 while ``pcb_tilt_penalty`` shapes approach.
+_GRASP_MAX_TILT_PENALTY = 0.15
+_GRASP_MAX_LONG_AXIS_ABS_Z = 0.50
 
 # Shared SceneEntityCfg snippets (reward / event params).
 _PCB_ENT = SceneEntityCfg("pcb")
@@ -948,20 +953,8 @@ class RewardsGraspPhaseCfg():
     * ``grasp_success_bonus`` (weight 15.0): sparse bonus for a held valid edge-centre pinch.
     """
 
-    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.00035)
+    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.001)
 
-    # Dense approach gradient — ungated so learning starts immediately from the home pose.
-    # finger_proximity = RewardTermCfg(
-    #     func=pcb_finger_object_proximity,
-    #     params=_grasp_finger_proximity_params(),
-    #     weight=2.0,
-    # )
-    # # Orientation — jaw rail ∥ world +Z.
-    # jaw_rail_vertical = RewardTermCfg(
-    #     func=gripper_jaw_rail_vertical_shaping,
-    #     params=_grasp_orientation_base_params(),
-    #     weight=2.5,
-    # )
     # Straddle quality (position only, no closedness): straddle × span × approach × width-centering.
     pcb_between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers,
@@ -974,11 +967,11 @@ class RewardsGraspPhaseCfg():
         params=_grasp_between_fingers_hold_params(),
         weight=40.0,
     )
-    # Closing — gated on straddle.  Separate from position so the closing gradient is strong.
+    # Closing — trailing-edge gated; moderate weight to avoid knocking the floating PCB on pinch.
     gripper_closing = RewardTermCfg(
         func=gripper_closing_reward,
         params=_grasp_closing_params(),
-        weight=15.0,
+        weight=10.0,
     )
     # Penalty for closing before straddling — fills the zero-gradient gap during approach.
     # Value = closedness when NOT straddled; paired with negative weight → stay open.
@@ -991,7 +984,7 @@ class RewardsGraspPhaseCfg():
     grasp_success_bonus = RewardTermCfg(
         func=grasp_success_bonus_reward,
         params=_grasp_termination_params(),
-        weight=200.0,
+        weight=400.0,
     )
     # Penalize sliding the PCB toward the slot (+Y) during grasp — keep the board at the trailing edge.
     pcb_push_displacement = RewardTermCfg(
@@ -1002,6 +995,12 @@ class RewardsGraspPhaseCfg():
             "max_displacement_m": _PCB_MAX_PUSH_DISPLACEMENT_M,
         },
         weight=-12.0,
+    )
+    # Continuous flatness shaping — discourages knock-over before hard tilt terminations fire.
+    pcb_tilt_penalty = RewardTermCfg(
+        func=pcb_thickness_axis_tilt_penalty,
+        params={"pcb_cfg": _PCB_ENT},
+        weight=-20.0,
     )
 
 
@@ -1367,11 +1366,11 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
 
     pcb_tilt_excessive = TerminationTermCfg(
         func=pcb_tilt_beyond_limit,
-        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": 0.10},
+        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": _GRASP_MAX_TILT_PENALTY},
     )
     pcb_long_axis_not_horizontal = TerminationTermCfg(
         func=pcb_long_axis_vertical_component_exceeds,
-        params={"pcb_cfg": _PCB_ENT, "max_abs_z": 0.40},
+        params={"pcb_cfg": _PCB_ENT, "max_abs_z": _GRASP_MAX_LONG_AXIS_ABS_Z},
     )
     pcb_fallen_below_rail = TerminationTermCfg(
         func=pcb_root_height_below_env_minimum,

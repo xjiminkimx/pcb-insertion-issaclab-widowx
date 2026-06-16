@@ -75,7 +75,7 @@ WidowXPcbPPOBaseCfg = {
             "lr_schedule": "adaptive",
             "kl_threshold": 0.012,
             "score_to_win": 20000,
-            "max_epochs": 200,
+            "max_epochs": 300,
             "save_best_after": 30,
             "save_frequency": 15,
             "print_stats": True,
@@ -109,8 +109,8 @@ WidowXPcbGraspPPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            # Slightly larger per-step joint deltas help sustained descent at the edge.
-            "clip_actions": 0.45,
+            # Softer per-step deltas reduce PCB knock-over late in training.
+            "clip_actions": 0.35,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -128,7 +128,7 @@ WidowXPcbGraspPPOCfg = {
             "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
             "entropy_coef": 2e-2,
-            "max_epochs": 150,
+            "max_epochs": 250,
             "reward_shaper": {"scale_value": 1.0},
         },
     },

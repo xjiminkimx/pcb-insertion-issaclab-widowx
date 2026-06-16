@@ -27,6 +27,3 @@ wandb/
 # OS
 .DS_Store
 Thumbs.db
-
-# Vendored full clone with its own Git history (add as submodule if you need it tracked here)
-trossen_ai_isaac/
