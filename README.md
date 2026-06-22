@@ -141,7 +141,7 @@ python scripts/collect_grasp_states.py \
 bash scripts/train_slide.sh --num_envs 2048 --headless
 ```
 
-Slide rewards (`RewardsSlidePhaseCfg`): straddle hold, +Y step/state progress toward **`_MAG_Y_NEAR_FACE_ENV`** (slot mouth plane), rail-parallel push, lane penalties. **No `sdf_insert`.** Episode ends on **`slide_success`** when the leading edge reaches the mouth.
+Slide rewards (`RewardsSlidePhaseCfg`): straddle shaping, `jaw_rail_vertical` + `wrist_push_alignment`, `gripper_closing`, **one-shot** travel milestones (25/50/75% toward mouth), `slide_success_bonus`. Obs include `pinch_orientation_cos` (jaw rail ∥ +Z, wrist ∥ +Y). Episode ends on **`slide_success`** when leading-edge Y ≥ 0.210 m, **gripper closed**, and PCB speed below thresholds for **4 consecutive steps** (~128 ms); milestones target `_SLIDE_MOUTH_LEAD_Y_ENV` (= `_MAG_Y_NEAR_FACE_ENV` − 8 mm).
 
 **Step 4 — Collect slide terminal states** (`slide_success` only)
 
@@ -185,14 +185,14 @@ Also: straddle hold, seated leading-edge proximity, lane / lateral / Z-lift pena
 | Phase | Termination | Criterion |
 |-------|-------------|-----------|
 | Grasp | `grasp_success` | Edge-centre pinch + tight gripper |
-| Slide | `slide_success` | Mouth + flat/align + **gripper closed** + straddle |
+| Slide | `slide_success` | Leading edge Y ≥ threshold + **gripper closed** + **low PCB speed** (4 steps); `pcb_detached` guards straddle |
 | Insert | `insert_success` | PCB centre Y at magazine centre |
 
 ### Tips
 
 - Collect **more states than parallel envs** (e.g. 2000+ for 2048 envs).
 - Re-collect buffers when upstream checkpoints or success criteria change.
-- Tune `_MAG_Y_NEAR_FACE_ENV`, `_SLOT_CENTER_XYZ_ENV` in Isaac Sim after moving the fixture.
+- Tune `_MAG_Y_NEAR_FACE_ENV`, `_SLOT_CENTER_XYZ_ENV` (lane X + magazine Y) in Isaac Sim after moving the fixture.
 
 ---
 
@@ -409,7 +409,7 @@ Isaac Lab manager env extras (when logged per episode):
 | Phase | Success termination | Reward terms worth watching |
 |-------|---------------------|-----------------------------|
 | Grasp | `grasp_success` | `grasp_success_bonus`, `pcb_between_fingers`, `gripper_closing`, `premature_close` |
-| Slide | `slide_success` | `slide_success_bonus`, `push_axis_step_progress`, `push_axis_state`, `mouth_approach_proximity`, `rail_parallel_push_progress` (no `sdf_insert`) |
+| Slide | `slide_success` | `slide_success_bonus`, `slide_travel_milestone`, `jaw_rail_vertical`, `wrist_push_alignment`, `gripper_closing`, `pcb_between_fingers` (no `sdf_insert`) |
 | Insert | `insert_success` | `sdf_insert`, `mouth_approach_proximity`, lane penalties (`pcb_x_lane_escape`, `pcb_lateral_velocity`) |
 
 If mean reward plateaus, compare per-term `Episode_Reward/*` curves against `action_rate_penalty` — a flat success termination while penalties dominate usually means the policy is idling or fighting contact at the slot mouth.

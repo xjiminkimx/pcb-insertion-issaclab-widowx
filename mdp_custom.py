@@ -284,6 +284,32 @@ def gripper_wrist_carriage_align_axis(
     return torch.abs(torch.sum(u_wc * axis, dim=-1))
 
 
+def gripper_wrist_carriage_yaw_align_axis(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    tip_offset_m: float = 0.0,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """``|dot(u_wc_xy, push_xy)|`` in ``[0, 1]`` — wrist→carriage heading in XY only (yaw); Z pitch free."""
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return torch.ones(env.num_envs, device=env.device, dtype=torch.float32)
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    mid = 0.5 * (left + right)
+    d_xy = mid[:, :2] - wrist[:, :2]
+    n_xy = torch.norm(d_xy, dim=-1)
+    axis = torch.tensor(push_axis_world[:2], device=env.device, dtype=d_xy.dtype)
+    axis = axis / torch.norm(axis).clamp(min=1e-9)
+    u_xy = d_xy / n_xy.unsqueeze(-1).clamp(min=1e-6)
+    align = torch.abs(torch.sum(u_xy * axis.unsqueeze(0), dim=-1))
+    return torch.where(n_xy > 1e-4, align, torch.zeros_like(align))
+
+
 def _gripper_belt_corridor_x_bounds_env(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
@@ -1549,8 +1575,13 @@ def gripper_wrist_carriage_push_axis_shaping(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    yaw_only: bool = True,
 ) -> torch.Tensor:
-    """Shaping ``[0, 1]``: reward wrist (``link_6``) → carriage mid parallel to push axis (+Y)."""
+    """Shaping ``[0, 1]``: wrist (``link_6``) → carriage mid aligned with push axis in XY (yaw).
+
+    With ``yaw_only=True`` (default), only the horizontal (+Y) heading is rewarded; wrist pitch
+    (world Z component of wrist→jaw) is unconstrained.
+    """
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
@@ -1568,15 +1599,25 @@ def gripper_wrist_carriage_push_axis_shaping(
         left,
         right,
     )
-    wc_y = gripper_wrist_carriage_align_axis(
-        env,
-        left_finger_cfg,
-        right_finger_cfg,
-        wrist_body_cfg,
-        tip_offset_m,
-        push_axis_world,
-    )
-    return wc_y * sep_ok * near
+    if yaw_only:
+        wc_align = gripper_wrist_carriage_yaw_align_axis(
+            env,
+            left_finger_cfg,
+            right_finger_cfg,
+            wrist_body_cfg,
+            tip_offset_m,
+            push_axis_world,
+        )
+    else:
+        wc_align = gripper_wrist_carriage_align_axis(
+            env,
+            left_finger_cfg,
+            right_finger_cfg,
+            wrist_body_cfg,
+            tip_offset_m,
+            push_axis_world,
+        )
+    return wc_align * sep_ok * near
 
 
 def gripper_jaw_rail_horizontal_penalty(
@@ -1666,21 +1707,32 @@ def gripper_pinch_orientation_cos_obs(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    yaw_only_wrist_align: bool = False,
 ) -> torch.Tensor:
-    """Two scalars in ``[0, 1]``: jaw rail ∥ +Z, wrist→carriage ∥ push (+Y); sep-scaled."""
+    """Two scalars in ``[0, 1]``: jaw rail ∥ +Z; wrist→carriage push alignment; sep-scaled."""
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
     _, n = _gripper_rail_unit_lr(left, right)
     rail_z = gripper_rail_align_world_z(env, left, right)
-    wc_y = gripper_wrist_carriage_align_axis(
-        env,
-        left_finger_cfg,
-        right_finger_cfg,
-        wrist_body_cfg,
-        tip_offset_m,
-        push_axis_world,
-    )
+    if yaw_only_wrist_align:
+        wc_y = gripper_wrist_carriage_yaw_align_axis(
+            env,
+            left_finger_cfg,
+            right_finger_cfg,
+            wrist_body_cfg,
+            tip_offset_m,
+            push_axis_world,
+        )
+    else:
+        wc_y = gripper_wrist_carriage_align_axis(
+            env,
+            left_finger_cfg,
+            right_finger_cfg,
+            wrist_body_cfg,
+            tip_offset_m,
+            push_axis_world,
+        )
     sep_soft = torch.clamp(n / (float(min_finger_sep_m) + 1e-9), 0.0, 1.0)
     return torch.stack([rail_z * sep_soft, wc_y * sep_soft], dim=-1)
 
@@ -2116,136 +2168,327 @@ def pcb_height_below_reference(
     return torch.clamp(min_height - h, min=0.0)
 
 
+def slide_mouth_lead_y_reached(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    min_lead_y_env: float,
+) -> torch.Tensor:
+    """True when the PCB leading short-edge centre Y ≥ ``min_lead_y_env`` (env-local)."""
+    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
+    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
+    return lead_y >= float(min_lead_y_env)
+
+
+def slide_mouth_leading_edge_near_xy(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    slot_mouth_x_env: float,
+    slot_mouth_y_env: float,
+    tolerance_m: float = 0.010,
+) -> torch.Tensor:
+    """True when the PCB leading short-edge centre is within ``tolerance_m`` of slot mouth (X, Y)."""
+    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
+    lead_env = lead_w - env.scene.env_origins[:, :3]
+    dx = torch.abs(lead_env[:, 0] - float(slot_mouth_x_env))
+    dy = torch.abs(lead_env[:, 1] - float(slot_mouth_y_env))
+    tol = float(tolerance_m)
+    return (dx <= tol) & (dy <= tol)
+
+
 def slide_mouth_reached(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
     slot_mouth_y_env: float,
     margin_m: float = 0.008,
+    slot_mouth_x_env: float | None = None,
+    tolerance_m: float | None = None,
 ) -> torch.Tensor:
-    """True when the PCB **leading** short-edge centre reaches the slot mouth plane (+Y)."""
+    """Legacy Y-only mouth check; prefer :func:`slide_mouth_leading_edge_near_xy`."""
+    if slot_mouth_x_env is not None and tolerance_m is not None:
+        return slide_mouth_leading_edge_near_xy(
+            env,
+            pcb_cfg,
+            half_length_m,
+            slot_mouth_x_env,
+            slot_mouth_y_env,
+            tolerance_m=tolerance_m,
+        )
     lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
     lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
     return lead_y >= float(slot_mouth_y_env) - float(margin_m)
+
+
+def _slide_success_sustain_count_tensor(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """Consecutive control steps satisfying mouth + gripper + low-speed criteria."""
+    if not hasattr(env, "_slide_success_sustain_count"):
+        env._slide_success_sustain_count = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+    count = env._slide_success_sustain_count
+    if count.shape[0] != env.num_envs or count.device != env.device:
+        count = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
+        env._slide_success_sustain_count = count
+    return count
+
+
+def _advance_slide_success_sustain(
+    env: ManagerBasedRLEnv,
+    frame: torch.Tensor,
+    min_sustained_steps: int,
+) -> torch.Tensor:
+    """Update sustain counter once per control step; return success mask."""
+    count = _slide_success_sustain_count_tensor(env)
+    first_step = env.episode_length_buf == 1
+
+    if not hasattr(env, "_slide_success_sustain_step_buf"):
+        env._slide_success_sustain_step_buf = torch.full(
+            (env.num_envs,), -1, device=env.device, dtype=torch.long
+        )
+    step_buf = env._slide_success_sustain_step_buf
+    if step_buf.shape[0] != env.num_envs or step_buf.device != env.device:
+        step_buf = torch.full((env.num_envs,), -1, device=env.device, dtype=torch.long)
+        env._slide_success_sustain_step_buf = step_buf
+
+    ep_step = env.episode_length_buf
+    already_counted = step_buf == ep_step
+    new_count = torch.where(first_step | (~frame), torch.zeros_like(count), count + 1)
+    count = torch.where(already_counted, count, new_count)
+    env._slide_success_sustain_count = count
+    env._slide_success_sustain_step_buf = torch.where(already_counted, step_buf, ep_step)
+
+    sustained = int(min_sustained_steps)
+    if sustained <= 1:
+        return frame
+    return count >= sustained
+
+
+def _slide_success_pose_ok(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    max_center_x_drift_m: float,
+    belt_center_z_env: float,
+    max_center_z_drift_m: float,
+) -> torch.Tensor:
+    """True when PCB centre X stays near spawn and Z is near belt-top centre height."""
+    pcb = env.scene[pcb_cfg.name]
+    center_env = pcb.data.root_pos_w[:, :3] - env.scene.env_origins[:, :3]
+
+    if hasattr(env, "_insert_start_center_env"):
+        delta_x = center_env[:, 0] - env._insert_start_center_env[:, 0]
+        x_ok = torch.abs(delta_x) <= float(max_center_x_drift_m)
+    else:
+        x_ok = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+
+    ref_z = float(belt_center_z_env)
+    z_ok = torch.abs(center_env[:, 2] - ref_z) <= float(max_center_z_drift_m)
+    return x_ok & z_ok
+
+
+def _slide_success_frame_ready(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    min_lead_y_env: float,
+    gripper_joint_cfg: SceneEntityCfg | None,
+    max_gripper_gap_m: float,
+    require_gripper_closed: bool,
+    max_lin_speed_m_s: float,
+    max_push_axis_speed_m_s: float,
+    max_off_axis_speed_m_s: float,
+    push_axis_world: tuple[float, float, float],
+    max_center_x_drift_m: float = 0.003,
+    belt_center_z_env: float = 0.10175,
+    max_center_z_drift_m: float = 0.005,
+) -> torch.Tensor:
+    """Per-step mask: mouth Y, lane X + belt Z pose, gripper closed, and low PCB speed."""
+    at_mouth = slide_mouth_lead_y_reached(env, pcb_cfg, half_length_m, min_lead_y_env)
+    pose_ok = _slide_success_pose_ok(
+        env, pcb_cfg, max_center_x_drift_m, belt_center_z_env, max_center_z_drift_m
+    )
+
+    gripper_ok = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+    if require_gripper_closed and gripper_joint_cfg is not None:
+        robot = env.scene[gripper_joint_cfg.name]
+        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+        gripper_ok = gq < float(max_gripper_gap_m)
+
+    pcb = env.scene[pcb_cfg.name]
+    v = pcb.data.root_lin_vel_w
+    lin_speed = torch.norm(v, dim=-1)
+    a = torch.tensor(push_axis_world, device=env.device, dtype=v.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    v_push = torch.sum(v * a.unsqueeze(0), dim=-1)
+    off_axis = _pcb_off_axis_speed(env, pcb_cfg)
+
+    speed_ok = lin_speed <= float(max_lin_speed_m_s)
+    speed_ok = speed_ok & (torch.abs(v_push) <= float(max_push_axis_speed_m_s))
+    speed_ok = speed_ok & (off_axis <= float(max_off_axis_speed_m_s))
+
+    return at_mouth & pose_ok & gripper_ok & speed_ok
 
 
 def slide_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    slot_mouth_y_env: float,
-    margin_m: float = 0.008,
+    min_lead_y_env: float = 0.210,
     min_episode_steps: int = 2,
-    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    max_tilt_penalty: float = 0.08,
-    max_long_axis_abs_z: float = 0.15,
-    min_long_axis_xy_align: float = 0.85,
     gripper_joint_cfg: SceneEntityCfg | None = None,
     max_gripper_gap_m: float = 0.001,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_straddle_sep_m: float = 0.0,
+    require_gripper_closed: bool = True,
+    max_lin_speed_m_s: float = 0.018,
+    max_push_axis_speed_m_s: float = 0.012,
+    max_off_axis_speed_m_s: float = 0.015,
+    min_sustained_steps: int = 4,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_center_x_drift_m: float = 0.003,
+    belt_center_z_env: float = 0.10175,
+    max_center_z_drift_m: float = 0.005,
 ) -> torch.Tensor:
-    """Slide-phase success: mouth reached + PCB parallel to the world XY plane + grasp hold.
+    """Slide success: stable mouth arrival — Y, lane X, belt Z, closed gripper, low speed.
 
-    Combines:
-
-    * **Mouth** — leading short-edge centre Y ≥ slot mouth − margin.
-    * **Thickness flatness** — ``pcb_thickness_axis_tilt_penalty`` ≤ ``max_tilt_penalty``
-      (default 0.08 ⇒ |dot(z_body, up)| ≥ 0.92, matches rail-parallel reward flatness).
-    * **Long-axis horizontal** — |world-Z component of body +X| ≤ ``max_long_axis_abs_z``
-      (long edge lies in the XY plane, not wedged edge-on).
-    * **Long-axis XY alignment** — body +X projected into XY aligns with ``axis_world``
-      (default +Y) by at least ``min_long_axis_xy_align`` (default 0.85).
-    * **Gripper closed** — ``left_carriage_joint`` < ``max_gripper_gap_m`` when
-      ``gripper_joint_cfg`` is set.
-    * **Straddle** — jaws on opposite faces of the PCB thickness axis when finger cfgs are set.
+    All criteria must hold for ``min_sustained_steps`` consecutive control steps so a fast
+    impact-and-bounce does not count; the board must be settled at the mouth with the gripper
+  still closed. Straddle quality is guarded by ``pcb_detached``.
     """
-    reached = slide_mouth_reached(
-        env, pcb_cfg, half_length_m, slot_mouth_y_env, margin_m=margin_m,
+    frame = _slide_success_frame_ready(
+        env,
+        pcb_cfg,
+        half_length_m,
+        min_lead_y_env,
+        gripper_joint_cfg,
+        max_gripper_gap_m,
+        require_gripper_closed,
+        max_lin_speed_m_s,
+        max_push_axis_speed_m_s,
+        max_off_axis_speed_m_s,
+        push_axis_world,
+        max_center_x_drift_m,
+        belt_center_z_env,
+        max_center_z_drift_m,
     )
-    tilt_ok = pcb_thickness_axis_tilt_penalty(env, pcb_cfg, world_up) <= float(max_tilt_penalty)
-
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    long_horizontal_ok = torch.abs(x_w[:, 2]) <= float(max_long_axis_abs_z)
-
-    x_xy = x_w.clone()
-    x_xy[:, 2] = 0.0
-    x_xy = x_xy / torch.norm(x_xy, dim=-1, keepdim=True).clamp_min(1e-6)
-    a = torch.tensor(axis_world, device=x_w.device, dtype=x_w.dtype)
-    a_xy = a.clone()
-    a_xy[2] = 0.0
-    a_xy = a_xy / torch.norm(a_xy).clamp_min(1e-6)
-    a_xy = a_xy.unsqueeze(0).expand_as(x_xy)
-    long_align = torch.abs(torch.sum(x_xy * a_xy, dim=-1))
-    long_align_ok = long_align >= float(min_long_axis_xy_align)
-
-    success = reached & tilt_ok & long_horizontal_ok & long_align_ok
-
-    if gripper_joint_cfg is not None:
-        robot = env.scene[gripper_joint_cfg.name]
-        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-        gripper_ok = gq < float(max_gripper_gap_m)
-        success = success & gripper_ok
-
-    if left_finger_cfg is not None and right_finger_cfg is not None:
-        w_left, w_right = _finger_thickness_offsets(
-            env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-        )
-        straddle_ok = (w_left * w_right < 0.0) & (
-            torch.abs(w_left - w_right) >= float(min_straddle_sep_m)
-        )
-        success = success & straddle_ok
 
     if min_episode_steps > 0:
         ready = env.episode_length_buf > min_episode_steps
-        success = success & ready
-    return success
+        frame = frame & ready
+
+    return _advance_slide_success_sustain(env, frame, min_sustained_steps)
+
+
+def _slide_lead_pose_ok(
+    env: ManagerBasedRLEnv,
+    lead_env: torch.Tensor,
+    max_lead_x_drift_m: float,
+    belt_center_z_env: float,
+    max_lead_z_drift_m: float,
+) -> torch.Tensor:
+    """True when leading-edge X stays near spawn and Z is near belt-top centre height."""
+    if hasattr(env, "_insert_start_lead_env"):
+        delta_x = lead_env[:, 0] - env._insert_start_lead_env[:, 0]
+        x_ok = torch.abs(delta_x) <= float(max_lead_x_drift_m)
+    else:
+        x_ok = torch.ones(lead_env.shape[0], device=lead_env.device, dtype=torch.bool)
+    ref_z = float(belt_center_z_env)
+    z_ok = torch.abs(lead_env[:, 2] - ref_z) <= float(max_lead_z_drift_m)
+    return x_ok & z_ok
+
+
+def slide_leading_edge_travel_milestone_bonus(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_y_env: float,
+    milestone_fractions: tuple[float, ...] = (0.25, 0.5, 0.75),
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    state_attr: str = "_slide_travel_milestone_paid",
+    max_lead_x_drift_m: float = 0.003,
+    belt_center_z_env: float = 0.10175,
+    max_lead_z_drift_m: float = 0.005,
+) -> torch.Tensor:
+    """One-shot sparse bonus each time leading-edge +Y travel crosses a milestone fraction.
+
+    Progress is measured from ``env._insert_start_lead_proj`` (set at slide reset) to
+    ``target_lead_y_env``.  Milestone credit requires leading-edge lane X and belt Z pose
+    (flat push on the conveyor).  Returns the count of newly crossed tiers this step.
+    """
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    pose_ok = _slide_lead_pose_ok(
+        env, lead_env, max_lead_x_drift_m, belt_center_z_env, max_lead_z_drift_m
+    )
+    a = torch.tensor(axis_world, device=env.device, dtype=lead_env.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+
+    if hasattr(env, "_insert_start_lead_proj"):
+        start_proj = env._insert_start_lead_proj
+    else:
+        start_proj = proj.detach()
+
+    total = float(target_lead_y_env) - start_proj
+    valid = total > 1e-6
+    total_safe = torch.where(valid, total, torch.ones_like(total))
+    frac = torch.where(valid, (proj - start_proj) / total_safe, torch.zeros_like(proj))
+    frac = frac.clamp(0.0, 1.0)
+
+    tiers = tuple(milestone_fractions)
+    n_tiers = len(tiers)
+    if not hasattr(env, state_attr):
+        setattr(
+            env,
+            state_attr,
+            torch.zeros(env.num_envs, n_tiers, device=env.device, dtype=torch.bool),
+        )
+    paid: torch.Tensor = getattr(env, state_attr)
+    if paid.shape[0] != env.num_envs or paid.shape[1] != n_tiers:
+        paid = torch.zeros(env.num_envs, n_tiers, device=env.device, dtype=torch.bool)
+        setattr(env, state_attr, paid)
+
+    bonus = torch.zeros(env.num_envs, device=env.device, dtype=frac.dtype)
+    for i, mf in enumerate(tiers):
+        crossed = frac >= float(mf)
+        newly = crossed & (~paid[:, i]) & pose_ok
+        paid[:, i] = paid[:, i] | newly
+        bonus = bonus + newly.to(dtype=frac.dtype)
+    return bonus
 
 
 def slide_success_bonus_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    slot_mouth_y_env: float,
-    margin_m: float = 0.008,
+    min_lead_y_env: float = 0.210,
     min_episode_steps: int = 2,
-    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    max_tilt_penalty: float = 0.08,
-    max_long_axis_abs_z: float = 0.15,
-    min_long_axis_xy_align: float = 0.85,
     gripper_joint_cfg: SceneEntityCfg | None = None,
     max_gripper_gap_m: float = 0.001,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_straddle_sep_m: float = 0.0,
+    require_gripper_closed: bool = True,
+    max_lin_speed_m_s: float = 0.018,
+    max_push_axis_speed_m_s: float = 0.012,
+    max_off_axis_speed_m_s: float = 0.015,
+    min_sustained_steps: int = 4,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_center_x_drift_m: float = 0.003,
+    belt_center_z_env: float = 0.10175,
+    max_center_z_drift_m: float = 0.005,
 ) -> torch.Tensor:
-    """Bonus (1.0) on steps where slide success criteria are met; mirrors :func:`slide_success`."""
+    """Bonus (1.0) when :func:`slide_success` criteria are satisfied (stable mouth arrival)."""
     achieved = slide_success(
         env,
         pcb_cfg,
         half_length_m,
-        slot_mouth_y_env,
-        margin_m=margin_m,
+        min_lead_y_env=min_lead_y_env,
         min_episode_steps=min_episode_steps,
-        world_up=world_up,
-        axis_world=axis_world,
-        max_tilt_penalty=max_tilt_penalty,
-        max_long_axis_abs_z=max_long_axis_abs_z,
-        min_long_axis_xy_align=min_long_axis_xy_align,
         gripper_joint_cfg=gripper_joint_cfg,
         max_gripper_gap_m=max_gripper_gap_m,
-        left_finger_cfg=left_finger_cfg,
-        right_finger_cfg=right_finger_cfg,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-        min_straddle_sep_m=min_straddle_sep_m,
+        require_gripper_closed=require_gripper_closed,
+        max_lin_speed_m_s=max_lin_speed_m_s,
+        max_push_axis_speed_m_s=max_push_axis_speed_m_s,
+        max_off_axis_speed_m_s=max_off_axis_speed_m_s,
+        min_sustained_steps=min_sustained_steps,
+        push_axis_world=push_axis_world,
+        max_center_x_drift_m=max_center_x_drift_m,
+        belt_center_z_env=belt_center_z_env,
+        max_center_z_drift_m=max_center_z_drift_m,
     )
     return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 
@@ -2740,11 +2983,14 @@ def _store_insert_progress_baselines(
         env._insert_start_lead_proj = torch.zeros(env.num_envs, device=device, dtype=dtype)
     if not hasattr(env, "_insert_start_lead_z"):
         env._insert_start_lead_z = torch.zeros(env.num_envs, device=device, dtype=dtype)
+    if not hasattr(env, "_insert_start_lead_env"):
+        env._insert_start_lead_env = torch.zeros(env.num_envs, 3, device=device, dtype=dtype)
     env._insert_start_center_env[env_ids] = center_env
     env._insert_start_center_proj[env_ids] = torch.sum(center_env * push.unsqueeze(0), dim=-1)
     env._insert_start_center_z[env_ids] = center_env[:, 2]
     lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)[env_ids]
     lead_env = lead_w - env.scene.env_origins[env_ids, :3]
+    env._insert_start_lead_env[env_ids] = lead_env
     env._insert_start_lead_proj[env_ids] = torch.sum(lead_env * push.unsqueeze(0), dim=-1)
     env._insert_start_lead_z[env_ids] = lead_env[:, 2]
 
@@ -2757,6 +3003,15 @@ def _store_insert_progress_baselines(
 
     if hasattr(env, "_insert_backward_step_count"):
         env._insert_backward_step_count[env_ids] = 0.0
+
+    if hasattr(env, "_slide_travel_milestone_paid"):
+        env._slide_travel_milestone_paid[env_ids] = False
+
+    if hasattr(env, "_slide_success_sustain_count"):
+        env._slide_success_sustain_count[env_ids] = 0
+
+    if hasattr(env, "_slide_success_sustain_step_buf"):
+        env._slide_success_sustain_step_buf[env_ids] = -1
 
 
 def reset_pcb_on_guide_rails(
@@ -3204,19 +3459,212 @@ class RelativeJointPositionActionWithGripperHoldCfg(RelativeJointPositionActionC
     gripper_closed_target_m: float = 0.00025
 
 
+def _pcb_tilt_penalty_from_quat_batch(
+    quat_wxyz: torch.Tensor,
+    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
+) -> torch.Tensor:
+    """Thickness-axis tilt penalty ``1 - |dot(z_body, up)|`` for buffer quaternions ``(N, 4)`` wxyz."""
+    device = quat_wxyz.device
+    dtype = quat_wxyz.dtype
+    up = torch.tensor(world_up, device=device, dtype=dtype)
+    up = up / torch.norm(up).clamp_min(1e-9)
+    local_z = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+    z_w = math_utils.quat_apply(
+        quat_wxyz,
+        local_z.unsqueeze(0).expand(quat_wxyz.shape[0], -1),
+    )
+    align = torch.abs(torch.sum(z_w * up.unsqueeze(0), dim=-1))
+    return 1.0 - torch.clamp(align, max=1.0)
+
+
 def _sample_grasp_buffer_indices(
     pcb_pos_env: torch.Tensor,
     n_samples: int,
-    rail_center_z: float,
+    pcb_z_reference: float,
     max_z_delta_m: float,
+    pcb_quat: torch.Tensor | None = None,
+    max_tilt_penalty: float | None = None,
 ) -> torch.Tensor:
-    """Sample buffer rows whose PCB centre Z is near the guide-rail contact height."""
+    """Sample buffer rows near ``pcb_z_reference``; optionally reject high tilt."""
     z = pcb_pos_env[:, 2]
-    valid = torch.nonzero(torch.abs(z - float(rail_center_z)) <= float(max_z_delta_m), as_tuple=False).view(-1)
-    if valid.numel() == 0:
+    valid = torch.abs(z - float(pcb_z_reference)) <= float(max_z_delta_m)
+    if max_tilt_penalty is not None and pcb_quat is not None:
+        tilt = _pcb_tilt_penalty_from_quat_batch(pcb_quat)
+        valid = valid & (tilt <= float(max_tilt_penalty))
+    valid_idx = torch.nonzero(valid, as_tuple=False).view(-1)
+    if valid_idx.numel() == 0:
         return torch.randint(0, pcb_pos_env.shape[0], (n_samples,), device="cpu")
-    pick = torch.randint(0, valid.numel(), (n_samples,), device="cpu")
-    return valid[pick]
+    pick = torch.randint(0, valid_idx.numel(), (n_samples,), device="cpu")
+    return valid_idx[pick]
+
+
+def _gripper_midpoint_z_w(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """World Z of the gripper jaw midpoint (pad tips when ``tip_offset_m`` > 0)."""
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    return mid[env_ids, 2]
+
+
+def _lift_robot_wrist_z_by_delta(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    robot_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    tip_offset_m: float,
+    delta_z_env: torch.Tensor,
+    joint_names: tuple[str, ...] = ("joint_1", "joint_2"),
+    joint_weights: tuple[float, ...] = (0.65, 0.35),
+    max_iters: int = 12,
+    z_tol_m: float = 0.002,
+    step_gain: float = 0.9,
+    m_per_rad: float = 0.12,
+) -> None:
+    """Raise gripper midpoint world-Z by ``delta_z_env`` using closed-loop ``joint_1``/``joint_2`` nudges."""
+    if len(env_ids) == 0:
+        return
+    active = delta_z_env.abs() > 1e-6
+    if not torch.any(active):
+        return
+
+    robot: Articulation = env.scene[robot_cfg.name]
+    dtype = robot.data.joint_pos.dtype
+    device = env.device
+    delta_z_env = delta_z_env.to(device=device, dtype=dtype)
+
+    joint_ids: list[int] = []
+    weights = torch.tensor(joint_weights, device=device, dtype=dtype)
+    for name in joint_names:
+        ids, _ = robot.find_joints(name)
+        if len(ids) == 0:
+            return
+        joint_ids.append(ids[0])
+
+    z_now = _gripper_midpoint_z_w(
+        env, env_ids, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    target_z = z_now + delta_z_env
+
+    for _ in range(int(max_iters)):
+        err = target_z - z_now
+        err = torch.where(active, err, torch.zeros_like(err))
+        if torch.all((err.abs() <= float(z_tol_m)) | ~active):
+            break
+
+        joint_pos_new = robot.data.joint_pos[env_ids].clone()
+        for jid, w in zip(joint_ids, weights):
+            # wxai: decreasing joint_1/2 raises the wrist at typical slide poses.
+            delta_j = -float(step_gain) * err * w / float(m_per_rad)
+            joint_pos_new[:, jid] = joint_pos_new[:, jid] + delta_j
+            lim = robot.data.soft_joint_pos_limits[env_ids, jid]
+            joint_pos_new[:, jid] = joint_pos_new[:, jid].clamp(lim[..., 0], lim[..., 1])
+
+        joint_vel_new = torch.zeros_like(joint_pos_new)
+        robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
+        robot.update(0.0)
+        z_now = _gripper_midpoint_z_w(
+            env, env_ids, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        )
+
+    if hasattr(env, "_insert_reset_joint_pos"):
+        env._insert_reset_joint_pos[env_ids] = robot.data.joint_pos[env_ids].clone()
+
+
+def _apply_robot_vertical_z_lift(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    delta_z_env: torch.Tensor,
+    joint_name: str = "joint_1",
+    lift_m_per_rad: float = 0.12,
+    lift_sign: float = -1.0,
+) -> None:
+    """Nudge a shoulder joint after a PCB Z snap so the gripper moves up with the board."""
+    if len(env_ids) == 0:
+        return
+    robot: Articulation = env.scene[asset_cfg.name]
+    joint_ids, _ = robot.find_joints(joint_name)
+    if len(joint_ids) == 0:
+        return
+    jid = joint_ids[0]
+    delta_joint = (
+        float(lift_sign) * delta_z_env.to(device=env.device, dtype=robot.data.joint_pos.dtype) / float(lift_m_per_rad)
+    )
+    # Only lift envs that received a non-zero snap delta.
+    delta_joint = torch.where(delta_z_env.abs() > 1e-6, delta_joint, torch.zeros_like(delta_joint))
+    joint_pos_new = robot.data.joint_pos[env_ids].clone()
+    joint_pos_new[:, jid] = joint_pos_new[:, jid] + delta_joint
+    lim = robot.data.soft_joint_pos_limits[env_ids, jid]
+    joint_pos_new[:, jid] = joint_pos_new[:, jid].clamp(lim[..., 0], lim[..., 1])
+    joint_vel_new = torch.zeros_like(joint_pos_new)
+    robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
+    robot.update(0.0)
+    if hasattr(env, "_insert_reset_joint_pos"):
+        env._insert_reset_joint_pos[env_ids] = joint_pos_new.clone()
+
+
+def _zero_entity_velocities_after_reset(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    pcb_cfg: SceneEntityCfg | None = None,
+    robot_cfg: SceneEntityCfg | None = None,
+) -> None:
+    """Zero root / joint velocities after a teleport reset to avoid launch impulses."""
+    if pcb_cfg is not None:
+        pcb = env.scene[pcb_cfg.name]
+        zeros = torch.zeros((len(env_ids), 6), device=env.device, dtype=pcb.data.root_vel_w.dtype)
+        pcb.write_root_velocity_to_sim(zeros, env_ids=env_ids)
+        pcb.update(0.0)
+    if robot_cfg is not None:
+        robot = env.scene[robot_cfg.name]
+        joint_zeros = torch.zeros_like(robot.data.joint_vel[env_ids])
+        robot.write_joint_velocity_to_sim(joint_zeros, env_ids=env_ids)
+        robot.update(0.0)
+
+
+def settle_physics_after_buffer_reset(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    num_steps: int = 16,
+    pcb_cfg: SceneEntityCfg | None = None,
+    robot_cfg: SceneEntityCfg | None = None,
+    gripper_asset_cfg: SceneEntityCfg | None = None,
+    gripper_joint_name: str = "left_carriage_joint",
+    gripper_closed_target_m: float = 0.00025,
+) -> None:
+    """Run a short passive physics settle after buffer teleports, then zero velocities."""
+    if len(env_ids) == 0 or num_steps <= 0:
+        return
+    env.scene.write_data_to_sim()
+    for _ in range(int(num_steps)):
+        if gripper_asset_cfg is not None:
+            hold_gripper_closed(
+                env,
+                env_ids,
+                gripper_asset_cfg,
+                joint_name=gripper_joint_name,
+                closed_target_m=gripper_closed_target_m,
+            )
+        env.sim.step(render=False)
+        env.scene.update(dt=env.physics_dt)
+    _zero_entity_velocities_after_reset(env, env_ids, pcb_cfg=pcb_cfg, robot_cfg=robot_cfg)
+    if gripper_asset_cfg is not None:
+        hold_gripper_closed(
+            env,
+            env_ids,
+            gripper_asset_cfg,
+            joint_name=gripper_joint_name,
+            closed_target_m=gripper_closed_target_m,
+            match_sim_state=True,
+            store_target=True,
+        )
 
 
 def reset_from_grasp_states(
@@ -3227,8 +3675,11 @@ def reset_from_grasp_states(
     velocity_scale: float = 0.0,
     gripper_joint_name: str = "left_carriage_joint",
     gripper_closed_target_m: float = 0.00025,
+    pcb_z_filter_env: float | None = None,
+    max_pcb_z_delta_m: float = 0.025,
+    max_buffer_tilt_penalty: float | None = None,
     rail_center_z_env: float | None = None,
-    max_rail_z_delta_m: float = 0.015,
+    max_rail_z_delta_m: float | None = None,
 ) -> None:
     """Reset **robot joints only** by sampling from the saved grasp terminal-state buffer.
 
@@ -3250,13 +3701,18 @@ def reset_from_grasp_states(
     device = env.device
     dtype = torch.float32
 
-    # Prefer grasp rows with PCB Z near the rail contact height (reduces airborne / shear slip).
-    if rail_center_z_env is not None:
+    z_ref = pcb_z_filter_env if pcb_z_filter_env is not None else rail_center_z_env
+    z_delta = max_pcb_z_delta_m if max_rail_z_delta_m is None else max_rail_z_delta_m
+
+    # Prefer rows whose saved PCB Z (and optional flatness) match conveyor slide start.
+    if z_ref is not None:
         idx = _sample_grasp_buffer_indices(
             buf["pcb_pos_env"],
             n_reset,
-            float(rail_center_z_env),
-            float(max_rail_z_delta_m),
+            float(z_ref),
+            float(z_delta),
+            pcb_quat=buf["pcb_quat"] if max_buffer_tilt_penalty is not None else None,
+            max_tilt_penalty=max_buffer_tilt_penalty,
         )
     else:
         idx = torch.randint(0, n_buf, (n_reset,), device="cpu")
@@ -3322,15 +3778,36 @@ def reset_pcb_from_grasp_states(
     rail_center_z_env: float | None = None,
     snap_z_to_rail: bool = False,
     snap_z_max_delta_m: float = 0.002,
+    rail_z_clearance_m: float = 0.0,
+    flatten_pcb_orientation: bool = False,
+    flat_rot_wxyz: tuple[float, float, float, float] | None = None,
+    lift_robot_with_snap: bool = False,
+    robot_asset_cfg: SceneEntityCfg | None = None,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_lift_joint_names: tuple[str, ...] = ("joint_1", "joint_2"),
+    wrist_lift_joint_weights: tuple[float, ...] = (0.65, 0.35),
+    wrist_lift_max_iters: int = 12,
+    wrist_lift_z_tol_m: float = 0.002,
+    # Legacy heuristic lift (used when finger cfgs are omitted).
+    vertical_lift_joint_name: str = "joint_1",
+    vertical_lift_joint_name_2: str | None = "joint_2",
+    vertical_lift_m_per_rad: float = 0.12,
+    vertical_lift_m_per_rad_2: float = 0.10,
+    vertical_lift_sign: float = -1.0,
+    vertical_lift_split: float = 0.65,
 ) -> None:
     """Place the PCB at the Phase-1 terminal pose stored in the grasp buffer.
 
     Must run **after** :func:`reset_from_grasp_states` so ``env._grasp_buffer_idx``
     points to the same buffer row as the robot joints.
 
-    When ``snap_z_to_rail`` is True, centre Z is set to ``rail_center_z_env`` only when the
-    buffer Z is already within ``snap_z_max_delta_m`` of that height.  Larger gaps keep buffer
-    Z to avoid a vertical teleport that overlaps rails/fingers and causes depenetration bounce.
+    When ``snap_z_to_rail`` is True, centre Z is set to ``rail_center_z_env`` (+ optional
+    clearance) when the buffer Z is within ``snap_z_max_delta_m``.  With ``lift_robot_with_snap``,
+    the arm wrist midpoint is raised to match the PCB Z delta before teleport.  Optional
+    ``flatten_pcb_orientation`` replaces buffer quaternions with ``flat_rot_wxyz``.
     """
     if not hasattr(env, "_grasp_buffer_idx"):
         raise RuntimeError(
@@ -3344,25 +3821,72 @@ def reset_pcb_from_grasp_states(
 
     idx = env._grasp_buffer_idx[env_ids].cpu()
     pos_env = buf["pcb_pos_env"][idx].to(device=device, dtype=dtype)
+    delta_z_env = torch.zeros(len(env_ids), device=device, dtype=dtype)
     if snap_z_to_rail and rail_center_z_env is not None:
-        rail_z = float(rail_center_z_env)
+        rail_z = float(rail_center_z_env) + float(rail_z_clearance_m)
         z_buf = pos_env[:, 2]
-        close = torch.abs(z_buf - rail_z) <= float(snap_z_max_delta_m)
-        pos_env[:, 2] = torch.where(
-            close,
-            torch.full_like(z_buf, rail_z),
-            z_buf,
-        )
+        dz = rail_z - z_buf
+        snap = torch.abs(dz) <= float(snap_z_max_delta_m)
+        delta_z_env = torch.where(snap, dz, torch.zeros_like(dz))
+        pos_env[:, 2] = torch.where(snap, torch.full_like(z_buf, rail_z), z_buf)
+
+    # Lift wrist to match PCB Z snap before teleport (closed-loop on gripper midpoint Z).
+    if lift_robot_with_snap and robot_asset_cfg is not None and torch.any(delta_z_env.abs() > 1e-6):
+        if left_finger_cfg is not None and right_finger_cfg is not None:
+            _lift_robot_wrist_z_by_delta(
+                env,
+                env_ids,
+                robot_asset_cfg,
+                left_finger_cfg,
+                right_finger_cfg,
+                wrist_body_cfg,
+                float(tip_offset_m),
+                delta_z_env,
+                joint_names=wrist_lift_joint_names,
+                joint_weights=wrist_lift_joint_weights,
+                max_iters=wrist_lift_max_iters,
+                z_tol_m=wrist_lift_z_tol_m,
+                m_per_rad=vertical_lift_m_per_rad,
+            )
+        else:
+            split = float(vertical_lift_split)
+            _apply_robot_vertical_z_lift(
+                env,
+                env_ids,
+                robot_asset_cfg,
+                delta_z_env * split,
+                joint_name=vertical_lift_joint_name,
+                lift_m_per_rad=vertical_lift_m_per_rad,
+                lift_sign=vertical_lift_sign,
+            )
+            if vertical_lift_joint_name_2 is not None:
+                _apply_robot_vertical_z_lift(
+                    env,
+                    env_ids,
+                    robot_asset_cfg,
+                    delta_z_env * (1.0 - split),
+                    joint_name=vertical_lift_joint_name_2,
+                    lift_m_per_rad=vertical_lift_m_per_rad_2,
+                    lift_sign=vertical_lift_sign,
+                )
+
     quat = buf["pcb_quat"][idx].to(device=device, dtype=dtype)
+    if flatten_pcb_orientation and flat_rot_wxyz is not None:
+        flat_q = torch.tensor(flat_rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(len(env_ids), -1)
+        quat = flat_q.clone()
+    if hasattr(env, "_sampled_pcb_quat"):
+        env._sampled_pcb_quat[env_ids] = quat.clone()
+
     origins = env.scene.env_origins[env_ids, :3]
     pos_w = pos_env + origins
     root_pose = torch.cat([pos_w, quat], dim=-1)
 
-    default_root_state = pcb.data.default_root_state[env_ids].clone()
-    root_vel = default_root_state[:, 7:13] * velocity_scale
     pcb.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+    root_vel = torch.zeros((len(env_ids), 6), device=device, dtype=dtype)
     pcb.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
     pcb.update(0.0)
+    if robot_asset_cfg is not None:
+        _zero_entity_velocities_after_reset(env, env_ids, robot_cfg=robot_asset_cfg)
 
     _store_insert_progress_baselines(env, env_ids, pcb_cfg, half_length_m)
 
@@ -3988,6 +4512,21 @@ def pcb_push_axis_sustained_backward_velocity_penalty(
     sustained = count >= float(min_consecutive_steps)
     penalty = torch.relu(-v_y)
     return torch.where(sustained & backward, penalty, torch.zeros_like(penalty))
+
+
+def pcb_slide_axis_sustained_backward_velocity_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    min_backward_speed_m_s: float = 0.003,
+    min_consecutive_steps: int = 3,
+) -> torch.Tensor:
+    """Slide-phase alias for :func:`pcb_push_axis_sustained_backward_velocity_penalty`."""
+    return pcb_push_axis_sustained_backward_velocity_penalty(
+        env,
+        pcb_cfg,
+        min_backward_speed_m_s=min_backward_speed_m_s,
+        min_consecutive_steps=min_consecutive_steps,
+    )
 
 
 def gripper_mid_gated_push_axis_velocity_reward(

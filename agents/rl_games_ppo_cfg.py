@@ -158,7 +158,7 @@ WidowXPcbGraspGripperTestPPOCfg = {
             "name": "widowx_pcb_grasp_gripper_test",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
-            "max_epochs": 150,
+            "max_epochs": 100,
             "reward_shaper": {"scale_value": 0.2},
             "horizon_length": 64,
         },
@@ -174,7 +174,7 @@ WidowXPcbSlidePPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            "clip_actions": 0.15,
+            "clip_actions": 0.12,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],

@@ -19,7 +19,9 @@ venv/
 
 # Training / logs (regenerate locally)
 logs/
+outputs/
 runs/
+*.hydra
 *.pt
 *.pth
 wandb/
