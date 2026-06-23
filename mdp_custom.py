@@ -2295,6 +2295,20 @@ def slide_leading_edge_in_target_xyz_range(
     return (delta[:, 0] <= tol[:, 0]) & (delta[:, 1] <= tol[:, 1]) & (delta[:, 2] <= tol[:, 2])
 
 
+def _slide_success_gripper_closed_ok(
+    env: ManagerBasedRLEnv,
+    gripper_joint_cfg: SceneEntityCfg | None,
+    max_gripper_gap_m: float,
+    require_gripper_closed: bool,
+) -> torch.Tensor:
+    """True when ``left_carriage_joint`` gap is below ``max_gripper_gap_m``."""
+    if not require_gripper_closed or gripper_joint_cfg is None:
+        return torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
+    return gq < float(max_gripper_gap_m)
+
+
 def _slide_success_in_range(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2303,6 +2317,9 @@ def _slide_success_in_range(
     tolerance_xy_m: tuple[float, float],
     min_episode_steps: int,
     axis_world: tuple[float, float, float],
+    gripper_joint_cfg: SceneEntityCfg | None,
+    max_gripper_gap_m: float,
+    require_gripper_closed: bool,
 ) -> torch.Tensor:
     """Shared mask for ``slide_success`` termination and ``slide_success_bonus`` reward."""
     in_range = slide_leading_edge_in_target_xy_range(
@@ -2313,6 +2330,10 @@ def _slide_success_in_range(
         tolerance_xy_m,
         axis_world,
     )
+    gripper_ok = _slide_success_gripper_closed_ok(
+        env, gripper_joint_cfg, max_gripper_gap_m, require_gripper_closed
+    )
+    in_range = in_range & gripper_ok
     if min_episode_steps > 0:
         in_range = in_range & (env.episode_length_buf > min_episode_steps)
     return in_range
@@ -2326,11 +2347,11 @@ def slide_success(
     tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
     min_episode_steps: int = 0,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    max_gripper_gap_m: float = 0.0015,
+    require_gripper_closed: bool = True,
 ) -> torch.Tensor:
-    """Slide success termination: leading-edge env X/Y within ``target ± tolerance`` (no Z gate).
-
-    Straddle quality is guarded by ``pcb_detached``; no gripper / velocity gates.
-    """
+    """Slide success: leading-edge X/Y in target box and gripper closed (no Z / velocity gates)."""
     return _slide_success_in_range(
         env,
         pcb_cfg,
@@ -2339,6 +2360,9 @@ def slide_success(
         tolerance_xy_m,
         min_episode_steps,
         axis_world,
+        gripper_joint_cfg,
+        max_gripper_gap_m,
+        require_gripper_closed,
     )
 
 
@@ -2427,8 +2451,11 @@ def slide_success_bonus_reward(
     tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
     min_episode_steps: int = 0,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    max_gripper_gap_m: float = 0.0015,
+    require_gripper_closed: bool = True,
 ) -> torch.Tensor:
-    """Bonus (1.0) when leading-edge X/Y is inside the same box as :func:`slide_success`."""
+    """Bonus (1.0) when leading-edge X/Y box and gripper closed match :func:`slide_success`."""
     achieved = _slide_success_in_range(
         env,
         pcb_cfg,
@@ -2437,6 +2464,9 @@ def slide_success_bonus_reward(
         tolerance_xy_m,
         min_episode_steps,
         axis_world,
+        gripper_joint_cfg,
+        max_gripper_gap_m,
+        require_gripper_closed,
     )
     return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 

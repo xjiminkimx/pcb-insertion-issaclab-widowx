@@ -323,6 +323,7 @@ _SLIDE_SUCCESS_LEAD_XY_TOLERANCE_M = (
     0.003,
     _SLIDE_MOUTH_LEAD_Y_ENV - _SLIDE_MIN_LEAD_Y_SUCCESS_ENV,
 )
+_SLIDE_MAX_GRIPPER_GAP_M = PCB_Z * 1.0  # ``left_carriage_joint`` must stay below this at success
 _SLIDE_APPROACH_LEAD_XYZ_ENV = (
     _SLIDE_MOUTH_LEAD_X_ENV,
     _SLIDE_MOUTH_LEAD_Y_ENV,
@@ -670,6 +671,9 @@ def _slide_success_params(**extra) -> dict:
         "half_length_m": _HALF_LENGTH_M,
         "target_lead_xy_env": _SLIDE_SUCCESS_TARGET_LEAD_XY_ENV,
         "tolerance_xy_m": _SLIDE_SUCCESS_LEAD_XY_TOLERANCE_M,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "max_gripper_gap_m": _SLIDE_MAX_GRIPPER_GAP_M,
+        "require_gripper_closed": True,
         "axis_world": PUSH_AXIS_WORLD,
     }
     base.update(extra)
