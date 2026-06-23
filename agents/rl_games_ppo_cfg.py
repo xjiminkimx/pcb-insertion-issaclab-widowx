@@ -193,7 +193,7 @@ WidowXPcbSlidePPOCfg = {
             "reward_shaper": {"scale_value": 0.25},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 150,
+            "max_epochs": 80,
             "horizon_length": 256,
             "mini_epochs": 8,
         },

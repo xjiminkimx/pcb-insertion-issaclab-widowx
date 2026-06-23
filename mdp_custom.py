@@ -2263,117 +2263,83 @@ def _advance_slide_success_sustain(
     return count >= sustained
 
 
-def _slide_success_pose_ok(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    max_center_x_drift_m: float,
-    belt_center_z_env: float,
-    max_center_z_drift_m: float,
-) -> torch.Tensor:
-    """True when PCB centre X stays near spawn and Z is near belt-top centre height."""
-    pcb = env.scene[pcb_cfg.name]
-    center_env = pcb.data.root_pos_w[:, :3] - env.scene.env_origins[:, :3]
-
-    if hasattr(env, "_insert_start_center_env"):
-        delta_x = center_env[:, 0] - env._insert_start_center_env[:, 0]
-        x_ok = torch.abs(delta_x) <= float(max_center_x_drift_m)
-    else:
-        x_ok = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
-
-    ref_z = float(belt_center_z_env)
-    z_ok = torch.abs(center_env[:, 2] - ref_z) <= float(max_center_z_drift_m)
-    return x_ok & z_ok
-
-
-def _slide_success_frame_ready(
+def slide_leading_edge_in_target_xy_range(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    min_lead_y_env: float,
-    gripper_joint_cfg: SceneEntityCfg | None,
-    max_gripper_gap_m: float,
-    require_gripper_closed: bool,
-    max_lin_speed_m_s: float,
-    max_push_axis_speed_m_s: float,
-    max_off_axis_speed_m_s: float,
-    push_axis_world: tuple[float, float, float],
-    max_center_x_drift_m: float = 0.003,
-    belt_center_z_env: float = 0.10175,
-    max_center_z_drift_m: float = 0.005,
+    target_lead_xy_env: tuple[float, float],
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Per-step mask: mouth Y, lane X + belt Z pose, gripper closed, and low PCB speed."""
-    at_mouth = slide_mouth_lead_y_reached(env, pcb_cfg, half_length_m, min_lead_y_env)
-    pose_ok = _slide_success_pose_ok(
-        env, pcb_cfg, max_center_x_drift_m, belt_center_z_env, max_center_z_drift_m
+    """True when leading short-edge centre X/Y are inside ``target_lead_xy_env ± tolerance``."""
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    tgt = torch.tensor(target_lead_xy_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
+    tol = torch.tensor(tolerance_xy_m, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
+    delta = torch.abs(lead_env[:, :2] - tgt)
+    return (delta[:, 0] <= tol[:, 0]) & (delta[:, 1] <= tol[:, 1])
+
+
+def slide_leading_edge_in_target_xyz_range(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_xyz_env: tuple[float, float, float],
+    tolerance_xyz_m: tuple[float, float, float] = (0.003, 0.020, 0.003),
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """True when the leading short-edge centre is inside a per-axis box around ``target_lead_xyz_env``."""
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
+    tol = torch.tensor(tolerance_xyz_m, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
+    delta = torch.abs(lead_env - tgt)
+    return (delta[:, 0] <= tol[:, 0]) & (delta[:, 1] <= tol[:, 1]) & (delta[:, 2] <= tol[:, 2])
+
+
+def _slide_success_in_range(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_xy_env: tuple[float, float],
+    tolerance_xy_m: tuple[float, float],
+    min_episode_steps: int,
+    axis_world: tuple[float, float, float],
+) -> torch.Tensor:
+    """Shared mask for ``slide_success`` termination and ``slide_success_bonus`` reward."""
+    in_range = slide_leading_edge_in_target_xy_range(
+        env,
+        pcb_cfg,
+        half_length_m,
+        target_lead_xy_env,
+        tolerance_xy_m,
+        axis_world,
     )
-
-    gripper_ok = torch.ones(env.num_envs, device=env.device, dtype=torch.bool)
-    if require_gripper_closed and gripper_joint_cfg is not None:
-        robot = env.scene[gripper_joint_cfg.name]
-        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-        gripper_ok = gq < float(max_gripper_gap_m)
-
-    pcb = env.scene[pcb_cfg.name]
-    v = pcb.data.root_lin_vel_w
-    lin_speed = torch.norm(v, dim=-1)
-    a = torch.tensor(push_axis_world, device=env.device, dtype=v.dtype)
-    a = a / torch.norm(a).clamp_min(1e-9)
-    v_push = torch.sum(v * a.unsqueeze(0), dim=-1)
-    off_axis = _pcb_off_axis_speed(env, pcb_cfg)
-
-    speed_ok = lin_speed <= float(max_lin_speed_m_s)
-    speed_ok = speed_ok & (torch.abs(v_push) <= float(max_push_axis_speed_m_s))
-    speed_ok = speed_ok & (off_axis <= float(max_off_axis_speed_m_s))
-
-    return at_mouth & pose_ok & gripper_ok & speed_ok
+    if min_episode_steps > 0:
+        in_range = in_range & (env.episode_length_buf > min_episode_steps)
+    return in_range
 
 
 def slide_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    min_lead_y_env: float = 0.210,
-    min_episode_steps: int = 2,
-    gripper_joint_cfg: SceneEntityCfg | None = None,
-    max_gripper_gap_m: float = 0.001,
-    require_gripper_closed: bool = True,
-    max_lin_speed_m_s: float = 0.018,
-    max_push_axis_speed_m_s: float = 0.012,
-    max_off_axis_speed_m_s: float = 0.015,
-    min_sustained_steps: int = 4,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    max_center_x_drift_m: float = 0.003,
-    belt_center_z_env: float = 0.10175,
-    max_center_z_drift_m: float = 0.005,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.220),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
+    min_episode_steps: int = 0,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Slide success: stable mouth arrival — Y, lane X, belt Z, closed gripper, low speed.
+    """Slide success termination: leading-edge env X/Y within ``target ± tolerance`` (no Z gate).
 
-    All criteria must hold for ``min_sustained_steps`` consecutive control steps so a fast
-    impact-and-bounce does not count; the board must be settled at the mouth with the gripper
-  still closed. Straddle quality is guarded by ``pcb_detached``.
+    Straddle quality is guarded by ``pcb_detached``; no gripper / velocity gates.
     """
-    frame = _slide_success_frame_ready(
+    return _slide_success_in_range(
         env,
         pcb_cfg,
         half_length_m,
-        min_lead_y_env,
-        gripper_joint_cfg,
-        max_gripper_gap_m,
-        require_gripper_closed,
-        max_lin_speed_m_s,
-        max_push_axis_speed_m_s,
-        max_off_axis_speed_m_s,
-        push_axis_world,
-        max_center_x_drift_m,
-        belt_center_z_env,
-        max_center_z_drift_m,
+        target_lead_xy_env,
+        tolerance_xy_m,
+        min_episode_steps,
+        axis_world,
     )
-
-    if min_episode_steps > 0:
-        ready = env.episode_length_buf > min_episode_steps
-        frame = frame & ready
-
-    return _advance_slide_success_sustain(env, frame, min_sustained_steps)
 
 
 def _slide_lead_pose_ok(
@@ -2457,38 +2423,20 @@ def slide_success_bonus_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    min_lead_y_env: float = 0.210,
-    min_episode_steps: int = 2,
-    gripper_joint_cfg: SceneEntityCfg | None = None,
-    max_gripper_gap_m: float = 0.001,
-    require_gripper_closed: bool = True,
-    max_lin_speed_m_s: float = 0.018,
-    max_push_axis_speed_m_s: float = 0.012,
-    max_off_axis_speed_m_s: float = 0.015,
-    min_sustained_steps: int = 4,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    max_center_x_drift_m: float = 0.003,
-    belt_center_z_env: float = 0.10175,
-    max_center_z_drift_m: float = 0.005,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.220),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
+    min_episode_steps: int = 0,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
-    """Bonus (1.0) when :func:`slide_success` criteria are satisfied (stable mouth arrival)."""
-    achieved = slide_success(
+    """Bonus (1.0) when leading-edge X/Y is inside the same box as :func:`slide_success`."""
+    achieved = _slide_success_in_range(
         env,
         pcb_cfg,
         half_length_m,
-        min_lead_y_env=min_lead_y_env,
-        min_episode_steps=min_episode_steps,
-        gripper_joint_cfg=gripper_joint_cfg,
-        max_gripper_gap_m=max_gripper_gap_m,
-        require_gripper_closed=require_gripper_closed,
-        max_lin_speed_m_s=max_lin_speed_m_s,
-        max_push_axis_speed_m_s=max_push_axis_speed_m_s,
-        max_off_axis_speed_m_s=max_off_axis_speed_m_s,
-        min_sustained_steps=min_sustained_steps,
-        push_axis_world=push_axis_world,
-        max_center_x_drift_m=max_center_x_drift_m,
-        belt_center_z_env=belt_center_z_env,
-        max_center_z_drift_m=max_center_z_drift_m,
+        target_lead_xy_env,
+        tolerance_xy_m,
+        min_episode_steps,
+        axis_world,
     )
     return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 

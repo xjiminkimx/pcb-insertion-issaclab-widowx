@@ -178,7 +178,7 @@ _CONVEYOR_SURFACE_Z = 0.100        # conveyor top Z (chip FK z + _MAG_POS[2] −
 _PCB_GRASP_CLEARANCE_ABOVE_BELT_M = 0.05
 _PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 + _PCB_GRASP_CLEARANCE_ABOVE_BELT_M
 # Insert / rail contact: PCB centre when the bottom sits on guide rails (~78 mm above belt top).
-_GUIDE_RAIL_TOP_ABOVE_BELT_M = 0.078
+_GUIDE_RAIL_TOP_ABOVE_BELT_M = 0.05
 _INSERT_RAIL_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5 + _GUIDE_RAIL_TOP_ABOVE_BELT_M
 # Grasp terminal states are saved near the grasp spawn centre (above belt, not on rails).
 _GRASP_BUFFER_Z_REFERENCE_ENV = _PCB_CENTER_Z_ENV
@@ -309,21 +309,20 @@ _INSERT_STRADDLE_GATE_MIN = 0.3
 # Terminal-state buffers (Sequential Dexterity chaining).
 _GRASP_STATES_PATH = os.path.join(ASSET_DIR, "data", "grasp_terminal_states.npz")
 _SLIDE_STATES_PATH = os.path.join(ASSET_DIR, "data", "slide_terminal_states.npz")
-# Slide success: leading short-edge centre at slot mouth (conveyor lane X, mouth Y).
+# Slide success: leading short-edge centre within target XY box (env-local; Z unchecked).
 _SLIDE_MOUTH_Y_MARGIN_M = 0.008
 _SLIDE_MOUTH_LEAD_Y_ENV = _MAG_Y_NEAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M  # 0.220 m
-_SLIDE_MIN_LEAD_Y_SUCCESS_ENV = 0.200   # one-sided: lead_y ≥ this (detach guards grasp quality)
-_SLIDE_MAX_GRIPPER_GAP_M = 0.003        # slide success: gripper must stay closed at mouth
-# Stable mouth arrival: low PCB speed for ``min_sustained_steps`` consecutive control steps.
-_SLIDE_SUCCESS_MAX_LIN_SPEED_M_S = 0.025
-_SLIDE_SUCCESS_MAX_PUSH_AXIS_SPEED_M_S = 0.025
-_SLIDE_SUCCESS_MAX_OFF_AXIS_SPEED_M_S = 0.015
-_SLIDE_SUCCESS_MIN_SUSTAINED_STEPS = 1
-# Success pose: centre X ±spawn drift; centre Z near belt-top height (not spawn-relative).
-_SLIDE_BELT_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + 0.02 + PCB_Z * 0.5
-_SLIDE_SUCCESS_MAX_CENTER_X_DRIFT_M = 0.003
-_SLIDE_SUCCESS_MAX_CENTER_Z_DRIFT_M = 0.003
+_SLIDE_MIN_LEAD_Y_SUCCESS_ENV = 0.200   # lower Y edge of success box (mouth target − tol_y)
 _SLIDE_MOUTH_LEAD_X_ENV = _LANE_CENTER_X_ENV
+_SLIDE_BELT_CENTER_Z_ENV = _INSERT_RAIL_CENTER_Z_ENV  # milestones / rail Z shaping only
+_SLIDE_SUCCESS_TARGET_LEAD_XY_ENV = (
+    _SLIDE_MOUTH_LEAD_X_ENV,
+    _SLIDE_MOUTH_LEAD_Y_ENV,
+)
+_SLIDE_SUCCESS_LEAD_XY_TOLERANCE_M = (
+    0.003,
+    _SLIDE_MOUTH_LEAD_Y_ENV - _SLIDE_MIN_LEAD_Y_SUCCESS_ENV,
+)
 _SLIDE_APPROACH_LEAD_XYZ_ENV = (
     _SLIDE_MOUTH_LEAD_X_ENV,
     _SLIDE_MOUTH_LEAD_Y_ENV,
@@ -669,18 +668,9 @@ def _slide_success_params(**extra) -> dict:
     base = {
         "pcb_cfg": _PCB_ENT,
         "half_length_m": _HALF_LENGTH_M,
-        "min_lead_y_env": _SLIDE_MIN_LEAD_Y_SUCCESS_ENV,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "max_gripper_gap_m": _SLIDE_MAX_GRIPPER_GAP_M,
-        "require_gripper_closed": True,
-        "max_lin_speed_m_s": _SLIDE_SUCCESS_MAX_LIN_SPEED_M_S,
-        "max_push_axis_speed_m_s": _SLIDE_SUCCESS_MAX_PUSH_AXIS_SPEED_M_S,
-        "max_off_axis_speed_m_s": _SLIDE_SUCCESS_MAX_OFF_AXIS_SPEED_M_S,
-        "min_sustained_steps": _SLIDE_SUCCESS_MIN_SUSTAINED_STEPS,
-        "push_axis_world": PUSH_AXIS_WORLD,
-        "max_center_x_drift_m": _SLIDE_SUCCESS_MAX_CENTER_X_DRIFT_M,
-        "belt_center_z_env": _SLIDE_BELT_CENTER_Z_ENV,
-        "max_center_z_drift_m": _SLIDE_SUCCESS_MAX_CENTER_Z_DRIFT_M,
+        "target_lead_xy_env": _SLIDE_SUCCESS_TARGET_LEAD_XY_ENV,
+        "tolerance_xy_m": _SLIDE_SUCCESS_LEAD_XY_TOLERANCE_M,
+        "axis_world": PUSH_AXIS_WORLD,
     }
     base.update(extra)
     return base
@@ -1483,7 +1473,7 @@ class TerminationsGraspCfg(TerminationsSharedCfg):
 
 @configclass
 class TerminationsSlideCfg(TerminationsSharedCfg):
-    """Slide phase: terminate on grasp loss, fall, or leading edge reaching slot mouth."""
+    """Slide phase: fail on grasp loss / fall; succeed when leading edge is in the success XYZ box."""
 
     pcb_fallen_below_rail = TerminationTermCfg(
         func=pcb_root_height_below_env_minimum,
@@ -1509,6 +1499,7 @@ class TerminationsSlideCfg(TerminationsSharedCfg):
         func=pcb_moving_backward_termination,
         params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 8},
     )
+    # Same leading-edge XYZ box as ``slide_success_bonus`` (see ``_slide_success_params``).
     slide_success = TerminationTermCfg(
         func=slide_success,
         params=_slide_success_params(),
