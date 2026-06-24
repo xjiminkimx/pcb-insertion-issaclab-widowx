@@ -61,6 +61,44 @@ import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.manager_based.widowx_pcb import widowx_pcb_env_cfg as cfg  # noqa: E402
 from isaaclab_tasks.manager_based.widowx_pcb.agents.rl_games_ppo_cfg import WidowXPcbSlidePPOCfg  # noqa: E402
 
+_GRASP_ACTION_DIM = 7
+_SLIDE_ACTION_DIM = 7
+_INSERT_ACTION_DIM = 6
+
+
+def _checkpoint_action_dim(checkpoint_path: str) -> int | None:
+    ckpt = torch.load(retrieve_file_path(checkpoint_path), map_location="cpu", weights_only=False)
+    weight = ckpt.get("model", {}).get("a2c_network.mu.weight")
+    if weight is None:
+        return None
+    return int(weight.shape[0])
+
+
+def _validate_checkpoint_for_phase(checkpoint_path: str, expected_dim: int, phase: str) -> None:
+    ckpt_dim = _checkpoint_action_dim(checkpoint_path)
+    if ckpt_dim is None:
+        print("[WARN] Could not read action dim from checkpoint; skipping validation.")
+        return
+    if ckpt_dim == expected_dim:
+        return
+    hint = ""
+    if ckpt_dim == _SLIDE_ACTION_DIM and expected_dim == _GRASP_ACTION_DIM:
+        hint = "Use scripts/collect_slide_states.py or a Grasp checkpoint."
+    elif ckpt_dim == _GRASP_ACTION_DIM and expected_dim == _SLIDE_ACTION_DIM:
+        hint = "Use scripts/collect_grasp_states.py or a Slide checkpoint."
+    elif ckpt_dim == 6 and expected_dim == _SLIDE_ACTION_DIM:
+        hint = (
+            "This checkpoint uses the old 6-DoF Slide policy (arm only). "
+            "Retrain Slide with gripper in the action space."
+        )
+    elif ckpt_dim == _INSERT_ACTION_DIM and expected_dim == _SLIDE_ACTION_DIM:
+        hint = "This is an Insert checkpoint (6 arm actions). Use a Slide checkpoint."
+    raise ValueError(
+        f"Checkpoint action dim {ckpt_dim} does not match {phase} env ({expected_dim}).\n"
+        f"  checkpoint: {checkpoint_path}\n"
+        f"  {hint}"
+    )
+
 
 def _build_env_and_player(checkpoint_path: str, num_envs: int):
     env_cfg = cfg.WidowXPcbSlideEnvCfg()
@@ -85,6 +123,7 @@ def _build_env_and_player(checkpoint_path: str, num_envs: int):
     runner = Runner()
     runner.load(agent_cfg)
     player: BasePlayer = runner.create_player()
+    _validate_checkpoint_for_phase(checkpoint_path, _SLIDE_ACTION_DIM, "Slide")
     player.restore(retrieve_file_path(checkpoint_path))
     player.reset()
 

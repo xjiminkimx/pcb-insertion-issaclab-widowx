@@ -166,7 +166,7 @@ WidowXPcbGraspGripperTestPPOCfg = {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 2 — Slide (arm-only, 6 DoF): rail +Y push to slot mouth.
+# Phase 2 — Slide (arm + gripper, 7 DoF): rail +Y push to slot mouth.
 # ---------------------------------------------------------------------------
 WidowXPcbSlidePPOCfg = {
     **WidowXPcbPPOBaseCfg,
@@ -193,7 +193,7 @@ WidowXPcbSlidePPOCfg = {
             "reward_shaper": {"scale_value": 0.25},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 80,
+            "max_epochs": 150,
             "horizon_length": 256,
             "mini_epochs": 8,
         },

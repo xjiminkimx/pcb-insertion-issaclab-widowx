@@ -75,6 +75,49 @@ import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.manager_based.widowx_pcb import widowx_pcb_env_cfg as cfg  # noqa: E402
 from isaaclab_tasks.manager_based.widowx_pcb.agents.rl_games_ppo_cfg import WidowXPcbGraspPPOCfg  # noqa: E402
 
+_GRASP_ACTION_DIM = 7   # arm (6) + gripper (1)
+_SLIDE_ACTION_DIM = 7   # arm (6) + gripper (1); insert remains 6 (arm only)
+
+
+def _checkpoint_action_dim(checkpoint_path: str) -> int | None:
+    """Return policy output dim from rl-games ``a2c_network.mu.weight`` (rows)."""
+    ckpt = torch.load(retrieve_file_path(checkpoint_path), map_location="cpu", weights_only=False)
+    weight = ckpt.get("model", {}).get("a2c_network.mu.weight")
+    if weight is None:
+        return None
+    return int(weight.shape[0])
+
+
+def _validate_checkpoint_for_phase(checkpoint_path: str, expected_dim: int, phase: str) -> None:
+    ckpt_dim = _checkpoint_action_dim(checkpoint_path)
+    if ckpt_dim is None:
+        print("[WARN] Could not read action dim from checkpoint; skipping validation.")
+        return
+    if ckpt_dim == expected_dim:
+        return
+    hint = ""
+    if ckpt_dim == _SLIDE_ACTION_DIM and expected_dim == _GRASP_ACTION_DIM:
+        hint = (
+            "This checkpoint is from Slide/Insert (6 arm-only actions). "
+            "Use scripts/collect_slide_states.py, or pass a Grasp checkpoint "
+            "(logs/rl_games/widowx_pcb_grasp/nn/...)."
+        )
+    elif ckpt_dim == _GRASP_ACTION_DIM and expected_dim == _SLIDE_ACTION_DIM:
+        hint = (
+            "This checkpoint is from Grasp (7 actions). "
+            "Use scripts/collect_grasp_states.py, or pass a Slide checkpoint."
+        )
+    elif ckpt_dim == 6 and expected_dim == 7:
+        hint = (
+            "This checkpoint uses the old 6-DoF Slide policy (arm only). "
+            "Retrain Slide with gripper in the action space, or use an older env cfg."
+        )
+    raise ValueError(
+        f"Checkpoint action dim {ckpt_dim} does not match {phase} env ({expected_dim}).\n"
+        f"  checkpoint: {checkpoint_path}\n"
+        f"  {hint}"
+    )
+
 
 def _build_env_and_player(checkpoint_path: str, num_envs: int):
     """Create wrapped env + rl-games player (same pattern as Isaac Lab play.py)."""
@@ -100,6 +143,7 @@ def _build_env_and_player(checkpoint_path: str, num_envs: int):
     runner = Runner()
     runner.load(agent_cfg)
     player: BasePlayer = runner.create_player()
+    _validate_checkpoint_for_phase(checkpoint_path, _GRASP_ACTION_DIM, "Grasp")
     # rl-games restore() uses torch.load(..., weights_only=False) internally.
     player.restore(retrieve_file_path(checkpoint_path))
     player.reset()

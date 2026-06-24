@@ -310,6 +310,49 @@ def gripper_wrist_carriage_yaw_align_axis(
     return torch.where(n_xy > 1e-4, align, torch.zeros_like(align))
 
 
+def gripper_wrist_carriage_yaw_pitch_limited_align(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    tip_offset_m: float = 0.0,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_pitch_deg: float = 25.0,
+    pitch_soft_deg: float = 10.0,
+) -> torch.Tensor:
+    """Yaw alignment in XY with a soft cap on wrist pitch (elevation of wrist→jaw from horizontal).
+
+    For unit wrist→carriage direction ``u_wc``, ``|u_wc_z|`` is ``sin(pitch)``. Credit is full while
+  ``|u_wc_z| <= sin(max_pitch_deg)`` and decays smoothly beyond that over ``pitch_soft_deg``.
+    """
+    yaw = gripper_wrist_carriage_yaw_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        tip_offset_m,
+        push_axis_world,
+    )
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return yaw
+
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    mid = 0.5 * (left + right)
+    u_wc = mid - wrist
+    u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
+    z_abs = torch.abs(u_wc[:, 2])
+
+    max_z = float(np.sin(np.radians(max_pitch_deg)))
+    soft_z = max(float(np.sin(np.radians(pitch_soft_deg))), 1e-6)
+    excess = torch.clamp(z_abs - max_z, min=0.0)
+    pitch_gate = torch.exp(-excess / soft_z)
+    return yaw * pitch_gate
+
+
 def _gripper_belt_corridor_x_bounds_env(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
@@ -1343,6 +1386,65 @@ def gripper_closing_reward(
     return gate * closedness
 
 
+def gripper_mouth_gated_closing_reward(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg,
+    open_width_m: float,
+    closed_target_m: float,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_xyz_env: tuple[float, float, float],
+    sigma_m: float = 0.10,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    gate_dist_m: float | None = None,
+    pcb_half_thickness_m: float = 0.00125,
+    width_weight: float = 3.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Closing credit gated by mouth proximity and (optionally) straddle / trailing-edge alignment.
+
+    Returns ``mouth_proximity × straddle_gate × closedness``. Proximity is
+    ``exp(-‖lead_env - target‖ / sigma_m)``; closedness is normalized carriage pinch.
+    Credit concentrates near the mouth so the policy learns arm poses that avoid
+    jaw-opening collisions during the final approach (gripper is PD-held, not actuated).
+    """
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
+    dist = torch.norm(lead_env - tgt, dim=-1)
+    proximity = torch.exp(-dist / (float(sigma_m) + 1e-9))
+
+    robot = env.scene[asset_cfg.name]
+    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
+    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
+    reward = proximity * closedness
+
+    if left_finger_cfg is not None and right_finger_cfg is not None:
+        w_left, w_right = _finger_thickness_offsets(
+            env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        )
+        is_straddled = (w_left * w_right < 0.0).to(closedness.dtype)
+        gate = is_straddled
+        if gate_dist_m is not None:
+            near_edge = _both_jaws_near_trailing_edge(
+                env,
+                pcb_cfg,
+                left_finger_cfg,
+                right_finger_cfg,
+                half_length_m,
+                gate_dist_m,
+                pcb_half_thickness_m,
+                width_weight,
+                tip_offset_m,
+                wrist_body_cfg,
+            )
+            gate = is_straddled * near_edge.to(dtype=closedness.dtype)
+        reward = reward * gate
+    return reward
+
+
 def premature_close_penalty(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
@@ -1576,11 +1678,14 @@ def gripper_wrist_carriage_push_axis_shaping(
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     yaw_only: bool = True,
+    max_pitch_deg: float | None = None,
+    pitch_soft_deg: float = 10.0,
 ) -> torch.Tensor:
     """Shaping ``[0, 1]``: wrist (``link_6``) → carriage mid aligned with push axis in XY (yaw).
 
-    With ``yaw_only=True`` (default), only the horizontal (+Y) heading is rewarded; wrist pitch
-    (world Z component of wrist→jaw) is unconstrained.
+    With ``yaw_only=True`` (default), only the horizontal (+Y) heading is rewarded. When
+    ``max_pitch_deg`` is set, wrist pitch is softly limited (not fully free, not full 3D lock).
+    With ``yaw_only=False``, full 3D alignment with the push axis is used.
     """
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
@@ -1600,14 +1705,26 @@ def gripper_wrist_carriage_push_axis_shaping(
         right,
     )
     if yaw_only:
-        wc_align = gripper_wrist_carriage_yaw_align_axis(
-            env,
-            left_finger_cfg,
-            right_finger_cfg,
-            wrist_body_cfg,
-            tip_offset_m,
-            push_axis_world,
-        )
+        if max_pitch_deg is not None:
+            wc_align = gripper_wrist_carriage_yaw_pitch_limited_align(
+                env,
+                left_finger_cfg,
+                right_finger_cfg,
+                wrist_body_cfg,
+                tip_offset_m,
+                push_axis_world,
+                max_pitch_deg,
+                pitch_soft_deg,
+            )
+        else:
+            wc_align = gripper_wrist_carriage_yaw_align_axis(
+                env,
+                left_finger_cfg,
+                right_finger_cfg,
+                wrist_body_cfg,
+                tip_offset_m,
+                push_axis_world,
+            )
     else:
         wc_align = gripper_wrist_carriage_align_axis(
             env,
@@ -2343,7 +2460,7 @@ def slide_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    target_lead_xy_env: tuple[float, float] = (0.056, 0.220),
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.190),
     tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
     min_episode_steps: int = 0,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
@@ -2447,7 +2564,7 @@ def slide_success_bonus_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     half_length_m: float,
-    target_lead_xy_env: tuple[float, float] = (0.056, 0.220),
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.190),
     tolerance_xy_m: tuple[float, float] = (0.003, 0.020),
     min_episode_steps: int = 0,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
@@ -3658,6 +3775,7 @@ def reset_from_grasp_states(
     max_buffer_tilt_penalty: float | None = None,
     rail_center_z_env: float | None = None,
     max_rail_z_delta_m: float | None = None,
+    apply_gripper_hold_on_reset: bool = True,
 ) -> None:
     """Reset **robot joints only** by sampling from the saved grasp terminal-state buffer.
 
@@ -3728,16 +3846,25 @@ def reset_from_grasp_states(
         )
     env._insert_reset_joint_pos[env_ids] = joint_pos_new.clone()
 
-    # Match PD target to the buffer pinch pose; tighten if looser than ``gripper_closed_target_m``.
-    hold_gripper_closed(
-        env,
-        env_ids,
-        asset_cfg,
-        joint_name=gripper_joint_name,
-        closed_target_m=gripper_closed_target_m,
-        match_sim_state=True,
-        store_target=True,
-    )
+    if apply_gripper_hold_on_reset:
+        # Match PD target to the buffer pinch pose; tighten if looser than ``gripper_closed_target_m``.
+        hold_gripper_closed(
+            env,
+            env_ids,
+            asset_cfg,
+            joint_name=gripper_joint_name,
+            closed_target_m=gripper_closed_target_m,
+            match_sim_state=True,
+            store_target=True,
+        )
+    else:
+        joint_ids, _ = robot.find_joints(gripper_joint_name)
+        if len(joint_ids) > 0:
+            jid = joint_ids[0]
+            grip_target = joint_pos_new[:, jid].unsqueeze(-1)
+            robot.set_joint_position_target(grip_target, joint_ids=[jid], env_ids=env_ids)
+            zeros = torch.zeros_like(grip_target)
+            robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=env_ids)
 
     # Legacy: snap path reads quat from here; buffer PCB reset uses the same buffer row.
     pcb_quat_buf = buf["pcb_quat"][idx].to(device=device, dtype=dtype)
