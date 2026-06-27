@@ -180,7 +180,6 @@ def collect(args):
             pp = (prev_pcb_pos_w[env_ids] - base_env.scene.env_origins[env_ids]).cpu().numpy().astype(np.float32)
             pq = prev_pcb_quat_w[env_ids].cpu().numpy().astype(np.float32)
 
-            # Defense in depth: drop rows with an open gripper (insert buffer must start pinched).
             lc_idx = (
                 list(joint_names).index("left_carriage_joint")
                 if "left_carriage_joint" in joint_names
@@ -190,7 +189,7 @@ def collect(args):
                 keep = jp[:, lc_idx] < float(cfg._GRASP_MAX_GRIPPER_GAP_M)
                 dropped = int(jp.shape[0] - int(keep.sum()))
                 if dropped:
-                    print(f"  [filter] dropped {dropped} slide_success rows with open gripper")
+                    print(f"  [filter] dropped {dropped} slide_success rows (open gripper)")
                 if not keep.any():
                     continue
                 jp = jp[keep]

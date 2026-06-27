@@ -32,7 +32,7 @@ See [Policy chaining (Grasp → Slide → Insert)](#policy-chaining-grasp--slide
 |------|------|
 | `__init__.py` | Registers grasp / slide / insert envs; rl-games log-std safety patch. |
 | `widowx_pcb_env_cfg.py` | Scene, per-phase rewards/events/terminations, magazine geometry. |
-| `usd_model/env_v3/` | URDF + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` |
+| `usd_model/env_v6/` | URDF + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` |
 | `mdp_custom.py` | Grasp/slide/insert MDP terms, terminal-state resets, `pcb_insertion_sdf_reward`. |
 | `scripts/collect_grasp_states.py` | Grasp → `data/grasp_terminal_states.npz` |
 | `scripts/collect_slide_states.py` | Slide → `data/slide_terminal_states.npz` |
@@ -435,10 +435,10 @@ Use `--clean-all` on those scripts to wipe the entire phase log folder (`summari
 
 ### Fixture pose vs USD
 
-The runtime fixture is `usd_model/usd_env/pcb_insertion_env.usd`, generated from **env_v3** (`assembly_2.urdf`):
+The runtime fixture is `usd_model/usd_env/pcb_insertion_env.usd`, generated from **env_v6** (`assembly_6.urdf`):
 
 ```bash
-cd usd_model/env_v3 && python3 convert_to_usd.py
+cd usd_model/env_v6 && python3 convert_to_usd.py
 ```
 
 Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with the loaded asset in world frame. If the **green PCB clips into the conveyor**, raise spawn Z (or `collision_props.contact_offset` / `rest_offset`) until the board sits on the belt top in the contact view.

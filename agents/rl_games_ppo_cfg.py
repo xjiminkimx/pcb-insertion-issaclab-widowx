@@ -201,7 +201,7 @@ WidowXPcbSlidePPOCfg = {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Insert (arm-only, 6 DoF): SDF-shaped slot insertion from slide terminal states.
+# Phase 3 — Insert (arm only, 6 DoF): slot insertion from slide terminal states.
 #
 # This is a *separate* tuned config (per user request).  The insert task differs
 # from grasp in important ways, so the hyper-parameters are tuned accordingly:
@@ -248,7 +248,7 @@ WidowXPcbInsertPPOCfg = {
             # Reduced from 3e-2 after early +Y discovery — less noisy detach-prone exploration.
             "entropy_coef": 1e-2,
             # Max epochs for insert training (scripts/train_insert.sh uses this unless --max_iterations).
-            "max_epochs": 200,
+            "max_epochs": 60,
             # ~2 s of control steps (256 × 8 ms) per rollout chunk vs 1 s at 128.
             "horizon_length": 256,
             "mini_epochs": 8,
