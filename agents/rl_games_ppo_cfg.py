@@ -128,42 +128,42 @@ WidowXPcbGraspPPOCfg = {
             "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
             "entropy_coef": 2e-2,
-            "max_epochs": 250,
+            "max_epochs": 60,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
 }
 
-WidowXPcbGraspGripperTestPPOCfg = {
-    **WidowXPcbPPOBaseCfg,
-    "params": {
-        **WidowXPcbPPOBaseCfg["params"],
-        "env": {
-            **WidowXPcbPPOBaseCfg["params"]["env"],
-            # Single gripper joint — smaller per-step deltas than full-arm grasp.
-            "clip_actions": 0.20,
-        },
-        "network": {
-            **WidowXPcbPPOBaseCfg["params"]["network"],
-            "space": {
-                **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
-                "continuous": {
-                    **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
-                    "sigma_init": {"name": "const_initializer", "val": -0.5},
-                },
-            },
-        },
-        "config": {
-            **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "widowx_pcb_grasp_gripper_test",
-            "full_experiment_name": ".",
-            "entropy_coef": 1e-2,
-            "max_epochs": 100,
-            "reward_shaper": {"scale_value": 0.2},
-            "horizon_length": 64,
-        },
-    },
-}
+# WidowXPcbGraspGripperTestPPOCfg = {
+#     **WidowXPcbPPOBaseCfg,
+#     "params": {
+#         **WidowXPcbPPOBaseCfg["params"],
+#         "env": {
+#             **WidowXPcbPPOBaseCfg["params"]["env"],
+#             # Single gripper joint — smaller per-step deltas than full-arm grasp.
+#             "clip_actions": 0.20,
+#         },
+#         "network": {
+#             **WidowXPcbPPOBaseCfg["params"]["network"],
+#             "space": {
+#                 **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
+#                 "continuous": {
+#                     **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
+#                     "sigma_init": {"name": "const_initializer", "val": -0.5},
+#                 },
+#             },
+#         },
+#         "config": {
+#             **WidowXPcbPPOBaseCfg["params"]["config"],
+#             "name": "widowx_pcb_grasp_gripper_test",
+#             "full_experiment_name": ".",
+#             "entropy_coef": 1e-2,
+#             "max_epochs": 400,
+#             "reward_shaper": {"scale_value": 0.2},
+#             "horizon_length": 64,
+#         },
+#     },
+# }
 
 # ---------------------------------------------------------------------------
 # Phase 2 — Slide (arm + gripper, 7 DoF): rail +Y push to slot mouth.
@@ -193,7 +193,7 @@ WidowXPcbSlidePPOCfg = {
             "reward_shaper": {"scale_value": 0.25},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 150,
+            "max_epochs": 200,
             "horizon_length": 256,
             "mini_epochs": 8,
         },
@@ -201,13 +201,13 @@ WidowXPcbSlidePPOCfg = {
 }
 
 # ---------------------------------------------------------------------------
-# Phase 3 — Insert (arm only, 6 DoF): slot insertion from slide terminal states.
+# Phase 3 — Insert (arm only, 6 DoF, force control): slot insertion from slide terminal states.
 #
 # This is a *separate* tuned config (per user request).  The insert task differs
 # from grasp in important ways, so the hyper-parameters are tuned accordingly:
 #
-#   * Action space is 6 arm joints only (gripper is held closed) → a lower-noise,
-#     more deterministic goal-reaching problem than the grasp phase.
+#   * Action space is 6 arm joints only (gripper held closed by PD, no action term).
+#     Force/torque control: policy outputs torques [N·m], arm stiffness=0.
 #   * Reward weights are O(1-200) (see RewardsInsertPhaseCfg) → ``reward_shaper``
 #     must be strong enough for credit assignment over ~370 mm travel, but below 1.0
 #     to keep value targets finite (NaN at 1.0 with dense penalties).
