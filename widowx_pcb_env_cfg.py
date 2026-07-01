@@ -1555,7 +1555,7 @@ class RewardsGraspPhaseCfg():
     premature_close = RewardTermCfg(
         func=premature_close_penalty,
         params=_grasp_premature_close_params(),
-        weight=-50.0,
+        weight=-10.0,
     )
     # Sparse success bonus for a completed, held pinch on the trailing edge centre.
     grasp_success_bonus = RewardTermCfg(

@@ -1122,7 +1122,6 @@ def grasp_edge_center_achieved(
     gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    **kwargs,
 ) -> torch.Tensor:
     """True when grasp reward terms indicate a valid trailing-edge pinch.
 
@@ -1200,7 +1199,6 @@ def grasp_success_bonus_reward(
     gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    **kwargs,
 ) -> torch.Tensor:
     """Bonus (1.0) on steps where grasp success matches the between-fingers + closing rewards."""
     achieved = grasp_edge_center_achieved(
@@ -3738,7 +3736,6 @@ def _grasp_not_yet_achieved(
     gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    **kwargs,
 ) -> torch.Tensor:
     """True while a valid edge-centre grasp has **not** been achieved."""
     return ~grasp_edge_center_achieved(
@@ -3792,7 +3789,6 @@ def pcb_tilt_before_grasp_termination(
     max_tilt_penalty: float = 0.01,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    **kwargs,
 ) -> torch.Tensor:
     """Terminate on excessive thickness-axis tilt (board not flat) **before** grasp success."""
     tilt_fail = pcb_tilt_beyond_limit(env, pcb_cfg, world_up=world_up, max_tilt_penalty=max_tilt_penalty)
@@ -3848,7 +3844,6 @@ def pcb_xy_plane_rotation_before_grasp_termination(
     min_xy_alignment: float = 0.97,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    **kwargs,
 ) -> torch.Tensor:
     """Terminate on excessive long-axis yaw in the XY plane **before** grasp success."""
     yaw_fail = pcb_long_axis_xy_rotation_exceeds(
