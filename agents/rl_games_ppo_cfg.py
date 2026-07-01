@@ -128,7 +128,7 @@ WidowXPcbGraspPPOCfg = {
             "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
             "entropy_coef": 2e-2,
-            "max_epochs": 100,
+            "max_epochs": 180,
             "reward_shaper": {"scale_value": 1.0},
         },
     },

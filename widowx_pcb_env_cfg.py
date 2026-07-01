@@ -429,27 +429,19 @@ _JAW_THICK_GATE_STD_M = 0.008
 # Far-field height gate on along rewards — along credit scales with midpoint Z vs PCB centre.
 _ALONG_HEIGHT_GATE_STD_M = 0.06
 
-# Grasp-success check kwargs reused by phase transition, bonus, and termination.
-# Thresholds are intentionally generous: the policy must achieve a real closed straddle
-# on the trailing edge, but sim contact/damping and PCB thickness limit how far the
-# carriage can physically close.
-#
-# ``max_gripper_gap_m``: grasp success when ``left_carriage_joint`` < PCB_Z * 0.7 (tight pinch).
-# ``width_frac``: each jaw Y-error < half_width * frac.  half_width = 38.75 mm.
-# ``gate_dist_m``: jaw-mid distance to trailing edge < this.
-# ``min_pinch_ready``: pinch_readiness score ≥ this.
+# Grasp-success thresholds — aligned with ``pcb_between_fingers`` + ``gripper_closing`` rewards.
+# ``min_between_quality`` / ``min_closing_reward``: same functions as dense rewards, compared at threshold.
+# ``max_gripper_gap_m``: hard pinch — ``left_carriage_joint`` must be below this.
+_GRASP_SUCCESS_MIN_BETWEEN_QUALITY = 0.50
+_GRASP_SUCCESS_MIN_CLOSING_REWARD = 0.75
+
+# Shared geometry kwargs for closing gate, straddle checks, and phase transitions.
+# ``gate_dist_m``: jaw-mid distance to trailing edge < this (closing gate).
 _GRASP_CHECK_KWARGS = {
     "max_gripper_gap_m": _GRASP_MAX_GRIPPER_GAP_M,
     "gate_dist_m": 0.050,
-    # Both jaw tips must be at least this far PAST the trailing short-edge face (along > 0).
     "min_along_m": 0.0005,
-    "width_frac": 0.40,
-    "min_pinch_ready": 0.30,
     "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-    "thickness_sigma_m": 0.01,
-    # Must be below PCB_Z: a closed pinch drives straddle_gap ≈ board thickness (~1 mm).
-    # 4 mm here made pinch_readiness zero exactly when the gripper closed → success never fired.
-    "min_finger_sep_m": _MIN_STRADDLE_SEP_M,
     "pcb_half_thickness_m": PCB_Z * 0.5,
     "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
 }
@@ -1075,22 +1067,33 @@ def _slide_success_params(**extra) -> dict:
     return base
 
 
-def _grasp_termination_params(**extra) -> dict:
-    """Entity + geometry kwargs shared by grasp-success and pre-grasp terminations."""
+def _grasp_success_params(**extra) -> dict:
+    """Kwargs for grasp success / bonus — same signals as ``pcb_between_fingers`` + ``gripper_closing``."""
     base = {
         "pcb_cfg": _PCB_ENT,
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
         "gripper_joint_cfg": _GRIPPER_JOINT,
         "half_length_m": _HALF_LENGTH_M,
-        "half_width_m": _PCB_HALF_WIDTH_M,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
+        "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
+        "min_between_quality": _GRASP_SUCCESS_MIN_BETWEEN_QUALITY,
+        "min_closing_reward": _GRASP_SUCCESS_MIN_CLOSING_REWARD,
+        # pcb_between_gripper_fingers (must match reward term)
+        "proximity_sigma_m": 0.040,
+        "width_sigma_m": 0.020,
+        "min_span_frac": 0.01,
+        "jaw_thick_gate_std_m": _JAW_THICK_GATE_STD_M,
         **_GRASP_CHECK_KWARGS,
         **_gripper_kinematics_kwargs(),
-        "push_axis_world": PUSH_AXIS_WORLD,
     }
     base.update(extra)
     return base
+
+
+def _grasp_termination_params(**extra) -> dict:
+    """Entity + geometry kwargs shared by grasp-success termination and bonus."""
+    return _grasp_success_params(**extra)
 
 
 @configclass

@@ -1106,75 +1106,74 @@ def grasp_edge_center_achieved(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    half_width_m: float,
     open_width_m: float,
-    max_gripper_gap_m: float = 0.00055,
-    gate_dist_m: float = 0.06,
-    along_margin_m: float | None = None,
-    min_along_m: float | None = None,
-    width_frac: float = 0.10,
-    min_pinch_ready: float = 0.55,
+    closed_target_m: float,
+    max_gripper_gap_m: float,
+    min_between_quality: float,
+    min_closing_reward: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
+    width_sigma_m: float = 0.010,
+    jaw_thick_gate_std_m: float | None = 0.003,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    **kwargs,
 ) -> torch.Tensor:
-    """True when the gripper has a valid closed pinch on the trailing short-edge centre.
+    """True when grasp reward terms indicate a valid trailing-edge pinch.
 
-    Closedness is ``left_carriage_joint < max_gripper_gap_m`` (typically ``PCB_Z * 1.1``).
-    Both jaw tips must be at least ``min_along_m`` past the trailing short-edge face so the
-    jaw pad faces overlap the PCB long surfaces (not just touch the 1 mm short edge).
+    Uses the same signals as the dense grasp rewards so termination / bonus align with training:
+    * ``pcb_between_gripper_fingers`` ≥ ``min_between_quality``
+    * ``gripper_closing_reward`` ≥ ``min_closing_reward``
+    * hard pinch: ``left_carriage_joint`` < ``max_gripper_gap_m``
     """
-    dist = gripper_mid_to_pcb_trailing_edge_distance(
+    between = pcb_between_gripper_fingers(
         env,
+        proximity_sigma_m,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        width_weight=width_weight,
         pcb_half_thickness_m=pcb_half_thickness_m,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        min_span_frac=min_span_frac,
+        width_sigma_m=width_sigma_m,
+        min_along_m=min_along_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+        width_weight=width_weight,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
     )
-    geom = _fingers_trailing_edge_geometry(
+    closing = gripper_closing_reward(
         env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        pcb_half_thickness_m,
-        width_weight,
-        tip_offset_m,
-        wrist_body_cfg,
+        gripper_joint_cfg,
+        open_width_m,
+        closed_target_m,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        half_length_m=half_length_m,
+        gate_dist_m=gate_dist_m,
+        min_along_m=min_along_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        width_weight=width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
     )
     robot = env.scene[gripper_joint_cfg.name]
     gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closed = _gripper_gap_below_threshold(gq, max_gripper_gap_m)
-    near = dist < float(gate_dist_m)
-    centered = (torch.abs(geom["width_l"]) < float(half_width_m) * float(width_frac)) & (
-        torch.abs(geom["width_r"]) < float(half_width_m) * float(width_frac)
+    pinched = _gripper_gap_below_threshold(gq, max_gripper_gap_m)
+    return (
+        (between >= float(min_between_quality))
+        & (closing >= float(min_closing_reward))
+        & pinched
     )
-    w_left, w_right = _finger_thickness_offsets(env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg)
-    # Opposite-sign check: one jaw above PCB center, one below.
-    opposite_sides = w_left * w_right < 0
-    # Separation check: jaw tips must span at least min_straddle_sep_m along the thickness axis.
-    separated = torch.abs(w_left - w_right) >= float(min_straddle_sep_m)
-    # Containment check: each jaw tip must be WITHIN the PCB thickness zone (±1.5× half-thickness).
-    # Without this, a gripper touching the PCB long face can appear "straddled" because one jaw is
-    # slightly above and one slightly below the PCB centre plane without physically straddling the board.
-    _ht = float(pcb_half_thickness_m)
-    jaw_contained = (
-        (torch.abs(w_left) <= _ht * _PINCH_READY_JAW_CONTAINED_MULT)
-        & (torch.abs(w_right) <= _ht * _PINCH_READY_JAW_CONTAINED_MULT)
-    )
-    straddled = opposite_sides & separated & jaw_contained
-    # Jaw tips must be past the trailing face (along > 0) so pads overlap PCB top/bottom faces.
-    along_min = float(min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0))
-    past_edge = (geom["along_l"] >= along_min) & (geom["along_r"] >= along_min)
-    return closed & near & centered & straddled & past_edge
 
 
 
@@ -1185,24 +1184,25 @@ def grasp_success_bonus_reward(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    half_width_m: float,
     open_width_m: float,
-    max_gripper_gap_m: float = 0.00055,
-    gate_dist_m: float = 0.06,
-    along_margin_m: float | None = None,
-    min_along_m: float | None = None,
-    width_frac: float = 0.10,
-    min_pinch_ready: float = 0.55,
+    closed_target_m: float,
+    max_gripper_gap_m: float,
+    min_between_quality: float,
+    min_closing_reward: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
+    width_sigma_m: float = 0.010,
+    jaw_thick_gate_std_m: float | None = 0.003,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    **kwargs,
 ) -> torch.Tensor:
-    """Bonus (1.0) on steps where a valid edge-centre grasp is achieved; for grasp-only training."""
+    """Bonus (1.0) on steps where grasp success matches the between-fingers + closing rewards."""
     achieved = grasp_edge_center_achieved(
         env,
         pcb_cfg,
@@ -1210,24 +1210,24 @@ def grasp_success_bonus_reward(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
-        half_width_m,
         open_width_m,
-        max_gripper_gap_m=max_gripper_gap_m,
-        gate_dist_m=gate_dist_m,
-        along_margin_m=along_margin_m,
-        min_along_m=min_along_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
+        closed_target_m,
+        max_gripper_gap_m,
+        min_between_quality,
+        min_closing_reward,
+        proximity_sigma_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
+        min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        push_axis_world=push_axis_world,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
+        width_weight=width_weight,
+        width_sigma_m=width_sigma_m,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
+        min_span_frac=min_span_frac,
+        gate_dist_m=gate_dist_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
-    bonus = achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
-    return bonus
+    return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 
 
 # Deprecated alias — kept for old env cfgs / checkpoints logging names.
@@ -3722,20 +3722,23 @@ def _grasp_not_yet_achieved(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    half_width_m: float,
     open_width_m: float,
-    max_gripper_gap_m: float = 0.00055,
-    gate_dist_m: float = 0.06,
-    width_frac: float = 0.10,
-    min_pinch_ready: float = 0.40,
+    closed_target_m: float,
+    max_gripper_gap_m: float,
+    min_between_quality: float,
+    min_closing_reward: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
+    width_sigma_m: float = 0.010,
+    jaw_thick_gate_std_m: float | None = 0.003,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    **kwargs,
 ) -> torch.Tensor:
     """True while a valid edge-centre grasp has **not** been achieved."""
     return ~grasp_edge_center_achieved(
@@ -3745,19 +3748,22 @@ def _grasp_not_yet_achieved(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
-        half_width_m,
         open_width_m,
-        max_gripper_gap_m=max_gripper_gap_m,
-        gate_dist_m=gate_dist_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
+        closed_target_m,
+        max_gripper_gap_m,
+        min_between_quality,
+        min_closing_reward,
+        proximity_sigma_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
+        min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        push_axis_world=push_axis_world,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
+        width_weight=width_weight,
+        width_sigma_m=width_sigma_m,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
+        min_span_frac=min_span_frac,
+        gate_dist_m=gate_dist_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
 
 
@@ -3768,22 +3774,25 @@ def pcb_tilt_before_grasp_termination(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    half_width_m: float,
     open_width_m: float,
-    max_gripper_gap_m: float = 0.00055,
-    gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
-    min_pinch_ready: float = 0.40,
+    closed_target_m: float,
+    max_gripper_gap_m: float,
+    min_between_quality: float,
+    min_closing_reward: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
+    width_sigma_m: float = 0.010,
+    jaw_thick_gate_std_m: float | None = 0.003,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
     world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
     max_tilt_penalty: float = 0.01,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    **kwargs,
 ) -> torch.Tensor:
     """Terminate on excessive thickness-axis tilt (board not flat) **before** grasp success."""
     tilt_fail = pcb_tilt_beyond_limit(env, pcb_cfg, world_up=world_up, max_tilt_penalty=max_tilt_penalty)
@@ -3794,19 +3803,22 @@ def pcb_tilt_before_grasp_termination(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
-        half_width_m,
         open_width_m,
-        max_gripper_gap_m=max_gripper_gap_m,
-        gate_dist_m=gate_dist_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
+        closed_target_m,
+        max_gripper_gap_m,
+        min_between_quality,
+        min_closing_reward,
+        proximity_sigma_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
+        min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        push_axis_world=push_axis_world,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
+        width_weight=width_weight,
+        width_sigma_m=width_sigma_m,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
+        min_span_frac=min_span_frac,
+        gate_dist_m=gate_dist_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     return tilt_fail & pre_grasp
 
@@ -3818,22 +3830,25 @@ def pcb_xy_plane_rotation_before_grasp_termination(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    half_width_m: float,
     open_width_m: float,
-    max_gripper_gap_m: float = 0.00055,
-    gate_dist_m: float = 0.06,
-    width_frac: float = 0.30,
-    min_pinch_ready: float = 0.40,
+    closed_target_m: float,
+    max_gripper_gap_m: float,
+    min_between_quality: float,
+    min_closing_reward: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
-    thickness_sigma_m: float = 0.006,
-    min_finger_sep_m: float = 0.006,
-    pcb_half_thickness_m: float = 0.00125,
-    min_straddle_sep_m: float = 0.0012,
+    width_sigma_m: float = 0.010,
+    jaw_thick_gate_std_m: float | None = 0.003,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     min_xy_alignment: float = 0.97,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    **kwargs,
 ) -> torch.Tensor:
     """Terminate on excessive long-axis yaw in the XY plane **before** grasp success."""
     yaw_fail = pcb_long_axis_xy_rotation_exceeds(
@@ -3846,19 +3861,22 @@ def pcb_xy_plane_rotation_before_grasp_termination(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
-        half_width_m,
         open_width_m,
-        max_gripper_gap_m=max_gripper_gap_m,
-        gate_dist_m=gate_dist_m,
-        width_frac=width_frac,
-        min_pinch_ready=min_pinch_ready,
-        width_weight=width_weight,
-        thickness_sigma_m=thickness_sigma_m,
-        min_finger_sep_m=min_finger_sep_m,
+        closed_target_m,
+        max_gripper_gap_m,
+        min_between_quality,
+        min_closing_reward,
+        proximity_sigma_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
+        min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        push_axis_world=push_axis_world,
-        **_gripper_tip_params(tip_offset_m, wrist_body_cfg),
+        width_weight=width_weight,
+        width_sigma_m=width_sigma_m,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
+        min_span_frac=min_span_frac,
+        gate_dist_m=gate_dist_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     return yaw_fail & pre_grasp
 
