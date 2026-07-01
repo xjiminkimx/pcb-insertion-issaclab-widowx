@@ -72,27 +72,29 @@ class RelativeJointPositionActionWithPosLimitsCfg(RelativeJointPositionActionCfg
 
 
 class JointEffortActionWithStraddleGate(joint_actions.JointEffortAction):
-    """Joint-effort action that blocks closing effort until open-jaw PCB straddle is achieved.
+    """Joint-effort action that blocks closing effort until ``pcb_between_gripper_fingers`` quality is met.
 
-    Uses ``pcb_open_straddle_gate_quality`` (opposite faces + past trailing edge, no
-    ``jaw_contained``).  When the gate opens, the gripper PD target tracks the current
-    joint position so the open spring does not fight closing effort.
+    Uses the same straddle-quality signal as the ``pcb_between_fingers`` reward term so the action
+    gate, closing reward, and dense shaping stay aligned.  When the gate opens, the gripper PD
+    target tracks the current joint position so the open spring does not fight closing effort.
     """
 
     cfg: "JointEffortActionWithStraddleGateCfg"
 
     def apply_actions(self) -> None:
         efforts = self.processed_actions
-        quality = pcb_open_straddle_gate_quality(
+        quality = pcb_between_gripper_fingers(
             self._env,
+            self.cfg.proximity_sigma_m,
             self.cfg.pcb_cfg,
             self.cfg.left_finger_cfg,
             self.cfg.right_finger_cfg,
             self.cfg.half_length_m,
-            self.cfg.pcb_half_thickness_m,
-            self.cfg.tip_offset_m,
-            self.cfg.wrist_body_cfg,
-            self.cfg.min_span_frac,
+            pcb_half_thickness_m=self.cfg.pcb_half_thickness_m,
+            tip_offset_m=self.cfg.tip_offset_m,
+            wrist_body_cfg=self.cfg.wrist_body_cfg,
+            min_span_frac=self.cfg.min_span_frac,
+            width_sigma_m=self.cfg.width_sigma_m,
             min_along_m=self.cfg.min_along_m,
             min_straddle_sep_m=self.cfg.min_straddle_sep_m,
             width_weight=self.cfg.width_weight,
@@ -1456,92 +1458,38 @@ def _grasp_closing_ready_gate(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
+    proximity_sigma_m: float,
     pcb_half_thickness_m: float,
     tip_offset_m: float,
     wrist_body_cfg: SceneEntityCfg | None,
     min_straddle_sep_m: float,
-    gate_dist_m: float | None = None,
-    min_along_m: float | None = None,
-    along_margin_m: float | None = None,
+    width_sigma_m: float,
     width_weight: float = 3.0,
-    midpoint_thick_gate_m: float | None = None,
     jaw_thick_gate_std_m: float | None = None,
+    min_along_m: float = 0.0,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
+    along_margin_m: float | None = None,
+    midpoint_thick_gate_m: float | None = None,
 ) -> torch.Tensor:
-    """Soft closing-ready gate: open straddle + trailing-edge alignment (no ``jaw_contained``)."""
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    """Soft closing-ready gate — same ``pcb_between_gripper_fingers`` quality as the reward term."""
+    return pcb_between_gripper_fingers(
+        env,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        min_span_frac=min_span_frac,
+        width_sigma_m=width_sigma_m,
+        min_along_m=min_along_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+        width_weight=width_weight,
+        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
     )
-    ready = _open_straddle_ready_mask(w_left, w_right, min_straddle_sep_m).to(w_left.dtype)
-    if half_length_m is not None and gate_dist_m is not None:
-        near_edge = _both_jaws_near_trailing_edge(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            gate_dist_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        ready = ready * near_edge.to(dtype=ready.dtype)
-    if half_length_m is not None and (along_margin_m is not None or min_along_m is not None):
-        geom = _fingers_trailing_edge_geometry(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        along_min = float(
-            min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0)
-        )
-        past_edge = (
-            (geom["along_l"] >= along_min)
-            & (geom["along_r"] >= along_min)
-        ).to(dtype=ready.dtype)
-        along_mid, _, _, _, _ = _gripper_mid_trailing_edge_errors(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-        )
-        mid_past_edge = (along_mid >= along_min).to(dtype=ready.dtype)
-        ready = ready * past_edge * mid_past_edge
-    if jaw_thick_gate_std_m is not None and half_length_m is not None:
-        geom_h = _fingers_trailing_edge_geometry(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        ready = ready * _jaw_trailing_height_factor(geom_h, jaw_thick_gate_std_m)
-    if midpoint_thick_gate_m is not None and half_length_m is not None:
-        _, _, thick_mid, _, _ = _gripper_mid_trailing_edge_errors(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-        )
-        mid_ok = (torch.abs(thick_mid) <= float(midpoint_thick_gate_m)).to(dtype=ready.dtype)
-        ready = ready * mid_ok
-    return ready
 
 
 def pcb_between_gripper_fingers(
@@ -1718,22 +1666,21 @@ def gripper_closing_reward(
     left_finger_cfg: SceneEntityCfg | None = None,
     right_finger_cfg: SceneEntityCfg | None = None,
     half_length_m: float | None = None,
-    gate_dist_m: float | None = None,
-    along_margin_m: float | None = None,
-    min_along_m: float | None = None,
+    proximity_sigma_m: float = 0.040,
     pcb_half_thickness_m: float = 0.00125,
     width_weight: float = 3.0,
+    width_sigma_m: float = 0.020,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_straddle_sep_m: float = 0.0005,
-    midpoint_thick_gate_m: float | None = 0.004,
     jaw_thick_gate_std_m: float | None = 0.003,
+    min_along_m: float = 0.0,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
+    along_margin_m: float | None = None,
+    midpoint_thick_gate_m: float | None = None,
 ) -> torch.Tensor:
-    """Closing reward gated on open straddle + trailing-edge alignment (when gate kwargs are set).
-
-    Without the trailing-edge gate the policy can straddle the board mid-span, close early,
-    and collect closing/hold dense reward without ever satisfying grasp success.
-    """
+    """Closing reward gated on ``pcb_between_gripper_fingers`` quality × closedness."""
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
     closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
@@ -1747,16 +1694,19 @@ def gripper_closing_reward(
         left_finger_cfg,
         right_finger_cfg,
         float(half_length_m) if half_length_m is not None else 0.0,
+        proximity_sigma_m,
         float(pcb_half_thickness_m),
         tip_offset_m,
         wrist_body_cfg,
         min_straddle_sep_m,
-        gate_dist_m,
-        min_along_m,
-        along_margin_m,
+        width_sigma_m,
         width_weight,
-        midpoint_thick_gate_m,
         jaw_thick_gate_std_m,
+        min_along_m,
+        min_span_frac,
+        gate_dist_m,
+        along_margin_m,
+        midpoint_thick_gate_m,
     )
     return gate * closedness
 
@@ -1829,18 +1779,21 @@ def premature_close_penalty(
     right_finger_cfg: SceneEntityCfg,
     closed_target_m: float = 0.00125,
     half_length_m: float | None = None,
-    gate_dist_m: float | None = None,
-    along_margin_m: float | None = None,
-    min_along_m: float | None = None,
+    proximity_sigma_m: float = 0.040,
     pcb_half_thickness_m: float = 0.00125,
     width_weight: float = 3.0,
+    width_sigma_m: float = 0.020,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_straddle_sep_m: float = 0.0005,
-    midpoint_thick_gate_m: float | None = 0.004,
     jaw_thick_gate_std_m: float | None = 0.003,
+    min_along_m: float = 0.0,
+    min_span_frac: float = 0.01,
+    gate_dist_m: float | None = None,
+    along_margin_m: float | None = None,
+    midpoint_thick_gate_m: float | None = None,
 ) -> torch.Tensor:
-    """Returns ``closedness`` when closing before open straddle + trailing-edge alignment, else 0."""
+    """Returns ``closedness`` when closing before ``pcb_between`` quality is sufficient, else 0."""
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
     closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
@@ -1850,16 +1803,19 @@ def premature_close_penalty(
         left_finger_cfg,
         right_finger_cfg,
         float(half_length_m) if half_length_m is not None else 0.0,
+        proximity_sigma_m,
         float(pcb_half_thickness_m),
         tip_offset_m,
         wrist_body_cfg,
         min_straddle_sep_m,
-        gate_dist_m,
-        min_along_m,
-        along_margin_m,
+        width_sigma_m,
         width_weight,
-        midpoint_thick_gate_m,
         jaw_thick_gate_std_m,
+        min_along_m,
+        min_span_frac,
+        gate_dist_m,
+        along_margin_m,
+        midpoint_thick_gate_m,
     )
     return (1.0 - ready) * closedness
 

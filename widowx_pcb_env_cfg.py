@@ -224,7 +224,7 @@ _SLIDE_WRIST_PITCH_SOFT_DEG = 18.0  # smooth falloff beyond max pitch
 # Gripper finger–PCB contact (multiply mode with PCB material in sim).
 _GRIPPER_FINGER_STATIC_FRICTION = 4.0
 _GRIPPER_FINGER_DYNAMIC_FRICTION = 3.2
-_GRIPPER_ACTUATOR_STIFFNESS = 50.0
+_GRIPPER_ACTUATOR_STIFFNESS = 25.0
 _GRIPPER_ACTUATOR_DAMPING = 50.0
 
 # Contact softening — lower depenetration / friction / stiff solver to reduce PCB bounce on rails.
@@ -346,7 +346,7 @@ _ARM_EFFORT_SCALE = {
     "joint_5":  2.0,   # end-effector tilt
 }
 # Gripper carriage: prismatic joint [N].  Grip-force headroom above PD hold.
-_GRIPPER_EFFORT_SCALE = 10.0
+_GRIPPER_EFFORT_SCALE = 20.0
 
 # Pre-mouth conveyor-rail approach: staged milestones at these fractions of start→mouth travel.
 _RAIL_APPROACH_TIER_FRACTIONS = (0.15, 0.30, 0.50)
@@ -434,13 +434,14 @@ _ALONG_HEIGHT_GATE_STD_M = 0.06
 # ``max_gripper_gap_m``: hard pinch — ``left_carriage_joint`` must be below this.
 _GRASP_SUCCESS_MIN_BETWEEN_QUALITY = 0.50
 _GRASP_SUCCESS_MIN_CLOSING_REWARD = 0.75
+# Action gate threshold — same signal as ``pcb_between_fingers``.
+_MIN_STRADDLE_GATE_QUALITY = 0.20
 
 # Shared geometry kwargs for closing gate, straddle checks, and phase transitions.
-# ``gate_dist_m``: jaw-mid distance to trailing edge < this (closing gate).
 _GRASP_CHECK_KWARGS = {
     "max_gripper_gap_m": _GRASP_MAX_GRIPPER_GAP_M,
-    "gate_dist_m": 0.050,
-    "min_along_m": 0.0005,
+    "gate_dist_m": 0.080,
+    "min_along_m": 0.0,
     "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
     "pcb_half_thickness_m": PCB_Z * 0.5,
     "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
@@ -492,6 +493,7 @@ def _grasp_between_fingers_params(**extra) -> dict:
         "proximity_sigma_m": 0.040,
         # Width-centring: 0.37 at 20 mm off, 0.78 at 5 mm off, 1.0 centred.
         "width_sigma_m": 0.020,
+        "min_span_frac": 0.01,
         "jaw_thick_gate_std_m": _JAW_THICK_GATE_STD_M,
         **_gripper_kinematics_kwargs(),
     }
@@ -500,21 +502,10 @@ def _grasp_between_fingers_params(**extra) -> dict:
 
 
 def _grasp_effort_straddle_gate_params(**extra) -> dict:
-    """Kwargs for hard action gate: block gripper closing until open straddle + past trailing face."""
+    """Kwargs for hard action gate — opens when ``pcb_between_gripper_fingers`` ≥ threshold."""
     base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "half_length_m": _HALF_LENGTH_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "min_straddle_quality": 0.35,
-        "min_along_m": _GRASP_CHECK_KWARGS["min_along_m"],
-        "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        "proximity_sigma_m": 0.040,
-        "width_sigma_m": 0.020,
-        "jaw_thick_gate_std_m": _JAW_THICK_GATE_STD_M,
-        **_gripper_kinematics_kwargs(),
+        **_grasp_between_fingers_params(),
+        "min_straddle_quality": _MIN_STRADDLE_GATE_QUALITY,
     }
     base.update(extra)
     return base
@@ -540,22 +531,13 @@ def _grasp_between_fingers_hold_params(**extra) -> dict:
 
 
 def _grasp_closing_params(**extra) -> dict:
-    """Kwargs for gripper_closing_reward — open straddle + trailing-edge gated closing signal."""
+    """Kwargs for gripper_closing_reward — ``pcb_between`` quality × closedness."""
     base = {
         "asset_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
         "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
         "half_length_m": _HALF_LENGTH_M,
-        "gate_dist_m": _GRASP_CHECK_KWARGS["gate_dist_m"],
-        "min_along_m": _GRASP_CHECK_KWARGS["min_along_m"],
-        "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
-        "jaw_thick_gate_std_m": _JAW_THICK_GATE_STD_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        **_gripper_kinematics_kwargs(),
+        **_grasp_between_fingers_params(),
     }
     base.update(extra)
     return base
@@ -719,17 +701,8 @@ def _grasp_premature_close_params(**extra) -> dict:
         "asset_cfg": _GRIPPER_JOINT,
         "open_width_m": _GRIPPER_OPEN_WIDTH_M,
         "closed_target_m": _GRIPPER_CLOSED_TARGET_M,
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
         "half_length_m": _HALF_LENGTH_M,
-        "gate_dist_m": _GRASP_CHECK_KWARGS["gate_dist_m"],
-        "min_along_m": _GRASP_CHECK_KWARGS["min_along_m"],
-        "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
-        "jaw_thick_gate_std_m": _JAW_THICK_GATE_STD_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        **_gripper_kinematics_kwargs(),
+        **_grasp_between_fingers_params(),
     }
     base.update(extra)
     return base
