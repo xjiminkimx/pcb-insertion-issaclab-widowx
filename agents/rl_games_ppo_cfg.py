@@ -75,8 +75,8 @@ WidowXPcbPPOBaseCfg = {
             "lr_schedule": "adaptive",
             "kl_threshold": 0.012,
             "score_to_win": 20000,
-            "max_epochs": 300,
-            "save_best_after": 30,
+            "max_epochs": 200,
+            "save_best_after": 20,
             "save_frequency": 15,
             "print_stats": True,
             
@@ -86,7 +86,7 @@ WidowXPcbPPOBaseCfg = {
             # At 2e-3 the policy was collapsing to a narrow grasp trajectory too early.
             # The adaptive LR will reduce the update magnitude when KL spikes, so a
             # higher entropy coef is safe — it just prevents premature convergence.
-            "entropy_coef": 5e-2,
+            "entropy_coef": 2e-2,
             "truncate_grads": True,
             "e_clip": 0.3,
             # Longer horizon gives the value function more context for delayed grasp/push rewards.
@@ -128,7 +128,7 @@ WidowXPcbGraspPPOCfg = {
             "full_experiment_name": ".",
             # Reward weights are now O(1-6) (see RewardsGraspPhaseCfg), so no down-scaling needed.
             "entropy_coef": 2e-2,
-            "max_epochs": 60,
+            "max_epochs": 100,
             "reward_shaper": {"scale_value": 1.0},
         },
     },

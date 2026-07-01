@@ -72,20 +72,19 @@ class RelativeJointPositionActionWithPosLimitsCfg(RelativeJointPositionActionCfg
 
 
 class JointEffortActionWithStraddleGate(joint_actions.JointEffortAction):
-    """Joint-effort action that blocks closing effort until PCB straddle quality is sufficient.
+    """Joint-effort action that blocks closing effort until open-jaw PCB straddle is achieved.
 
-    This enforces the intended grasp sequence:
-    1) approach/straddle the PCB faces first,
-    2) then allow positive carriage effort (closing).
+    Uses ``pcb_open_straddle_gate_quality`` (opposite faces + past trailing edge, no
+    ``jaw_contained``).  When the gate opens, the gripper PD target tracks the current
+    joint position so the open spring does not fight closing effort.
     """
 
     cfg: "JointEffortActionWithStraddleGateCfg"
 
     def apply_actions(self) -> None:
         efforts = self.processed_actions
-        quality = pcb_between_gripper_fingers(
+        quality = pcb_open_straddle_gate_quality(
             self._env,
-            self.cfg.proximity_sigma_m,
             self.cfg.pcb_cfg,
             self.cfg.left_finger_cfg,
             self.cfg.right_finger_cfg,
@@ -94,15 +93,25 @@ class JointEffortActionWithStraddleGate(joint_actions.JointEffortAction):
             self.cfg.tip_offset_m,
             self.cfg.wrist_body_cfg,
             self.cfg.min_span_frac,
-            self.cfg.width_sigma_m,
             min_along_m=self.cfg.min_along_m,
             min_straddle_sep_m=self.cfg.min_straddle_sep_m,
             width_weight=self.cfg.width_weight,
+            jaw_thick_gate_std_m=self.cfg.jaw_thick_gate_std_m,
         )
-        ready = (quality >= float(self.cfg.min_straddle_quality)).unsqueeze(-1)
+        ready = (quality >= float(self.cfg.min_straddle_quality)).squeeze(-1)
+        ready_exp = ready.unsqueeze(-1)
         # Positive effort closes left_carriage_joint; clamp it away until straddle is achieved.
-        gated_efforts = torch.where(ready, efforts, torch.minimum(efforts, torch.zeros_like(efforts)))
+        gated_efforts = torch.where(ready_exp, efforts, torch.minimum(efforts, torch.zeros_like(efforts)))
         self._asset.set_joint_effort_target(gated_efforts, joint_ids=self._joint_ids)
+        if ready.any():
+            ready_ids = torch.nonzero(ready, as_tuple=False).squeeze(-1)
+            if ready_ids.dim() == 0:
+                ready_ids = ready_ids.unsqueeze(0)
+            jid = int(self._joint_ids[0]) if not isinstance(self._joint_ids, int) else int(self._joint_ids)
+            q = self._asset.data.joint_pos[ready_ids, jid].unsqueeze(-1)
+            zeros = torch.zeros_like(q)
+            self._asset.set_joint_position_target(q, joint_ids=[jid], env_ids=ready_ids)
+            self._asset.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=ready_ids)
 
 
 @configclass
@@ -124,11 +133,18 @@ class JointEffortActionWithStraddleGateCfg(JointEffortActionCfg):
     pcb_half_thickness_m: float = 0.0005
     tip_offset_m: float = 0.0
     wrist_body_cfg: SceneEntityCfg | None = None
+    jaw_thick_gate_std_m: float | None = 0.003
 
 
 # ---------------------------------------------------------
 # Gripper kinematics — body origins vs pad tips (wxai carriage offset)
 # ---------------------------------------------------------
+# Pinch-ready containment: each jaw tip within this many × PCB half-thickness of centre.
+# Open-straddle gate / closing-ready omit this; grasp success keeps the strict multiplier.
+_JAW_CONTAINED_HALF_THICKNESS_MULT = 1.5
+_PINCH_READY_JAW_CONTAINED_MULT = _JAW_CONTAINED_HALF_THICKNESS_MULT
+
+
 def _resolve_first_body_id(robot: Articulation, body_cfg: SceneEntityCfg) -> int:
     """Return first body id from a SceneEntityCfg, resolving lazy/slice ids via names."""
     body_ids = body_cfg.body_ids
@@ -1150,7 +1166,10 @@ def grasp_edge_center_achieved(
     # Without this, a gripper touching the PCB long face can appear "straddled" because one jaw is
     # slightly above and one slightly below the PCB centre plane without physically straddling the board.
     _ht = float(pcb_half_thickness_m)
-    jaw_contained = (torch.abs(w_left) <= _ht * 1.5) & (torch.abs(w_right) <= _ht * 1.5)
+    jaw_contained = (
+        (torch.abs(w_left) <= _ht * _PINCH_READY_JAW_CONTAINED_MULT)
+        & (torch.abs(w_right) <= _ht * _PINCH_READY_JAW_CONTAINED_MULT)
+    )
     straddled = opposite_sides & separated & jaw_contained
     # Jaw tips must be past the trailing face (along > 0) so pads overlap PCB top/bottom faces.
     along_min = float(min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0))
@@ -1315,6 +1334,218 @@ def pcb_object_gripper_mid_distance(
     return 1.0 - torch.tanh(distance / (float(std) + 1e-9))
 
 
+def _open_straddle_ready_mask(
+    w_left: torch.Tensor,
+    w_right: torch.Tensor,
+    min_straddle_sep_m: float,
+) -> torch.Tensor:
+    """True when pad tips are on opposite PCB faces with minimum thickness-axis separation."""
+    straddle_gap = torch.abs(w_left - w_right)
+    separated = straddle_gap >= float(min_straddle_sep_m)
+    return (w_left * w_right < 0.0) & separated
+
+
+def _pcb_between_jaws_mask(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    min_span_frac: float,
+    min_straddle_sep_m: float,
+) -> torch.Tensor:
+    """True when the PCB centre lies inside the open jaw span along the thickness axis."""
+    pcb_pos = env.scene[pcb_cfg.name].data.root_pos_w
+    span = right - left
+    span_len_sq = torch.sum(span * span, dim=-1).clamp_min(1e-12)
+    span_len = torch.sqrt(span_len_sq)
+    span_frac = torch.sum((pcb_pos - left) * span, dim=-1) / span_len_sq
+    margin = float(min_span_frac)
+    return (
+        (span_len >= float(min_straddle_sep_m))
+        & (span_frac >= margin)
+        & (span_frac <= (1.0 - margin))
+    )
+
+
+def pcb_open_straddle_gate_quality(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float = 0.005,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    min_span_frac: float = 0.01,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.002,
+    width_weight: float = 3.0,
+    jaw_thick_gate_std_m: float | None = None,
+) -> torch.Tensor:
+    """Open-jaw straddle signal for the effort gate (no ``jaw_contained``).
+
+    Returns ``1.0`` when pad tips are on opposite PCB faces, the board centre lies
+    between the jaw span, and both tips are past the trailing short-edge face.
+    """
+    left, right = gripper_finger_tips_world(
+        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    geom = _fingers_trailing_edge_geometry(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        width_weight,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    w_left, w_right = _finger_thickness_offsets(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    z_open = _open_straddle_ready_mask(w_left, w_right, min_straddle_sep_m)
+    along_min = float(min_along_m)
+    jaws_past_edge = (geom["along_l"] >= along_min) & (geom["along_r"] >= along_min)
+    between_jaws = _pcb_between_jaws_mask(
+        env, pcb_cfg, left, right, min_span_frac, min_straddle_sep_m
+    )
+    ready = z_open & jaws_past_edge & between_jaws
+    quality = ready.to(left.dtype)
+    if jaw_thick_gate_std_m is not None:
+        quality = quality * _jaw_trailing_height_factor(geom, jaw_thick_gate_std_m)
+    return quality
+
+
+def _midpoint_trailing_edge_soft_gate(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    std_m: float,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Soft gate ≈1 when the gripper midpoint is within ``std_m`` of the trailing-edge face centre."""
+    _, _, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    sig = float(std_m) + 1e-9
+    return 1.0 - torch.tanh(edge_dist / sig)
+
+
+def _jaw_trailing_height_factor(
+    geom: dict[str, torch.Tensor],
+    std_m: float,
+) -> torch.Tensor:
+    """Per-jaw thickness-axis alignment to trailing-edge ±half-thickness targets (0–1)."""
+    sig = float(std_m) + 1e-9
+    left_h = 1.0 - torch.tanh(torch.abs(geom["thick_l"]) / sig)
+    right_h = 1.0 - torch.tanh(torch.abs(geom["thick_r"]) / sig)
+    return torch.minimum(left_h, right_h)
+
+
+def _grasp_closing_ready_gate(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float,
+    tip_offset_m: float,
+    wrist_body_cfg: SceneEntityCfg | None,
+    min_straddle_sep_m: float,
+    gate_dist_m: float | None = None,
+    min_along_m: float | None = None,
+    along_margin_m: float | None = None,
+    width_weight: float = 3.0,
+    midpoint_thick_gate_m: float | None = None,
+    jaw_thick_gate_std_m: float | None = None,
+) -> torch.Tensor:
+    """Soft closing-ready gate: open straddle + trailing-edge alignment (no ``jaw_contained``)."""
+    w_left, w_right = _finger_thickness_offsets(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    )
+    ready = _open_straddle_ready_mask(w_left, w_right, min_straddle_sep_m).to(w_left.dtype)
+    if half_length_m is not None and gate_dist_m is not None:
+        near_edge = _both_jaws_near_trailing_edge(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            gate_dist_m,
+            pcb_half_thickness_m,
+            width_weight,
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        ready = ready * near_edge.to(dtype=ready.dtype)
+    if half_length_m is not None and (along_margin_m is not None or min_along_m is not None):
+        geom = _fingers_trailing_edge_geometry(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            pcb_half_thickness_m,
+            width_weight,
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        along_min = float(
+            min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0)
+        )
+        past_edge = (
+            (geom["along_l"] >= along_min)
+            & (geom["along_r"] >= along_min)
+        ).to(dtype=ready.dtype)
+        along_mid, _, _, _, _ = _gripper_mid_trailing_edge_errors(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+        )
+        mid_past_edge = (along_mid >= along_min).to(dtype=ready.dtype)
+        ready = ready * past_edge * mid_past_edge
+    if jaw_thick_gate_std_m is not None and half_length_m is not None:
+        geom_h = _fingers_trailing_edge_geometry(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            pcb_half_thickness_m,
+            width_weight,
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        ready = ready * _jaw_trailing_height_factor(geom_h, jaw_thick_gate_std_m)
+    if midpoint_thick_gate_m is not None and half_length_m is not None:
+        _, _, thick_mid, _, _ = _gripper_mid_trailing_edge_errors(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+        )
+        mid_ok = (torch.abs(thick_mid) <= float(midpoint_thick_gate_m)).to(dtype=ready.dtype)
+        ready = ready * mid_ok
+    return ready
+
+
 def pcb_between_gripper_fingers(
     env: ManagerBasedRLEnv,
     proximity_sigma_m: float,
@@ -1330,6 +1561,7 @@ def pcb_between_gripper_fingers(
     min_along_m: float = 0.0,
     min_straddle_sep_m: float = 0.0005,
     width_weight: float = 3.0,
+    jaw_thick_gate_std_m: float | None = 0.003,
 ) -> torch.Tensor:
     """Straddle-quality reward: how well the PCB is positioned between the jaws (position only).
 
@@ -1337,18 +1569,15 @@ def pcb_between_gripper_fingers(
     the separate ``gripper_closing_reward`` term so the closing gradient is not diluted or
     suppressed by these position factors):
 
-    1. ``is_graspable``  — hard gate matching grasp success straddle logic:
-                           opposite Z faces, minimum jaw separation, tips within PCB thickness,
+    1. ``is_graspable``  — hard gate: opposite thickness-axis faces, minimum jaw separation,
                            **both** pad tips past the trailing short-edge face (``along >= min_along_m``).
-                           Z-only straddle in front of the trailing face does not count.
+                           No ``jaw_contained`` here (open straddle); pinch containment is checked at success.
     2. ``between_jaws``  — hard gate: PCB centre within jaw-span projection **and** jaw span
                            wide enough to physically contain the board (not closed in empty air).
     3. ``prox``          — ``exp(-max(dist_l, dist_r)/σ)`` — both jaws near trailing-edge
                            targets (one-sided along). σ=proximity_sigma_m spans the approach.
     4. ``width_centre``  — ``exp(-|mean_Y_err|/σ_w)`` — jaws centred along the PCB short edge.
     """
-    pcb = env.scene[pcb_cfg.name]
-    pcb_pos = pcb.data.root_pos_w
     left, right = gripper_finger_tips_world(
         env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
@@ -1360,30 +1589,25 @@ def pcb_between_gripper_fingers(
         tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg,
     )
 
-    # Factor 1: full straddle + both jaws past trailing face (along / push axis).
+    # Factor 1: open straddle + both jaws past trailing face (pinch containment checked at success).
     w_left, w_right = _finger_thickness_offsets(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
     )
-    _ht = float(pcb_half_thickness_m)
-    jaw_contained = (torch.abs(w_left) <= _ht * 1.5) & (torch.abs(w_right) <= _ht * 1.5)
     straddle_gap = torch.abs(w_left - w_right)
     separated = straddle_gap >= float(min_straddle_sep_m)
-    z_straddled = (w_left * w_right < 0.0) & separated & jaw_contained
+    z_straddled = (w_left * w_right < 0.0) & separated
     along_min = float(min_along_m)
     jaws_past_edge = (geom["along_l"] >= along_min) & (geom["along_r"] >= along_min)
-    is_graspable = (z_straddled & jaws_past_edge).to(left.dtype)
+    height_factor = (
+        _jaw_trailing_height_factor(geom, jaw_thick_gate_std_m)
+        if jaw_thick_gate_std_m is not None
+        else torch.ones_like(left[:, 0])
+    )
+    is_graspable = (z_straddled & jaws_past_edge).to(left.dtype) * height_factor
 
     # Factor 2: PCB centre in jaw span along thickness — requires open span, not closed-in-air.
-    span = right - left
-    span_len_sq = torch.sum(span * span, dim=-1).clamp_min(1e-12)
-    span_len = torch.sqrt(span_len_sq)
-    span_frac = torch.sum((pcb_pos - left) * span, dim=-1) / span_len_sq
-    margin = float(min_span_frac)
-    span_wide_enough = span_len >= float(min_straddle_sep_m)
-    between_jaws = (
-        span_wide_enough
-        & (span_frac >= margin)
-        & (span_frac <= (1.0 - margin))
+    between_jaws = _pcb_between_jaws_mask(
+        env, pcb_cfg, left, right, min_span_frac, min_straddle_sep_m
     ).to(left.dtype)
 
     # Factor 3: per-finger proximity to trailing-edge ±half-thickness targets (real board faces).
@@ -1503,8 +1727,11 @@ def gripper_closing_reward(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    min_straddle_sep_m: float = 0.0005,
+    midpoint_thick_gate_m: float | None = 0.004,
+    jaw_thick_gate_std_m: float | None = 0.003,
 ) -> torch.Tensor:
-    """Closing reward gated on straddle **and** trailing-edge proximity (when gate kwargs are set).
+    """Closing reward gated on open straddle + trailing-edge alignment (when gate kwargs are set).
 
     Without the trailing-edge gate the policy can straddle the board mid-span, close early,
     and collect closing/hold dense reward without ever satisfying grasp success.
@@ -1516,60 +1743,23 @@ def gripper_closing_reward(
     if pcb_cfg is None or left_finger_cfg is None or right_finger_cfg is None:
         return closedness
 
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    gate = _grasp_closing_ready_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        float(half_length_m) if half_length_m is not None else 0.0,
+        float(pcb_half_thickness_m),
+        tip_offset_m,
+        wrist_body_cfg,
+        min_straddle_sep_m,
+        gate_dist_m,
+        min_along_m,
+        along_margin_m,
+        width_weight,
+        midpoint_thick_gate_m,
+        jaw_thick_gate_std_m,
     )
-    # Containment check: jaw tips must be within the PCB thickness zone to count as straddled.
-    # Without this, touching the PCB long face (one jaw above / one below PCB centre) triggers
-    # is_straddled even though the PCB is not physically between the jaws.
-    _ht = float(pcb_half_thickness_m)
-    jaw_contained = (torch.abs(w_left) <= _ht * 1.5) & (torch.abs(w_right) <= _ht * 1.5)
-    is_straddled = ((w_left * w_right < 0.0) & jaw_contained).to(closedness.dtype)
-    gate = is_straddled
-    if half_length_m is not None and gate_dist_m is not None:
-        near_edge = _both_jaws_near_trailing_edge(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            gate_dist_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        gate = is_straddled * near_edge.to(dtype=closedness.dtype)
-    if half_length_m is not None and (along_margin_m is not None or min_along_m is not None):
-        geom = _fingers_trailing_edge_geometry(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        along_min = float(
-            min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0)
-        )
-        past_edge = (
-            (geom["along_l"] >= along_min)
-            & (geom["along_r"] >= along_min)
-        ).to(dtype=closedness.dtype)
-        along_mid, _, _, _, _ = _gripper_mid_trailing_edge_errors(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-        )
-        mid_past_edge = (along_mid >= along_min).to(dtype=closedness.dtype)
-        gate = gate * past_edge * mid_past_edge
     return gate * closedness
 
 
@@ -1648,68 +1838,31 @@ def premature_close_penalty(
     width_weight: float = 3.0,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    min_straddle_sep_m: float = 0.0005,
+    midpoint_thick_gate_m: float | None = 0.004,
+    jaw_thick_gate_std_m: float | None = 0.003,
 ) -> torch.Tensor:
-    """Returns ``closedness`` when closing before straddle + trailing-edge alignment, else 0.
-
-    Penalty value: ``(1 - ready) × closedness`` where ``ready`` is straddled and (optionally)
-    both jaws near the trailing short-edge targets.
-    """
+    """Returns ``closedness`` when closing before open straddle + trailing-edge alignment, else 0."""
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
     closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    ready = _grasp_closing_ready_gate(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        float(half_length_m) if half_length_m is not None else 0.0,
+        float(pcb_half_thickness_m),
+        tip_offset_m,
+        wrist_body_cfg,
+        min_straddle_sep_m,
+        gate_dist_m,
+        min_along_m,
+        along_margin_m,
+        width_weight,
+        midpoint_thick_gate_m,
+        jaw_thick_gate_std_m,
     )
-    # Containment check mirrors gripper_closing_reward: only count as straddled when jaw tips
-    # are physically within the PCB thickness zone (prevents false "ready" on PCB long-face contact).
-    _ht = float(pcb_half_thickness_m)
-    jaw_contained = (torch.abs(w_left) <= _ht * 1.5) & (torch.abs(w_right) <= _ht * 1.5)
-    is_straddled = ((w_left * w_right < 0.0) & jaw_contained).to(closedness.dtype)
-    ready = is_straddled
-    if half_length_m is not None and gate_dist_m is not None:
-        near_edge = _both_jaws_near_trailing_edge(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            gate_dist_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        ready = is_straddled * near_edge.to(dtype=closedness.dtype)
-    if half_length_m is not None and (along_margin_m is not None or min_along_m is not None):
-        geom = _fingers_trailing_edge_geometry(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        along_min = float(
-            min_along_m if min_along_m is not None else (along_margin_m if along_margin_m is not None else 0.0)
-        )
-        past_edge = (
-            (geom["along_l"] >= along_min)
-            & (geom["along_r"] >= along_min)
-        ).to(dtype=closedness.dtype)
-        along_mid, _, _, _, _ = _gripper_mid_trailing_edge_errors(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-        )
-        mid_past_edge = (along_mid >= along_min).to(dtype=closedness.dtype)
-        ready = ready * past_edge * mid_past_edge
     return (1.0 - ready) * closedness
 
 
@@ -1897,6 +2050,7 @@ def jaw_along_approach_reward(
     pcb_half_thickness_m: float = 0.0005,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    height_gate_std_m: float | None = None,
 ) -> torch.Tensor:
     """Reward for jaw tips advancing along the PCB long axis to reach the trailing edge.
 
@@ -1930,7 +2084,36 @@ def jaw_along_approach_reward(
     right_err = torch.clamp(-geom["along_r"], min=0.0)
     left_rew = 1.0 - torch.tanh(left_err / sig)
     right_rew = 1.0 - torch.tanh(right_err / sig)
-    return torch.minimum(left_rew, right_rew)
+    along_rew = torch.minimum(left_rew, right_rew)
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        along_rew = along_rew * height_gate
+    return along_rew
+
+
+def _jaw_along_deep_single_reward(
+    along: torch.Tensor,
+    target: float,
+    approach_std_m: float,
+    overshoot_std_m: float,
+) -> torch.Tensor:
+    """Bell-ish along reward: rises toward ``target``, peaks there, decays when past (overshoot)."""
+    app_sig = float(approach_std_m) + 1e-9
+    over_sig = float(overshoot_std_m) + 1e-9
+    behind_err = torch.clamp(float(target) - along, min=0.0)
+    approach_rew = 1.0 - torch.tanh(behind_err / app_sig)
+    overshoot_err = torch.clamp(along - float(target), min=0.0)
+    overshoot_factor = 1.0 - torch.tanh(overshoot_err / over_sig)
+    return approach_rew * overshoot_factor
 
 
 def jaw_along_deep_approach_reward(
@@ -1944,21 +2127,14 @@ def jaw_along_deep_approach_reward(
     pcb_half_thickness_m: float = 0.0005,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    overshoot_std_m: float = 0.005,
+    height_gate_std_m: float | None = None,
 ) -> torch.Tensor:
-    """One-sided reward: max when jaw tips have advanced ``target_along_m`` past the trailing edge.
+    """Deep along reward: peak at ``target_along_m`` past the trailing face, decay beyond (overshoot).
 
-    ``along > 0`` means the jaw tip is past the trailing short-edge face along the PCB body
-    long axis.  When the jaws are open wider than the PCB thickness (straddling), the jaw tips
-    can physically advance past the short-edge face into the PCB body region without collision,
-    enabling a 'deep grip' at ``target_along_m`` from the edge for higher grasping stability.
-
-    Specifically, ``target_along_m = 0.010`` (10 mm) means each jaw tip should be positioned
-    10 mm inside the PCB from the trailing short-edge face.  The reward is 0 when the jaw is
-    far behind the face, rises steeply within ``std`` metres of ``target_along_m``, and reaches
-    1.0 when the jaw tip is at or past the target — both jaws must reach the target (min).
-
-    ``std = 0.005`` (5 mm): gradient is meaningful from ~15 mm away from the target.
-    Complements ``jaw_along_approach_reward`` (large std, far-field) with close-field precision.
+    Before the target the reward rises one-sided (same as legacy deep approach).  Past the target
+    an overshoot factor ``1 - tanh((along - target) / overshoot_std_m)`` decays credit so the
+    policy does not keep driving into the PCB after straddle.  Both jaws must satisfy (min).
     """
     geom = _fingers_trailing_edge_geometry(
         env,
@@ -1972,11 +2148,22 @@ def jaw_along_deep_approach_reward(
         wrist_body_cfg,
     )
     target = float(target_along_m)
-    sig = float(std) + 1e-9
-    # One-sided: penalize not yet reaching target; zero error when at/past target.
-    left_err = torch.clamp(target - geom["along_l"], min=0.0)
-    right_err = torch.clamp(target - geom["along_r"], min=0.0)
-    return torch.minimum(1.0 - torch.tanh(left_err / sig), 1.0 - torch.tanh(right_err / sig))
+    left_rew = _jaw_along_deep_single_reward(geom["along_l"], target, std, overshoot_std_m)
+    right_rew = _jaw_along_deep_single_reward(geom["along_r"], target, std, overshoot_std_m)
+    deep_rew = torch.minimum(left_rew, right_rew)
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        deep_rew = deep_rew * height_gate
+    return deep_rew
 
 
 def gripper_midpoint_along_approach_reward(
@@ -1988,6 +2175,7 @@ def gripper_midpoint_along_approach_reward(
     std: float,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    height_gate_std_m: float | None = None,
 ) -> torch.Tensor:
     """Reward for the gripper midpoint advancing along the PCB long axis to the trailing edge.
 
@@ -2006,7 +2194,20 @@ def gripper_midpoint_along_approach_reward(
     )
     sig = float(std) + 1e-9
     err = torch.clamp(-along, min=0.0)
-    return 1.0 - torch.tanh(err / sig)
+    along_rew = 1.0 - torch.tanh(err / sig)
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            tip_offset_m,
+            wrist_body_cfg,
+        )
+        along_rew = along_rew * height_gate
+    return along_rew
 
 
 def close_behind_trailing_edge_penalty(
