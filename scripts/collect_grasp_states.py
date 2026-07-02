@@ -4,10 +4,9 @@
 Usage (from workspace root)::
 
     python scripts/collect_grasp_states.py \\
-        --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth \\
-        --num_envs 256 \\
-        --num_states 2000 \\
-        --out data/grasp_terminal_states.npz
+        --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth
+
+    # Defaults: num_envs=4096, num_states=500, headless (use --gui for viewport).
 
 The script rolls out the policy, detects episodes terminated by ``grasp_success``,
 and saves the robot joint positions + PCB root pose (position + quaternion) of
@@ -44,18 +43,48 @@ if _ISAACLAB_ROOT not in sys.path:
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
+_DEFAULT_CKPT_DIR = os.path.join(_WORKSPACE, "logs", "rl_games", "widowx_pcb_grasp", "nn")
+_DEFAULT_CKPT_NAME = "widowx_pcb_grasp.pth"
+
+
+def _resolve_default_checkpoint() -> str:
+    """Pick best grasp checkpoint from workspace logs (same logic as play_grasp.sh)."""
+    default = os.path.join(_DEFAULT_CKPT_DIR, _DEFAULT_CKPT_NAME)
+    if os.path.isfile(default):
+        return default
+    import glob
+
+    last_ckpts = glob.glob(os.path.join(_DEFAULT_CKPT_DIR, "last_*.pth"))
+    if last_ckpts:
+        return max(last_ckpts, key=os.path.getmtime)
+    raise FileNotFoundError(
+        f"No grasp checkpoint found in {_DEFAULT_CKPT_DIR}.\n"
+        "Train first (bash scripts/train_grasp.sh) or pass --checkpoint <path>.pth"
+    )
+
+
 parser = argparse.ArgumentParser(description="Collect grasp terminal states.")
-parser.add_argument("--checkpoint", required=True, help="Path to trained .pth checkpoint.")
-parser.add_argument("--num_envs", type=int, default=256, help="Number of parallel environments.")
-parser.add_argument("--num_states", type=int, default=2000, help="Target number of states to collect.")
+parser.add_argument(
+    "--checkpoint",
+    default=None,
+    help=(
+        "Path to trained .pth checkpoint. "
+        f"Default: {_DEFAULT_CKPT_DIR}/{_DEFAULT_CKPT_NAME} or latest last_*.pth."
+    ),
+)
+parser.add_argument("--num_envs", type=int, default=4096, help="Number of parallel environments.")
+parser.add_argument("--num_states", type=int, default=500, help="Target number of states to collect.")
 parser.add_argument("--out", default=os.path.join(_WORKSPACE, "data", "grasp_terminal_states.npz"),
                     help="Output .npz path.")
 parser.add_argument("--max_steps", type=int, default=20_000,
                     help="Safety cap: stop after this many env steps regardless of num_states.")
+parser.add_argument("--gui", action="store_true", help="Show Isaac Sim viewport (default: headless).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
-if not hasattr(args, "headless") or args.headless is None:
+# AppLauncher registers --headless as store_true (default False), so "headless when omitted"
+# must be applied explicitly; checking `args.headless is None` never triggers.
+if not args.gui:
     args.headless = True
 
 app_launcher = AppLauncher(args)
@@ -154,8 +183,10 @@ def _build_env_and_player(checkpoint_path: str, num_envs: int):
 def collect(args):
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
 
-    print(f"[INFO] Loading checkpoint: {args.checkpoint}")
-    env, player = _build_env_and_player(args.checkpoint, args.num_envs)
+    checkpoint = args.checkpoint or _resolve_default_checkpoint()
+    print(f"[INFO] Loading checkpoint: {checkpoint}")
+    print(f"[INFO] num_envs={args.num_envs}, num_states={args.num_states}, headless={args.headless}")
+    env, player = _build_env_and_player(checkpoint, args.num_envs)
 
     robot = env.unwrapped.scene["robot"]
     pcb = env.unwrapped.scene["pcb"]

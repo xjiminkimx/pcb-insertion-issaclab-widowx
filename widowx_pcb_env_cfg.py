@@ -1583,9 +1583,6 @@ class ObservationsCfgInsert:
 class RewardsGraspPhaseCfg():
     """Grasp phase reward stack — simplified for clean one-jaw-above/one-jaw-below straddle.
 
-    Home pose: joint_4=1.50 rad (wrist roll) so carriage opens/closes vertically through the
-    PCB thickness (1 mm).  Rewards guide a three-step sequence:
-
     1. APPROACH  — ``finger_proximity`` (20) + ``jaw_along_approach`` (50) +
                    ``jaw_along_deep`` (30) + ``midpoint_along_approach`` (45): pull both jaws
                    toward the trailing edge and then 10 mm PAST it so the jaw pad face overlaps
@@ -1724,7 +1721,12 @@ class RewardsGraspPhaseCfg():
 
 @configclass
 class RewardsSlidePhaseCfg:
-    """Phase 2 slide rewards: +Y progress + milestones aligned with mouth success."""
+    """Phase 2 slide rewards: +Y progress + milestones aligned with mouth success.
+
+    Arm-only joint-effort control (6 DoF); gripper is PD-held closed (no action term).
+    ``gripper_closing`` uses the same PD-hold hold signal as Insert, not ``gripper_closing_reward``
+    (which assumed a controllable gripper delta in the old 7-DoF slide stack).
+    """
 
     pcb_between_fingers_hold = RewardTermCfg(
         func=pcb_between_gripper_fingers_hold_reward,
@@ -1766,9 +1768,11 @@ class RewardsSlidePhaseCfg:
         params=_slide_mouth_gated_closing_params(),
         weight=20.0,
     )
+    # PD-held gripper: reward closedness only while gap stays below success threshold (arm torques
+    # maintain pinch under rail contact — same pattern as Insert ``insert_gripper_closing``).
     gripper_closing = RewardTermCfg(
-        func=gripper_closing_reward,
-        params=_slide_gripper_closing_params(),
+        func=insert_gripper_closing_step_reward,
+        params={**_slide_gripper_closing_params(), "max_gripper_gap_m": _SLIDE_MAX_GRIPPER_GAP_M},
         weight=20.0,
     )
     # Jaw rail vertical (⊥ XY) — keeps thickness pinch from scraping conveyor / guide rails.

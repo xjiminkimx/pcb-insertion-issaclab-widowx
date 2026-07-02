@@ -39,10 +39,11 @@ parser.add_argument(
     help="Output .npz path.",
 )
 parser.add_argument("--max_steps", type=int, default=30_000, help="Safety cap on total env steps.")
+parser.add_argument("--gui", action="store_true", help="Show Isaac Sim viewport (default: headless).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
-if not hasattr(args, "headless") or args.headless is None:
+if not args.gui:
     args.headless = True
 
 app_launcher = AppLauncher(args)

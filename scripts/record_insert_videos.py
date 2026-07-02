@@ -63,8 +63,7 @@ AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
 args.enable_cameras = True
-if not hasattr(args, "headless") or args.headless is None:
-    args.headless = True
+args.headless = True
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
