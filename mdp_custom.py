@@ -98,16 +98,42 @@ def _left_carriage_half_gap_m(robot: Articulation, gripper_joint_cfg: SceneEntit
     return gq * (_GRIPPER_CARRIAGE_JOINT_SPAN_SCALE * 0.5)
 
 
+def _gripper_tip_offset_direction_w(
+    robot: Articulation,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    wrist_body_cfg: SceneEntityCfg | None,
+) -> torch.Tensor:
+    """Unit vector from wrist toward jaw bodies (distal pad-tip direction)."""
+    mid = 0.5 * (left + right)
+    if wrist_body_cfg is not None:
+        wrist_id = _resolve_first_body_id(robot, wrist_body_cfg)
+        wrist = robot.data.body_pos_w[:, wrist_id]
+        d = mid - wrist
+    else:
+        span = right - left
+        u = span / torch.norm(span, dim=-1, keepdim=True).clamp_min(1e-6)
+        z_up = torch.tensor([0.0, 0.0, 1.0], device=mid.device, dtype=mid.dtype).unsqueeze(0).expand_as(mid)
+        d = torch.cross(u, z_up, dim=-1)
+        x_pref = torch.tensor([1.0, 0.0, 0.0], device=mid.device, dtype=mid.dtype).unsqueeze(0).expand_as(mid)
+        flip = (torch.sum(d * x_pref, dim=-1, keepdim=True) < 0.0).to(dtype=d.dtype)
+        d = torch.where(flip, -d, d)
+    return d / torch.norm(d, dim=-1, keepdim=True).clamp_min(1e-6)
+
+
 def gripper_jaw_pad_tips_world(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """World positions of left/right pad tips from carriage joint + jaw axis.
+    """World positions of left/right **contact pad tips** (not finger-body origins).
 
-    ``gripper_left`` / ``gripper_right`` body origins stay ~fixed apart on the housing;
-    physical span ≈ ``left_carriage_joint × _GRIPPER_CARRIAGE_JOINT_SPAN_SCALE`` about mid.
+    Lateral: carriage span about the jaw midpoint (``left_carriage_joint × scale``).
+    Distal: each pad tip is offset from the jaw-axis pad centre toward the PCB by
+    ``tip_offset_m`` along wrist→jaw (body origin sits proximal to the actual contact point).
     """
     robot = env.scene[left_finger_cfg.name]
     left_id = _resolve_first_body_id(robot, left_finger_cfg)
@@ -120,6 +146,11 @@ def gripper_jaw_pad_tips_world(
     half_gap = _left_carriage_half_gap_m(robot, gripper_joint_cfg)
     left = mid - u * half_gap.unsqueeze(-1)
     right = mid + u * half_gap.unsqueeze(-1)
+    if float(tip_offset_m) > 0.0:
+        fwd = _gripper_tip_offset_direction_w(robot, left_h, right_h, wrist_body_cfg)
+        off = float(tip_offset_m) * fwd
+        left = left + off
+        right = right + off
     return left, right
 
 
@@ -130,10 +161,17 @@ def _trailing_edge_jaw_opening_gaps(
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Jaw-axis clearances (m) from trailing-edge centre to each pad (joint-based span)."""
     left, right = gripper_jaw_pad_tips_world(
-        env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
     return _finger_jaw_opening_gaps(left, right, center)
@@ -1136,8 +1174,8 @@ def straddle_asymmetric_achieved(
     std: float | None = None,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    # Legacy kwargs (ignored) — kept so older param dicts still load.
     open_width_m: float | None = None,
     proximity_sigma_m: float | None = None,
     pcb_half_thickness_m: float | None = None,
@@ -1191,11 +1229,9 @@ def straddle_asymmetric_achieved(
         half_length_m,
         finger_offset_m=finger_offset_m,
         closedness_threshold=closedness_threshold,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-
-
-
 
 
 def straddle_success_bonus_reward(
@@ -1208,6 +1244,7 @@ def straddle_success_bonus_reward(
     std: float,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Bonus (1.0) on steps where finger-target closedness ≥ ``closedness_threshold``."""
@@ -1221,6 +1258,7 @@ def straddle_success_bonus_reward(
         half_length_m,
         finger_offset_m=finger_offset_m,
         closedness_threshold=closedness_threshold,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     return achieved.to(dtype=torch.float32)
@@ -1797,6 +1835,7 @@ def straddle_gripper_debug_accumulate(
     std: float,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Zero-weight reward hook: accumulate gap / closedness stats before episode reset."""
@@ -1809,6 +1848,8 @@ def straddle_gripper_debug_accumulate(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     closedness = straddle_finger_target_closedness(
         env,
@@ -1819,6 +1860,7 @@ def straddle_gripper_debug_accumulate(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     achieved = closedness >= float(closedness_threshold)
@@ -1838,6 +1880,7 @@ def straddle_gripper_debug_step(
     std: float,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     print_every_control_steps: int = 32,
     print_env_id: int = 0,
@@ -1854,6 +1897,8 @@ def straddle_gripper_debug_step(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     closedness = straddle_finger_target_closedness(
         env,
@@ -1864,9 +1909,10 @@ def straddle_gripper_debug_step(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
-    dist_left, dist_right = _straddle_width_target_tip_dists(
+    dist_left, dist_right, along_l, along_r, thick_l, thick_r = _straddle_width_target_tip_dists(
         env,
         pcb_cfg,
         left_finger_cfg,
@@ -1874,6 +1920,8 @@ def straddle_gripper_debug_step(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     achieved = closedness >= float(closedness_threshold)
     _straddle_gripper_debug_accumulate_step(gap_left, gap_right, achieved, closedness)
@@ -1887,6 +1935,8 @@ def straddle_gripper_debug_step(
     print(
         f"[straddle] step={int(env.common_step_counter)} env={eid} "
         f"dist_L={dist_left[eid].item()*1000:.1f}mm dist_R={dist_right[eid].item()*1000:.1f}mm "
+        f"along_L={along_l[eid].item()*1000:.1f}mm along_R={along_r[eid].item()*1000:.1f}mm "
+        f"thick_L={thick_l[eid].item()*1000:.1f}mm thick_R={thick_r[eid].item()*1000:.1f}mm "
         f"gap_L={gap_left[eid].item()*1000:.1f}mm gap_R={gap_right[eid].item()*1000:.1f}mm "
         f"closedness={closedness[eid].item():.3f} "
         f"success={bool(achieved[eid].item())} "
@@ -1907,6 +1957,7 @@ def straddle_gripper_debug_curriculum(
     std: float,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> dict[str, float]:
     """Log episode closedness / gap means to TensorBoard via ``Curriculum/straddle_gripper_debug/*``."""
@@ -1920,6 +1971,7 @@ def straddle_gripper_debug_curriculum(
         std,
         finger_offset_m,
         closedness_threshold,
+        tip_offset_m,
         wrist_body_cfg,
     )
     global _STRADDLE_DEBUG_STEP_COUNT, _STRADDLE_ACHIEVED_STEP_COUNT
@@ -2082,6 +2134,7 @@ def straddle_lateral_gap_shaping(
     width_gap_target_left_m: float,
     width_gap_target_right_m: float,
     width_gap_sigma_m: float,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Dense reward for symmetric jaw-axis clearances (±20 mm at trailing edge, 40 mm span)."""
@@ -2092,6 +2145,8 @@ def straddle_lateral_gap_shaping(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     return _asymmetric_width_gap_quality(
         gap_left,
@@ -2261,6 +2316,23 @@ def pcb_finger_object_proximity(
     )
 
 
+def _straddle_width_face_targets(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Trailing short-edge face targets at mid-thickness, ±offset along body +Y (width).
+
+    Both targets lie on the trailing face centre plane (not PCB top/bottom faces) so pads
+    straddle the 78.5 mm edge at mid-height for a forward push.
+    """
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    off = float(finger_offset_m)
+    return center + y_w * off, center - y_w * off, center
+
+
 def _straddle_width_target_tip_dists(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2269,30 +2341,42 @@ def _straddle_width_target_tip_dists(
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
     finger_offset_m: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-jaw one-sided 3D distance (m) to trailing-edge centre ±offset along body +Y.
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-jaw distance (m) to trailing-face ±width targets plus mid-thickness offsets.
 
-    Along the PCB long axis, error is one-sided: once a pad is at or past the trailing face
-    (``along ≥ 0`` vs the target), further forward motion does not increase distance.
+    Returns ``(dist_l, dist_r, along_l_mm, along_r_mm, thick_l_mm, thick_r_mm)`` for debug.
+    Uses symmetric PCB-frame error to each target (penalises pads on the PCB top as well as
+    behind the trailing face).
     """
-    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    left_tgt, right_tgt, center = _straddle_width_face_targets(
+        env, pcb_cfg, half_length_m, finger_offset_m
+    )
     x_w = pcb_body_axis_x_world(env, pcb_cfg)
     y_w = pcb_body_axis_y_world(env, pcb_cfg)
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    off = float(finger_offset_m)
-    left_tgt = center + y_w * off
-    right_tgt = center - y_w * off
-    left, right = gripper_jaw_pad_tips_world(env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg)
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
 
-    def _one_sided_dist(tip: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    def _frame_dists(tip: torch.Tensor, tgt: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         delta = tip - tgt
         along = torch.sum(delta * x_w, dim=-1)
         width = torch.sum(delta * y_w, dim=-1)
-        thick = torch.sum(delta * z_w, dim=-1)
-        along_err = torch.clamp(-along, min=0.0)
-        return torch.sqrt(along_err**2 + width**2 + thick**2 + 1e-6)
+        thick_tgt = torch.sum(delta * z_w, dim=-1)
+        thick_mid = torch.sum((tip - center) * z_w, dim=-1)
+        dist = torch.sqrt(along * along + width * width + thick_tgt * thick_tgt + 1e-6)
+        return dist, along, thick_tgt, thick_mid
 
-    return _one_sided_dist(left, left_tgt), _one_sided_dist(right, right_tgt)
+    dist_l, along_l, thick_l_tgt, thick_l_mid = _frame_dists(left, left_tgt)
+    dist_r, along_r, thick_r_tgt, thick_r_mid = _frame_dists(right, right_tgt)
+    return dist_l, dist_r, along_l, along_r, thick_l_mid, thick_r_mid
 
 
 def straddle_finger_target_closedness(
@@ -2304,16 +2388,15 @@ def straddle_finger_target_closedness(
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
     finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Composite closedness in ``[0, 1]`` from per-jaw distance to trailing-edge ±offset targets.
 
     Each jaw: ``q = 1 - tanh(dist / std)``.  Returns ``0.5 * (q_left + q_right)``.
-    Use ``std ≈ 0.03–0.05`` m for approach shaping; ``std ≈ 0.005`` m is too tight for
-    far-field gradient (closedness stays ~0 until pads are within ~1 cm).
+    Distances use **contact pad tips** (body origin + ``tip_offset_m`` distal), not link centres.
     """
-    del wrist_body_cfg
-    lfinger_dist, rfinger_dist = _straddle_width_target_tip_dists(
+    lfinger_dist, rfinger_dist, _, _, _, _ = _straddle_width_target_tip_dists(
         env,
         pcb_cfg,
         left_finger_cfg,
@@ -2321,11 +2404,93 @@ def straddle_finger_target_closedness(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
     )
     sig = float(std) + 1e-9
     left_q = 1.0 - torch.tanh(lfinger_dist / sig)
     right_q = 1.0 - torch.tanh(rfinger_dist / sig)
     return 0.5 * (left_q + right_q)
+
+
+def straddle_tip_mid_thickness_shaping(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Pull each contact pad tip to the PCB mid-thickness plane (not the finger-body centre)."""
+    _, _, _, _, thick_l, thick_r = _straddle_width_target_tip_dists(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    sig = float(std) + 1e-9
+    left_q = 1.0 - torch.tanh(torch.abs(thick_l) / sig)
+    right_q = 1.0 - torch.tanh(torch.abs(thick_r) / sig)
+    return 0.5 * (left_q + right_q)
+
+
+def straddle_trailing_face_approach_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    std: float,
+    height_gate_std_m: float | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """One-sided reward for pads advancing to the trailing short-edge face (width straddle).
+
+    Unlike :func:`jaw_along_approach_reward` (grasp targets on ±thickness faces), both pads
+    should reach the trailing **centre plane** so they can flank the 78.5 mm edge at mid-height.
+    """
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+
+    def _behind_face_err(tip: torch.Tensor) -> torch.Tensor:
+        along = torch.sum((tip - center) * x_w, dim=-1)
+        return torch.clamp(-along, min=0.0)
+
+    sig = float(std) + 1e-9
+    left_rew = 1.0 - torch.tanh(_behind_face_err(left) / sig)
+    right_rew = 1.0 - torch.tanh(_behind_face_err(right) / sig)
+    rew = torch.minimum(left_rew, right_rew)
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            wrist_body_cfg,
+        )
+        rew = rew * height_gate
+    return rew
 
 
 def straddle_finger_target_success(
@@ -2338,6 +2503,7 @@ def straddle_finger_target_success(
     half_length_m: float,
     finger_offset_m: float = 0.020,
     closedness_threshold: float = 0.5,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Episode success when :func:`straddle_finger_target_closedness` ≥ ``closedness_threshold``."""
@@ -2350,6 +2516,7 @@ def straddle_finger_target_success(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     return closedness >= float(closedness_threshold)
@@ -2364,6 +2531,7 @@ def straddle_finger_trailing_width_proximity(
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
     finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Per-jaw proximity reward — same closedness index as straddle success (dense shaping)."""
@@ -2376,6 +2544,7 @@ def straddle_finger_trailing_width_proximity(
         gripper_joint_cfg,
         half_length_m,
         finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
 

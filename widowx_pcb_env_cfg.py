@@ -47,7 +47,8 @@ from .mdp_custom import (
     slide_success_bonus_reward,
     slide_leading_edge_travel_milestone_bonus,
     gripper_wrist_carriage_target_pitch_shaping,
-    jaw_along_approach_reward,
+    straddle_trailing_face_approach_reward,
+    straddle_tip_mid_thickness_shaping,
     straddle_finger_trailing_width_proximity,
     reset_pcb_on_guide_rails_randomized,
     reset_from_straddle_states,
@@ -146,6 +147,8 @@ _ROBOT_HOME_JOINT_POS_RANGES = {
     "left_carriage_joint": (0.0, 0.0),  # fixed at _STRADDLE_OPEN_WIDTH_M (40 mm span)
 }
 _GRIPPER_OPEN_WIDTH_M = _STRADDLE_OPEN_WIDTH_M
+# Distal offset from ``gripper_left``/``gripper_right`` body origin to contact pad tip (wrist→jaw).
+_GRIPPER_TIP_OFFSET_M = 0.060
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (prior Sim tuning; env_v6 USD at _MAG_POS above)
@@ -293,11 +296,14 @@ _GRIPPER_JOINT = SceneEntityCfg("robot", joint_names=["left_carriage_joint"])
 _WRIST_BODY = SceneEntityCfg("robot", body_names="link_6")
 
 
+def _gripper_wrist_kwargs() -> dict:
+    """Wrist body cfg only (observations / orientation terms)."""
+    return {"wrist_body_cfg": _WRIST_BODY}
+
+
 def _gripper_kinematics_kwargs() -> dict:
-    """Wrist body cfg for wrist→jaw orientation rewards."""
-    return {
-        "wrist_body_cfg": _WRIST_BODY,
-    }
+    """Wrist body + pad-tip distal offset for contact-point rewards / straddle geometry."""
+    return {**_gripper_wrist_kwargs(), "tip_offset_m": _GRIPPER_TIP_OFFSET_M}
 
 # Minimum jaw span along the trailing short-edge (width) axis for a valid straddle.
 _MIN_STRADDLE_SEP_M = 0.030
@@ -312,10 +318,12 @@ _STRADDLE_FINGER_OFFSET_M = 0.020
 # Approach shaping (finger_proximity): wide σ so gradient is active from ~10–15 cm behind edge.
 _STRADDLE_PROXIMITY_STD_M = 0.035
 # Success / termination closedness: tight σ for ±20 mm placement at trailing edge.
-_STRADDLE_SUCCESS_STD_M = 0.005
+_STRADDLE_SUCCESS_STD_M = 0.02
 _STRADDLE_WIDTH_GAP_SIGMA_M = _STRADDLE_SUCCESS_STD_M
 # Far-field along (+Y) approach to trailing face (per-jaw, one-sided).
 _STRADDLE_ALONG_APPROACH_STD_M = 0.050
+# Mid-thickness height: pull pads off the PCB top face toward the trailing-edge centre plane.
+_STRADDLE_MID_THICKNESS_STD_M = 0.012
 _STRADDLE_JAW_SPAN_SIGMA_M = 0.004
 _STRADDLE_OPEN_TOLERANCE_M = 0.003
 _STRADDLE_GAP_TOLERANCE_M = 0.005
@@ -350,7 +358,7 @@ def _pinch_orient_obs_params(**extra) -> dict:
         "right_finger_cfg": _RIGHT_FINGER,
         "min_finger_sep_m": _PINCH_ORIENT_MIN_SEP_M,
         "push_axis_world": PUSH_AXIS_WORLD,
-        **_gripper_kinematics_kwargs(),
+        **_gripper_wrist_kwargs(),
     }
     base.update(extra)
     return base
@@ -363,7 +371,7 @@ def _straddle_entity_params(**extra) -> dict:
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
         "half_length_m": _HALF_LENGTH_M,
-        **_gripper_kinematics_kwargs(),
+        **_gripper_wrist_kwargs(),
     }
     base.update(extra)
     return base
@@ -470,23 +478,24 @@ def _straddle_wrist_pitch_params(**extra) -> dict:
 
 
 def _straddle_jaw_along_approach_params(**extra) -> dict:
-    """Kwargs for jaw_along_approach_reward — per-jaw advance to trailing short edge.
-
-    One-sided along PCB long axis; ``std`` ≈ 5 cm keeps gradient from ~15 cm behind the edge.
-    Complements wide ``finger_proximity`` σ (lateral ±20 mm targets).
-    """
+    """Kwargs for straddle_trailing_face_approach_reward — pads advance to trailing face centre."""
     base = {
         "pcb_cfg": _PCB_ENT,
         "left_finger_cfg": _LEFT_FINGER,
         "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
         "half_length_m": _HALF_LENGTH_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
         "std": _STRADDLE_ALONG_APPROACH_STD_M,
         "height_gate_std_m": _ALONG_HEIGHT_GATE_STD_M,
         **_gripper_kinematics_kwargs(),
     }
     base.update(extra)
     return base
+
+
+def _straddle_mid_thickness_params(**extra) -> dict:
+    """Kwargs for straddle_tip_mid_thickness_shaping — pads at edge mid-height, not PCB top."""
+    return _straddle_finger_geometry_params(std=_STRADDLE_MID_THICKNESS_STD_M, **extra)
 
 
 # def _straddle_jaw_along_deep_params(**extra) -> dict:
@@ -752,7 +761,7 @@ class ObservationsCfg:
                 "left_finger_cfg": SceneEntityCfg("robot", body_names="gripper_left"),
                 "right_finger_cfg": SceneEntityCfg("robot", body_names="gripper_right"),
                 "scale_m": 0.012,
-                **_gripper_kinematics_kwargs(),
+                **_gripper_wrist_kwargs(),
             },
         )
         # Jaw rail ∥ world +Z; wrist→carriage line ∥ push axis (+Y).
@@ -835,20 +844,27 @@ class ObservationsCfgSlide:
 class RewardsStraddlePhaseCfg():
     """Straddle phase reward stack — open symmetric width-axis trailing-edge straddle (no pinch).
 
-    1. APPROACH  — along advance + per-jaw width proximity + lateral gap (wrist pitch disabled).
+    1. APPROACH  — trailing-face advance + mid-thickness height + width proximity + lateral gap.
     2. SUCCESS   — finger-target closedness ≥ 0.5 (tight σ).
     """
 
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.001)
 
-    # Per-jaw advance along PCB long axis toward trailing face (far-field +Y incentive).
-    jaw_along_approach = RewardTermCfg(
-        func=jaw_along_approach_reward,
+    # Pads advance to trailing short-edge face (not grasp ±thickness targets).
+    trailing_face_approach = RewardTermCfg(
+        func=straddle_trailing_face_approach_reward,
         params=_straddle_jaw_along_approach_params(),
         weight=120.0,
     )
 
-    # Per-jaw ±20 mm targets along the 78.5 mm trailing edge (proximity σ = 35 mm).
+    # Pull pads to PCB mid-thickness (edge height) — not the top face.
+    tip_mid_thickness = RewardTermCfg(
+        func=straddle_tip_mid_thickness_shaping,
+        params=_straddle_mid_thickness_params(),
+        weight=180.0,
+    )
+
+    # Per-jaw ±20 mm targets on trailing face at mid-height (proximity σ = 35 mm).
     finger_proximity = RewardTermCfg(
         func=straddle_finger_trailing_width_proximity,
         params=_straddle_finger_proximity_params(),
@@ -1047,32 +1063,32 @@ class CurriculumStraddleDebugCfg:
     )
 
 
-def _gripper_friction_event() -> EventTermCfg:
-    return EventTermCfg(
-        func=mdp.randomize_rigid_body_material,
-        mode="startup",
-        params={
-            "asset_cfg": SceneEntityCfg("robot", body_names=["gripper_left", "gripper_right"]),
-            "static_friction_range": (
-                _GRIPPER_FINGER_STATIC_FRICTION,
-                _GRIPPER_FINGER_STATIC_FRICTION,
-            ),
-            "dynamic_friction_range": (
-                _GRIPPER_FINGER_DYNAMIC_FRICTION,
-                _GRIPPER_FINGER_DYNAMIC_FRICTION,
-            ),
-            "restitution_range": (0.0, 0.0),
-            "num_buckets": 1,
-            "make_consistent": True,
-        },
-    )
+# def _gripper_friction_event() -> EventTermCfg:
+#     return EventTermCfg(
+#         func=mdp.randomize_rigid_body_material,
+#         mode="startup",
+#         params={
+#             "asset_cfg": SceneEntityCfg("robot", body_names=["gripper_left", "gripper_right"]),
+#             "static_friction_range": (
+#                 _GRIPPER_FINGER_STATIC_FRICTION,
+#                 _GRIPPER_FINGER_STATIC_FRICTION,
+#             ),
+#             "dynamic_friction_range": (
+#                 _GRIPPER_FINGER_DYNAMIC_FRICTION,
+#                 _GRIPPER_FINGER_DYNAMIC_FRICTION,
+#             ),
+#             "restitution_range": (0.0, 0.0),
+#             "num_buckets": 1,
+#             "make_consistent": True,
+#         },
+#     )
 
 
 @configclass
 class EventCfgSlide:
     """Phase 2 reset: straddle buffer robot pose + conveyor-flat PCB; gripper stays open."""
 
-    set_gripper_finger_friction = _gripper_friction_event()
+    # set_gripper_finger_friction = _gripper_friction_event()
     reset_robot_from_straddle = EventTermCfg(
         func=reset_from_straddle_states,
         mode="reset",
