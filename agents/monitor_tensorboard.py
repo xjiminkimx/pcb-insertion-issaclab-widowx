@@ -23,6 +23,7 @@ except ImportError:
 
 # Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
 WIDOWX_RL_RUNS = (
+    ("Straddle", "widowx_pcb_straddle/summaries"),
     ("Grasp", "widowx_pcb_grasp/summaries"),
     ("Grasp gripper test", "widowx_pcb_grasp_gripper_test/summaries"),
     ("Slide", "widowx_pcb_slide/summaries"),
@@ -153,14 +154,15 @@ def main() -> int:
     print("      - KL / approx_kl")
     print()
     print("[TIP] Run folders under logs/rl_games/:")
-    print("      - widowx_pcb_grasp   (phase 1 — grasp)")
-    print("      - widowx_pcb_slide   (phase 2 — slide to slot mouth)")
-    print("      - widowx_pcb_insert  (phase 3 — SDF insert)")
+    print("      - widowx_pcb_straddle (phase 1 — open straddle at trailing edge)")
+    print("      - widowx_pcb_grasp    (legacy grasp phase)")
+    print("      - widowx_pcb_slide    (phase 2 — slide to slot mouth)")
+    print("      - widowx_pcb_insert   (phase 3 — SDF insert)")
     print()
-    print("[TIP] Phase success rates in TensorBoard (when logged):")
-    print("      - Episode_Termination/grasp_success")
-    print("      - Episode_Termination/slide_success")
-    print("      - Episode_Termination/insert_success")
+    print("[TIP] Straddle finger-target closedness (success when mean ≥ 0.5):")
+    print("      - Curriculum/straddle_gripper_debug/closedness_mean")
+    print("      - Curriculum/straddle_gripper_debug/closedness_live")
+    print("      - Curriculum/straddle_gripper_debug/success_frac")
     print()
 
     cmd = [

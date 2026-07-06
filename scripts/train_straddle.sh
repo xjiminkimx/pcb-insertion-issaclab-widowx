@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Train Grasp phase; TensorBoard + checkpoints land in <workspace>/logs/rl_games/...
+# Train Straddle phase (Phase 1); TensorBoard + checkpoints in logs/rl_games/widowx_pcb_straddle/
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -13,5 +13,5 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
 fi
 
 cd "${WORKSPACE_DIR}"
-echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_grasp/"
-exec python "${TRAIN_PY}" --task Isaac-WidowX-PCB-Grasp-v0 "$@"
+echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_straddle/"
+exec python "${TRAIN_PY}" --task Isaac-WidowX-PCB-Straddle-v0 "$@"

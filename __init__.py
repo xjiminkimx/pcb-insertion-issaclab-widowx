@@ -11,11 +11,11 @@ _COMMON_KWARGS = {
 }
 
 gym.register(
-    id="Isaac-WidowX-PCB-Grasp-v0",
+    id="Isaac-WidowX-PCB-Straddle-v0",
     entry_point=_COMMON_KWARGS["entry_point"],
     kwargs={
-        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbGraspEnvCfg,
-        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbGraspPPOCfg",
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbStraddleEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbStraddlePPOCfg",
     },
 )
 
@@ -25,14 +25,5 @@ gym.register(
     kwargs={
         "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbSlideEnvCfg,
         "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbSlidePPOCfg",
-    },
-)
-
-gym.register(
-    id="Isaac-WidowX-PCB-Insert-v0",
-    entry_point=_COMMON_KWARGS["entry_point"],
-    kwargs={
-        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbInsertEnvCfg,
-        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbInsertPPOCfg",
     },
 )

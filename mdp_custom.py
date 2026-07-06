@@ -1,9 +1,8 @@
 """Custom MDP terms for the WidowX PCB on-rail task.
 
-Observation helpers, push/grasp shaping, regularization, rail reset, and drop detection.
+Observation helpers, straddle/slide shaping, regularization, rail reset, and drop detection.
 
-Grasp and insert are separate registered envs (``Isaac-WidowX-PCB-Grasp-v0``,
-``Isaac-WidowX-PCB-Insert-v0``); each uses its own reward config with no in-episode phase gating.
+Straddle and slide are separate registered envs; each uses its own reward config with no in-episode phase gating.
 """
 
 import torch
@@ -25,10 +24,10 @@ from isaaclab.utils import configclass
 _DEFAULT_PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 
 # ---------------------------------------------------------
-# Insert-phase actions — relative joint deltas with position-target clamps
+# Slide-phase actions — relative joint deltas with position-target clamps
 # ---------------------------------------------------------
 from isaaclab.envs.mdp.actions import joint_actions  # noqa: E402
-from isaaclab.envs.mdp.actions.actions_cfg import JointEffortActionCfg, RelativeJointPositionActionCfg  # noqa: E402
+from isaaclab.envs.mdp.actions.actions_cfg import RelativeJointPositionActionCfg  # noqa: E402
 
 
 class RelativeJointPositionActionWithPosLimits(joint_actions.RelativeJointPositionAction):
@@ -71,86 +70,85 @@ class RelativeJointPositionActionWithPosLimitsCfg(RelativeJointPositionActionCfg
     """Per-joint ``(min, max)`` on ``q_current + scaled_action`` (rad), keyed by joint name."""
 
 
-class JointEffortActionWithStraddleGate(joint_actions.JointEffortAction):
-    """Joint-effort action that blocks closing effort until open straddle geometry is satisfied.
+def _finger_jaw_opening_gaps(
+    left: torch.Tensor,
+    right: torch.Tensor,
+    center: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Clearances (m) from ``center`` to each jaw pad along the left→right jaw axis."""
+    jaw = right - left
+    u = jaw / torch.norm(jaw, dim=-1, keepdim=True).clamp_min(1e-9)
+    gap_left = torch.sum((center - left) * u, dim=-1).clamp(min=0.0)
+    gap_right = torch.sum((right - center) * u, dim=-1).clamp(min=0.0)
+    return gap_left, gap_right
 
-    Before straddle: PD target is held at ``open_width_m`` so implicit actuators cannot snap shut.
-    After straddle: PD tracks current joint position so policy effort can close without fighting
-    the open spring.
+
+# wxai follower: physical jaw span (m) ≈ ``left_carriage_joint`` × scale (q=0.02 → 40 mm).
+_GRIPPER_CARRIAGE_JOINT_SPAN_SCALE = 2.0
+
+
+def _gripper_jaw_span_from_joint(gq: torch.Tensor) -> torch.Tensor:
+    """Physical pad gap (m) from ``left_carriage_joint`` (not 2× joint)."""
+    return gq * _GRIPPER_CARRIAGE_JOINT_SPAN_SCALE
+
+
+def _left_carriage_half_gap_m(robot: Articulation, gripper_joint_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Half the physical pad gap (m) from carriage joint."""
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]].clamp(min=0.0)
+    return gq * (_GRIPPER_CARRIAGE_JOINT_SPAN_SCALE * 0.5)
+
+
+def gripper_jaw_pad_tips_world(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """World positions of left/right pad tips from carriage joint + jaw axis.
+
+    ``gripper_left`` / ``gripper_right`` body origins stay ~fixed apart on the housing;
+    physical span ≈ ``left_carriage_joint × _GRIPPER_CARRIAGE_JOINT_SPAN_SCALE`` about mid.
     """
-
-    cfg: "JointEffortActionWithStraddleGateCfg"
-
-    def apply_actions(self) -> None:
-        efforts = self.processed_actions
-        ready = pcb_open_straddle_ready(
-            self._env,
-            self.cfg.pcb_cfg,
-            self.cfg.left_finger_cfg,
-            self.cfg.right_finger_cfg,
-            self.cfg.half_length_m,
-            pcb_half_thickness_m=self.cfg.pcb_half_thickness_m,
-            tip_offset_m=self.cfg.tip_offset_m,
-            wrist_body_cfg=self.cfg.wrist_body_cfg,
-            min_span_frac=self.cfg.min_span_frac,
-            min_along_m=self.cfg.min_along_m,
-            min_straddle_sep_m=self.cfg.min_straddle_sep_m,
-            jaw_thick_gate_std_m=self.cfg.jaw_thick_gate_std_m,
-            min_height_factor=self.cfg.min_height_factor,
-        ).reshape(self._env.num_envs).bool()
-        ready_exp = ready.unsqueeze(-1)
-        jid = int(self._joint_ids[0]) if not isinstance(self._joint_ids, int) else int(self._joint_ids)
-        zeros_1 = torch.zeros((self._env.num_envs, 1), device=self._env.device, dtype=efforts.dtype)
-        open_target = torch.full(
-            (self._env.num_envs, 1),
-            float(self.cfg.open_width_m),
-            device=self._env.device,
-            dtype=efforts.dtype,
-        )
-        # Positive effort closes left_carriage_joint; clamp it away until straddle is achieved.
-        gated_efforts = torch.where(ready_exp, efforts, torch.minimum(efforts, zeros_1))
-        self._asset.set_joint_effort_target(gated_efforts, joint_ids=self._joint_ids)
-        not_ready_ids = (~ready).nonzero(as_tuple=False).view(-1)
-        if not_ready_ids.numel() > 0:
-            self._asset.set_joint_position_target(
-                open_target[not_ready_ids], joint_ids=[jid], env_ids=not_ready_ids
-            )
-            self._asset.set_joint_velocity_target(
-                zeros_1[not_ready_ids], joint_ids=[jid], env_ids=not_ready_ids
-            )
-        ready_ids = ready.nonzero(as_tuple=False).view(-1)
-        if ready_ids.numel() > 0:
-            q = self._asset.data.joint_pos[ready_ids, jid].unsqueeze(-1)
-            self._asset.set_joint_position_target(q, joint_ids=[jid], env_ids=ready_ids)
-            self._asset.set_joint_velocity_target(zeros_1[ready_ids], joint_ids=[jid], env_ids=ready_ids)
+    robot = env.scene[left_finger_cfg.name]
+    left_id = _resolve_first_body_id(robot, left_finger_cfg)
+    right_id = _resolve_first_body_id(robot, right_finger_cfg)
+    left_h = robot.data.body_pos_w[:, left_id]
+    right_h = robot.data.body_pos_w[:, right_id]
+    jaw = right_h - left_h
+    u = jaw / torch.norm(jaw, dim=-1, keepdim=True).clamp_min(1e-9)
+    mid = 0.5 * (left_h + right_h)
+    half_gap = _left_carriage_half_gap_m(robot, gripper_joint_cfg)
+    left = mid - u * half_gap.unsqueeze(-1)
+    right = mid + u * half_gap.unsqueeze(-1)
+    return left, right
 
 
-@configclass
-class JointEffortActionWithStraddleGateCfg(JointEffortActionCfg):
-    """Joint-effort action config with a hard pre-straddle closing gate for grasp."""
-
-    class_type: type[ActionTerm] = JointEffortActionWithStraddleGate
-    pcb_cfg: SceneEntityCfg = MISSING
-    left_finger_cfg: SceneEntityCfg = MISSING
-    right_finger_cfg: SceneEntityCfg = MISSING
-    half_length_m: float = MISSING
-    open_width_m: float = MISSING
-    min_along_m: float = 0.0
-    min_height_factor: float = 0.70
-    min_straddle_sep_m: float = 0.0005
-    proximity_sigma_m: float = 0.040
-    width_sigma_m: float = 0.020
-    width_weight: float = 3.0
-    min_span_frac: float = 0.01
-    pcb_half_thickness_m: float = 0.0005
-    tip_offset_m: float = 0.0
-    wrist_body_cfg: SceneEntityCfg | None = None
-    jaw_thick_gate_std_m: float | None = 0.003
+def _trailing_edge_jaw_opening_gaps(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Jaw-axis clearances (m) from trailing-edge centre to each pad (joint-based span)."""
+    left, right = gripper_jaw_pad_tips_world(
+        env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg
+    )
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    return _finger_jaw_opening_gaps(left, right, center)
 
 
-# ---------------------------------------------------------
-# Gripper kinematics — body origins vs pad tips (wxai carriage offset)
-# ---------------------------------------------------------
+def straddle_midpoint_target_offset_w(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    offset_m: float,
+) -> torch.Tensor:
+    """World offset for asymmetric approach — trailing centre shifted toward ``gripper_right`` (−body +Z)."""
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    return -z_w * float(offset_m)
+
+
 # Pinch-ready containment: each jaw tip within this many × PCB half-thickness of centre.
 # Open-straddle gate / closing-ready omit this; grasp success keeps the strict multiplier.
 _JAW_CONTAINED_HALF_THICKNESS_MULT = 1.5
@@ -179,60 +177,28 @@ def _resolve_first_body_id(robot: Articulation, body_cfg: SceneEntityCfg) -> int
     return int(ids[0])
 
 
-def _gripper_tip_offset_direction_w(
-    robot,
-    left: torch.Tensor,
-    right: torch.Tensor,
-    wrist_body_cfg: SceneEntityCfg | None,
-) -> torch.Tensor:
-    """Unit vector from wrist toward jaw bodies (continue distally to pad tips)."""
-    mid = 0.5 * (left + right)
-    if wrist_body_cfg is not None:
-        wrist_id = _resolve_first_body_id(robot, wrist_body_cfg)
-        wrist = robot.data.body_pos_w[:, wrist_id]
-        d = mid - wrist
-    else:
-        span = right - left
-        u = span / torch.norm(span, dim=-1, keepdim=True).clamp_min(1e-6)
-        z_up = torch.tensor([0.0, 0.0, 1.0], device=mid.device, dtype=mid.dtype).unsqueeze(0).expand_as(mid)
-        d = torch.cross(u, z_up, dim=-1)
-        x_pref = torch.tensor([1.0, 0.0, 0.0], device=mid.device, dtype=mid.dtype).unsqueeze(0).expand_as(mid)
-        flip = (torch.sum(d * x_pref, dim=-1, keepdim=True) < 0.0).to(dtype=d.dtype)
-        d = torch.where(flip, -d, d)
-    return d / torch.norm(d, dim=-1, keepdim=True).clamp_min(1e-6)
-
 
 def gripper_finger_tips_world(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """World positions of left/right **pad tips** (body origin + distal offset along wrist→jaw axis)."""
+    """World positions of left/right gripper finger bodies."""
     robot = env.scene[left_finger_cfg.name]
     left_id = _resolve_first_body_id(robot, left_finger_cfg)
     right_id = _resolve_first_body_id(robot, right_finger_cfg)
     left = robot.data.body_pos_w[:, left_id]
     right = robot.data.body_pos_w[:, right_id]
-    if tip_offset_m <= 0.0:
-        return left, right
-    fwd = _gripper_tip_offset_direction_w(robot, left, right, wrist_body_cfg)
-    off = float(tip_offset_m) * fwd
-    return left + off, right + off
+    return left, right
 
 
 def gripper_midpoint_world(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """World position at the midpoint between pad tips (or body origins when offset is 0)."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    """World position at the midpoint between finger bodies."""
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     return 0.5 * (left + right)
 
 
@@ -258,13 +224,6 @@ def _pcb_off_axis_speed(
     v = env.scene[pcb_cfg.name].data.root_lin_vel_w
     return torch.sqrt(torch.square(v[:, 0]) + torch.square(v[:, 2]))
 
-
-def _gripper_tip_params(
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> dict:
-    """Kwargs bundle for pad-tip offset (passed from env cfg)."""
-    return {"tip_offset_m": tip_offset_m, "wrist_body_cfg": wrist_body_cfg}
 
 
 def _gripper_closedness_to_target(
@@ -342,7 +301,6 @@ def _gripper_top_bottom_near_gate(
     half_length_m: float,
     gate_dist_m: float,
     width_weight: float,
-    tip_offset_m: float,
     wrist_body_cfg: SceneEntityCfg | None,
     min_finger_sep_m: float,
     left: torch.Tensor,
@@ -362,7 +320,6 @@ def _gripper_top_bottom_near_gate(
         right_finger_cfg,
         half_length_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     near = torch.exp(-dist / (float(gate_dist_m) + 1e-9))
@@ -374,7 +331,6 @@ def gripper_wrist_carriage_align_axis(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     wrist_body_cfg: SceneEntityCfg | None,
-    tip_offset_m: float = 0.0,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """``|dot(u_wc, axis_world)|`` in ``[0, 1]`` — wrist→carriage mid parallel to push axis (+Y)."""
@@ -382,9 +338,7 @@ def gripper_wrist_carriage_align_axis(
         return torch.ones(env.num_envs, device=env.device, dtype=torch.float32)
     robot = env.scene[left_finger_cfg.name]
     wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     mid = 0.5 * (left + right)
     d = mid - wrist
     u_wc = d / torch.norm(d, dim=-1, keepdim=True).clamp(min=1e-6)
@@ -397,7 +351,6 @@ def gripper_wrist_carriage_yaw_align_axis(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     wrist_body_cfg: SceneEntityCfg | None,
-    tip_offset_m: float = 0.0,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """``|dot(u_wc_xy, push_xy)|`` in ``[0, 1]`` — wrist→carriage heading in XY only (yaw); Z pitch free."""
@@ -405,9 +358,7 @@ def gripper_wrist_carriage_yaw_align_axis(
         return torch.ones(env.num_envs, device=env.device, dtype=torch.float32)
     robot = env.scene[left_finger_cfg.name]
     wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     mid = 0.5 * (left + right)
     d_xy = mid[:, :2] - wrist[:, :2]
     n_xy = torch.norm(d_xy, dim=-1)
@@ -423,7 +374,6 @@ def gripper_wrist_carriage_yaw_pitch_limited_align(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     wrist_body_cfg: SceneEntityCfg | None,
-    tip_offset_m: float = 0.0,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     max_pitch_deg: float = 25.0,
     pitch_soft_deg: float = 10.0,
@@ -438,7 +388,6 @@ def gripper_wrist_carriage_yaw_pitch_limited_align(
         left_finger_cfg,
         right_finger_cfg,
         wrist_body_cfg,
-        tip_offset_m,
         push_axis_world,
     )
     if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
@@ -446,9 +395,7 @@ def gripper_wrist_carriage_yaw_pitch_limited_align(
 
     robot = env.scene[left_finger_cfg.name]
     wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     mid = 0.5 * (left + right)
     u_wc = mid - wrist
     u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
@@ -461,13 +408,49 @@ def gripper_wrist_carriage_yaw_pitch_limited_align(
     return yaw * pitch_gate
 
 
+def gripper_wrist_carriage_target_pitch_shaping(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    target_pitch_deg: float = 20.0,
+    pitch_sigma_deg: float = 5.0,
+) -> torch.Tensor:
+    """Yaw alignment in XY plus soft target on wrist→jaw pitch (elevation from horizontal push plane).
+
+    ``|u_wc_z|`` is ``sin(pitch)``.  Credit peaks near ``target_pitch_deg`` (e.g. 20° for camera
+    clearance) with width ``pitch_sigma_deg`` (≈15–25° band at σ=5°).
+    """
+    yaw = gripper_wrist_carriage_yaw_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        push_axis_world,
+    )
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return yaw
+
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
+    mid = 0.5 * (left + right)
+    u_wc = mid - wrist
+    u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
+    z_abs = torch.abs(u_wc[:, 2])
+    target_z = float(np.sin(np.radians(target_pitch_deg)))
+    sigma_z = max(float(np.sin(np.radians(pitch_sigma_deg))), 1e-6)
+    pitch_q = torch.exp(-torch.abs(z_abs - target_z) / sigma_z)
+    return yaw * pitch_q
+
+
 def _gripper_belt_corridor_x_bounds_env(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     origins: torch.Tensor,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    corridor_tip_offset_m: float = 0.0,
     jaw_lateral_half_width_m: float = 0.010,
     wrist_lateral_half_width_m: float = 0.012,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -484,7 +467,6 @@ def _gripper_belt_corridor_x_bounds_env(
         env,
         left_finger_cfg,
         right_finger_cfg,
-        corridor_tip_offset_m,
         wrist_body_cfg,
     )
     left_env = left - origins
@@ -514,15 +496,9 @@ def gripper_midpoint_position_env(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.2,
-    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Env-local position at the midpoint between pad tips (true grasp center).
-
-    ``gripper_left`` / ``gripper_right`` USD body origins sit on the carriage housing; add
-    ``tip_offset_m`` (typically ~0.06 m) along wrist→jaw so rewards/obs match contact pads.
-    """
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    """Env-local position at the midpoint between finger bodies."""
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     return mid - env.scene.env_origins
 
 
@@ -549,12 +525,12 @@ def pcb_leading_short_edge_center_env(
 def joint_pos_rel_episode_reset(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
-    reset_joint_pos_attr: str = "_insert_reset_joint_pos",
+    reset_joint_pos_attr: str = "_slide_reset_joint_pos",
 ) -> torch.Tensor:
-    """Joint positions relative to the robot pose stored at insert reset (grasp buffer row).
+    """Joint positions relative to the robot pose stored at slide reset (straddle buffer row).
 
     Unlike ``joint_pos_rel`` (vs USD default / HOME), this zeros at the actual Phase-1
-    terminal pose so the policy sees deltas from the grasp configuration.
+    terminal pose so the policy sees deltas from the straddle configuration.
     """
     robot: Articulation = env.scene[asset_cfg.name]
     q = robot.data.joint_pos
@@ -654,14 +630,13 @@ def _gripper_mid_trailing_edge_errors(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     target_offset_w: torch.Tensor | None = None,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """PCB-frame errors vs the trailing short-edge **face centre** target.
 
     Returns ``along, width, thick, in_plane, edge_dist`` where width is body +Y (short-edge width).
     """
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     long_axis = pcb_body_axis_x_world(env, pcb_cfg)
     y_axis = pcb_body_axis_y_world(env, pcb_cfg)
     z_axis = pcb_body_axis_z_world(env, pcb_cfg)
@@ -735,13 +710,10 @@ def _fingers_trailing_edge_geometry(
     half_length_m: float,
     pcb_half_thickness_m: float = 0.00125,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> dict[str, torch.Tensor]:
     """Per-jaw geometry vs opposite-side trailing-edge targets (not the jaw midpoint)."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     left_tgt, right_tgt = _finger_trailing_edge_grasp_targets(
         env, pcb_cfg, half_length_m, pcb_half_thickness_m
     )
@@ -777,7 +749,6 @@ def _both_jaws_near_trailing_edge(
     gate_dist_m: float,
     pcb_half_thickness_m: float = 0.00125,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """True when both pad tips are within ``gate_dist_m`` of trailing-edge grasp targets."""
@@ -789,7 +760,6 @@ def _both_jaws_near_trailing_edge(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     max_dist = torch.maximum(geom["dist_l"], geom["dist_r"])
@@ -809,16 +779,13 @@ def _finger_thickness_offsets(
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Signed offset of each jaw tip along PCB body +Z from the board centre (thickness axis)."""
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     w_left = torch.sum((left - pcb_pos) * z_w, dim=-1)
     w_right = torch.sum((right - pcb_pos) * z_w, dim=-1)
     return w_left, w_right
@@ -832,7 +799,6 @@ def gripper_mid_to_pcb_trailing_edge_distance(
     half_length_m: float,
     width_weight: float = 3.0,
     pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Bottleneck distance: max of left/right jaw tip distance to per-finger trailing-edge targets."""
@@ -844,7 +810,6 @@ def gripper_mid_to_pcb_trailing_edge_distance(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     dist_l, dist_r = _one_sided_trailing_finger_dists(geom, width_weight)
@@ -858,7 +823,6 @@ def _trailing_edge_xy_distance(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Width-weighted horizontal distance to the trailing edge centre and PCB-frame errors.
@@ -871,8 +835,6 @@ def _trailing_edge_xy_distance(
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
     )
     ww = float(width_weight)
     dist_xy = torch.sqrt(along * along + (ww * width) * (ww * width) + 1e-12)
@@ -887,7 +849,6 @@ def _trailing_edge_weighted_distance(
     half_length_m: float,
     width_weight: float = 3.0,
     pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Per-finger trailing-edge distances; returns bottleneck dist and mean along/width/thick errors."""
@@ -899,7 +860,6 @@ def _trailing_edge_weighted_distance(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     dist = torch.maximum(geom["dist_l"], geom["dist_r"])
@@ -918,7 +878,6 @@ def _trailing_edge_near_factor(
     gate_dist_m: float = 0.10,
     near_along_m: float = 0.030,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Trailing-edge 3D proximity factor in ``[0, 1]`` plus ``(dist_3d, |thick|)``."""
@@ -929,7 +888,6 @@ def _trailing_edge_near_factor(
         right_finger_cfg,
         half_length_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     along_gate = _trailing_edge_along_gate(along, near_along_m)
@@ -946,7 +904,6 @@ def _trailing_edge_xy_near_factor(
     gate_dist_m: float = 0.10,
     near_along_m: float = 0.030,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Alias for :func:`_trailing_edge_near_factor` (full 3D target, not XY-only)."""
@@ -959,7 +916,6 @@ def _trailing_edge_xy_near_factor(
         gate_dist_m=gate_dist_m,
         near_along_m=near_along_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
 
@@ -974,7 +930,6 @@ def gripper_trailing_edge_proximity_shaping(
     near_along_m: float = 0.030,
     width_weight: float = 3.0,
     pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Dense shaping in ``[0, 1]``: each jaw tip must approach its own trailing-edge target."""
@@ -986,7 +941,6 @@ def gripper_trailing_edge_proximity_shaping(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     gate_l = _trailing_edge_along_gate(geom["along_l"], near_along_m)
@@ -1012,7 +966,6 @@ def gripper_trailing_edge_approach_progress(
     max_step_m: float = 0.008,
     width_weight: float = 3.0,
     pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Progress reward for each jaw tip moving toward its own trailing-edge target."""
@@ -1026,7 +979,6 @@ def gripper_trailing_edge_approach_progress(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     dist_l = geom["dist_l"]
@@ -1064,7 +1016,6 @@ def gripper_trailing_edge_xy_proximity_shaping(
     near_along_m: float = 0.030,
     thick_couple_sigma_m: float = 0.025,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_proximity_shaping` (3D target)."""
@@ -1077,7 +1028,6 @@ def gripper_trailing_edge_xy_proximity_shaping(
         sigma_m=sigma_m,
         near_along_m=near_along_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
 
@@ -1093,7 +1043,6 @@ def gripper_trailing_edge_thickness_descent_progress(
     near_xy_min: float = 0.35,
     max_step_m: float = 0.006,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
@@ -1106,12 +1055,11 @@ def gripper_trailing_edge_thickness_descent_progress(
         near_along_m=near_along_m,
         max_step_m=max_step_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
 
 
-def grasp_edge_center_achieved(
+def _straddle_asymmetric_parts(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
@@ -1119,108 +1067,165 @@ def grasp_edge_center_achieved(
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
     open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    min_between_quality: float,
-    min_closing_reward: float,
     proximity_sigma_m: float,
     pcb_half_thickness_m: float = 0.0005,
+    width_gap_target_left_m: float = 0.012,
+    width_gap_target_right_m: float = 0.003,
+    gap_tolerance_m: float = 0.004,
+    min_open_width_m: float | None = None,
+    open_width_tolerance_m: float = 0.002,
     min_along_m: float = 0.0,
     min_straddle_sep_m: float = 0.0005,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.010,
-    jaw_thick_gate_std_m: float | None = 0.003,
     min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """True when grasp reward terms indicate a valid trailing-edge pinch.
+) -> dict[str, torch.Tensor]:
+    """Per-env straddle gate booleans plus jaw-axis gap measurements (m)."""
+    del proximity_sigma_m, open_width_m, min_open_width_m
 
-    * ``pcb_between_gripper_fingers`` ≥ ``min_between_quality`` (ready-aligned: no Z-straddle / height gate)
-    * normalized ``closedness`` ≥ ``min_closing_reward``
-    * hard pinch: ``left_carriage_joint`` < ``max_gripper_gap_m``
-    """
-    between = pcb_between_gripper_fingers(
+    left, right = gripper_jaw_pad_tips_world(env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg)
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    geom = _fingers_trailing_edge_geometry(
         env,
-        proximity_sigma_m,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
+        pcb_half_thickness_m,
+        1.0,
         wrist_body_cfg=wrist_body_cfg,
-        min_span_frac=min_span_frac,
-        width_sigma_m=width_sigma_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        ready_aligned_graspable=True,
     )
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    pinched = _gripper_gap_below_threshold(gq, max_gripper_gap_m)
-    return (
-        (between >= float(min_between_quality))
-        & (closedness >= float(min_closing_reward))
-        & pinched
+    along_min = float(min_along_m)
+    jaws_past = (geom["along_l"] >= along_min) & (geom["along_r"] >= along_min)
+    between_jaws = _pcb_between_jaws_mask(
+        env, pcb_cfg, left, right, min_span_frac, min_straddle_sep_m
     )
+    z_straddled = _width_straddle_ready_mask(
+        env, pcb_cfg, left, right, min_straddle_sep_m, min_span_frac
+    )
+    gap_left, gap_right = _finger_jaw_opening_gaps(left, right, center)
+    jaw_span = gap_left + gap_right
+    target_span = float(width_gap_target_left_m) + float(width_gap_target_right_m)
+    tol = float(gap_tolerance_m)
+    gap_ok = (
+        (torch.abs(gap_left - float(width_gap_target_left_m)) <= tol)
+        & (torch.abs(gap_right - float(width_gap_target_right_m)) <= tol)
+    )
+    span_tol = float(open_width_tolerance_m)
+    open_ok = torch.abs(jaw_span - target_span) <= span_tol
+    achieved = jaws_past & between_jaws & z_straddled & gap_ok & open_ok
+    return {
+        "jaws_past": jaws_past.reshape(env.num_envs),
+        "between_jaws": between_jaws.reshape(env.num_envs),
+        "z_straddled": z_straddled.reshape(env.num_envs),
+        "gap_left": gap_left.reshape(env.num_envs),
+        "gap_right": gap_right.reshape(env.num_envs),
+        "jaw_span": jaw_span.reshape(env.num_envs),
+        "gap_ok": gap_ok.reshape(env.num_envs),
+        "open_ok": open_ok.reshape(env.num_envs),
+        "achieved": achieved.reshape(env.num_envs),
+    }
 
 
-
-def grasp_success_bonus_reward(
+def straddle_asymmetric_achieved(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    min_between_quality: float,
-    min_closing_reward: float,
-    proximity_sigma_m: float,
-    pcb_half_thickness_m: float = 0.0005,
-    min_along_m: float = 0.0,
-    min_straddle_sep_m: float = 0.0005,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.010,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    tip_offset_m: float = 0.0,
+    std: float | None = None,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    # Legacy kwargs (ignored) — kept so older param dicts still load.
+    open_width_m: float | None = None,
+    proximity_sigma_m: float | None = None,
+    pcb_half_thickness_m: float | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    gap_tolerance_m: float | None = None,
+    min_open_width_m: float | None = None,
+    open_width_tolerance_m: float | None = None,
+    min_along_m: float | None = None,
+    min_straddle_sep_m: float | None = None,
+    min_span_frac: float | None = None,
+    min_between_quality: float | None = None,
+    width_gap_sigma_m: float | None = None,
+    pcb_half_width_m: float | None = None,
+    width_weight: float | None = None,
+    width_sigma_m: float | None = None,
+    jaw_thick_gate_std_m: float | None = None,
 ) -> torch.Tensor:
-    """Bonus (1.0) on steps where grasp success matches the between-fingers + closing rewards."""
-    achieved = grasp_edge_center_achieved(
+    """Backward-compatible alias for :func:`straddle_finger_target_success`."""
+    sig = float(
+        std
+        if std is not None
+        else (proximity_sigma_m if proximity_sigma_m is not None else 0.005)
+    )
+    del (
+        open_width_m,
+        proximity_sigma_m,
+        pcb_half_thickness_m,
+        width_gap_target_left_m,
+        width_gap_target_right_m,
+        gap_tolerance_m,
+        min_open_width_m,
+        open_width_tolerance_m,
+        min_along_m,
+        min_straddle_sep_m,
+        min_span_frac,
+        min_between_quality,
+        width_gap_sigma_m,
+        pcb_half_width_m,
+        width_weight,
+        width_sigma_m,
+        jaw_thick_gate_std_m,
+    )
+    return straddle_finger_target_success(
         env,
+        sig,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
-        open_width_m,
-        closed_target_m,
-        max_gripper_gap_m,
-        min_between_quality,
-        min_closing_reward,
-        proximity_sigma_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        width_sigma_m=width_sigma_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_span_frac=min_span_frac,
-        gate_dist_m=gate_dist_m,
-        tip_offset_m=tip_offset_m,
+        finger_offset_m=finger_offset_m,
+        closedness_threshold=closedness_threshold,
         wrist_body_cfg=wrist_body_cfg,
     )
-    return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
+
+
+
+
+
+def straddle_success_bonus_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    std: float,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Bonus (1.0) on steps where finger-target closedness ≥ ``closedness_threshold``."""
+    achieved = straddle_finger_target_success(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        closedness_threshold=closedness_threshold,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return achieved.to(dtype=torch.float32)
+
+
 
 
 # Deprecated alias — kept for old env cfgs / checkpoints logging names.
@@ -1235,7 +1240,6 @@ def ee_xy_approach_progress_reward(
     half_length_m: float,
     max_step_m: float = 0.05,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Deprecated — use :func:`gripper_trailing_edge_approach_progress` (3D target)."""
@@ -1247,7 +1251,6 @@ def ee_xy_approach_progress_reward(
         half_length_m,
         max_step_m=max_step_m,
         width_weight=width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
 
@@ -1260,7 +1263,6 @@ def gripper_pinch_readiness(
     half_length_m: float,
     thickness_sigma_m: float = 0.006,
     min_finger_sep_m: float = 0.006,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
@@ -1278,9 +1280,7 @@ def gripper_pinch_readiness(
     """
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     mid = 0.5 * (left + right)
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
     w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
@@ -1292,7 +1292,6 @@ def gripper_pinch_readiness(
         left_finger_cfg,
         right_finger_cfg,
         wrist_body_cfg,
-        tip_offset_m,
         push_axis_world,
     )
     # Floor wc_align at 0.5 so a non-ideal heading reduces but never zeroes the readiness.
@@ -1300,7 +1299,7 @@ def gripper_pinch_readiness(
 
     # Anti-degenerate: jaws straddle the board faces with a real gap along the thickness axis.
     w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, wrist_body_cfg
     )
     straddle_gap = torch.abs(w_left - w_right)
     sep_ok = (straddle_gap > float(min_finger_sep_m)).to(dtype=thickness_ok.dtype)
@@ -1313,7 +1312,6 @@ def pcb_object_gripper_mid_distance(
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Reward reaching the PCB with the jaw midpoint (Isaac Lab ``object_ee_distance`` / lift task).
@@ -1322,7 +1320,7 @@ def pcb_object_gripper_mid_distance(
     """
     pcb = env.scene[pcb_cfg.name]
     pcb_pos_w = pcb.data.root_pos_w
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     distance = torch.norm(pcb_pos_w - mid, dim=-1)
     return 1.0 - torch.tanh(distance / (float(std) + 1e-9))
 
@@ -1336,6 +1334,27 @@ def _open_straddle_ready_mask(
     straddle_gap = torch.abs(w_left - w_right)
     separated = straddle_gap >= float(min_straddle_sep_m)
     return (w_left * w_right < 0.0) & separated
+
+
+def _width_straddle_ready_mask(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left: torch.Tensor,
+    right: torch.Tensor,
+    min_straddle_sep_m: float,
+    min_span_frac: float = 0.01,
+    min_y_align: float = 0.85,
+) -> torch.Tensor:
+    """True when jaws span the PCB along body +Y (78.5 mm trailing edge) with PCB centred in span."""
+    between_jaws = _pcb_between_jaws_mask(
+        env, pcb_cfg, left, right, min_span_frac, min_straddle_sep_m
+    )
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    jaw = left - right
+    u = jaw / torch.norm(jaw, dim=-1, keepdim=True).clamp_min(1e-9)
+    y_align = torch.abs(torch.sum(u * y_w, dim=-1)) >= float(min_y_align)
+    span_ok = torch.norm(jaw, dim=-1) >= float(min_straddle_sep_m)
+    return between_jaws & y_align & span_ok
 
 
 def _pcb_between_jaws_mask(
@@ -1367,7 +1386,6 @@ def pcb_open_straddle_gate_quality(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.01,
     min_along_m: float = 0.0,
@@ -1380,9 +1398,7 @@ def pcb_open_straddle_gate_quality(
     Returns ``1.0`` when pad tips are on opposite PCB faces, the board centre lies
     between the jaw span, and both tips are past the trailing short-edge face.
     """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     geom = _fingers_trailing_edge_geometry(
         env,
         pcb_cfg,
@@ -1391,11 +1407,10 @@ def pcb_open_straddle_gate_quality(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, wrist_body_cfg
     )
     z_open = _open_straddle_ready_mask(w_left, w_right, min_straddle_sep_m)
     along_min = float(min_along_m)
@@ -1405,8 +1420,6 @@ def pcb_open_straddle_gate_quality(
     )
     ready = z_open & jaws_past_edge & between_jaws
     quality = ready.to(left.dtype)
-    if jaw_thick_gate_std_m is not None:
-        quality = quality * _jaw_trailing_height_factor(geom, jaw_thick_gate_std_m)
     return quality
 
 
@@ -1417,7 +1430,6 @@ def _midpoint_trailing_edge_soft_gate(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     std_m: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Soft gate ≈1 when the gripper midpoint is within ``std_m`` of the trailing-edge face centre."""
@@ -1427,22 +1439,36 @@ def _midpoint_trailing_edge_soft_gate(
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
     )
     sig = float(std_m) + 1e-9
     return 1.0 - torch.tanh(edge_dist / sig)
 
 
-def _jaw_trailing_height_factor(
-    geom: dict[str, torch.Tensor],
-    std_m: float,
-) -> torch.Tensor:
-    """Per-jaw thickness-axis alignment to trailing-edge ±half-thickness targets (0–1)."""
-    sig = float(std_m) + 1e-9
-    left_h = 1.0 - torch.tanh(torch.abs(geom["thick_l"]) / sig)
-    right_h = 1.0 - torch.tanh(torch.abs(geom["thick_r"]) / sig)
-    return torch.minimum(left_h, right_h)
+def straddle_finger_pcb_z_vertical_distances(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Absolute PCB-thickness-axis offset (m) of each jaw tip from its trailing-edge face target.
+
+    When the board lies flat, this matches the vertical (world +Z) clearance to the nearest
+    PCB top/bottom face at the trailing short edge.
+    """
+    geom = _fingers_trailing_edge_geometry(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        1.0,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return torch.abs(geom["thick_l"]), torch.abs(geom["thick_r"])
 
 
 def _pcb_open_straddle_ready_parts(
@@ -1452,18 +1478,13 @@ def _pcb_open_straddle_ready_parts(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.01,
     min_along_m: float = 0.0,
     min_straddle_sep_m: float = 0.0005,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_height_factor: float = 0.70,
 ) -> dict[str, torch.Tensor]:
     """Per-env booleans for each hard straddle gate term plus combined ``ready``."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     geom = _fingers_trailing_edge_geometry(
         env,
         pcb_cfg,
@@ -1472,25 +1493,20 @@ def _pcb_open_straddle_ready_parts(
         half_length_m,
         pcb_half_thickness_m,
         1.0,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     jaws_past = (geom["along_l"] >= float(min_along_m)) & (geom["along_r"] >= float(min_along_m))
     between_jaws = _pcb_between_jaws_mask(
         env, pcb_cfg, left, right, min_span_frac, min_straddle_sep_m
     )
-    if jaw_thick_gate_std_m is not None:
-        height_factor = _jaw_trailing_height_factor(geom, jaw_thick_gate_std_m)
-        height_ok = height_factor >= float(min_height_factor)
-    else:
-        height_factor = torch.ones_like(jaws_past, dtype=torch.float32)
-        height_ok = torch.ones_like(jaws_past)
-    ready = jaws_past & between_jaws
+    z_straddled = _width_straddle_ready_mask(
+        env, pcb_cfg, left, right, min_straddle_sep_m, min_span_frac
+    )
+    ready = jaws_past & between_jaws & z_straddled
     return {
         "jaws_past": jaws_past.reshape(env.num_envs),
         "between_jaws": between_jaws.reshape(env.num_envs),
-        "height_ok": height_ok.reshape(env.num_envs),
-        "height_factor": height_factor.reshape(env.num_envs),
+        "z_straddled": z_straddled.reshape(env.num_envs),
         "ready": ready.reshape(env.num_envs),
     }
 
@@ -1502,18 +1518,12 @@ def pcb_open_straddle_ready(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.01,
     min_along_m: float = 0.0,
     min_straddle_sep_m: float = 0.0005,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_height_factor: float = 0.70,
 ) -> torch.Tensor:
-    """Hard boolean gate for closing: jaws past trailing face, PCB in span.
-
-    ``height_ok`` is still computed for debug logging but does not gate ``ready``.
-    """
+    """Hard boolean gate: Z-straddle, jaws past trailing face, PCB in jaw span."""
     return _pcb_open_straddle_ready_parts(
         env,
         pcb_cfg,
@@ -1521,62 +1531,211 @@ def pcb_open_straddle_ready(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         min_span_frac=min_span_frac,
         min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_height_factor=min_height_factor,
     )["ready"]
 
 
-# Per-env episode accumulators for grasp gripper debug logging.
-_GRASP_DEBUG_JOINT_SUM: torch.Tensor | None = None
-_GRASP_DEBUG_READY_SUM: torch.Tensor | None = None
-_GRASP_DEBUG_JAWS_PAST_SUM: torch.Tensor | None = None
-_GRASP_DEBUG_BETWEEN_JAWS_SUM: torch.Tensor | None = None
-_GRASP_DEBUG_HEIGHT_OK_SUM: torch.Tensor | None = None
-_GRASP_DEBUG_STEP_COUNT: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_GQ: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_READY: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_JAWS_PAST: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_BETWEEN_JAWS: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_HEIGHT_OK: torch.Tensor | None = None
-_GRASP_DEBUG_LAST_HEIGHT_FACTOR: torch.Tensor | None = None
+# Per-env episode accumulators for straddle gripper debug logging.
+_STRADDLE_DEBUG_JOINT_SUM: torch.Tensor | None = None
+_STRADDLE_DEBUG_READY_SUM: torch.Tensor | None = None
+_STRADDLE_DEBUG_JAWS_PAST_SUM: torch.Tensor | None = None
+_STRADDLE_DEBUG_BETWEEN_JAWS_SUM: torch.Tensor | None = None
+_STRADDLE_DEBUG_Z_STRADDLED_SUM: torch.Tensor | None = None
+_STRADDLE_DEBUG_STEP_COUNT: torch.Tensor | None = None
+_STRADDLE_DEBUG_LAST_GQ: torch.Tensor | None = None
+_STRADDLE_DEBUG_LAST_READY: torch.Tensor | None = None
+_STRADDLE_DEBUG_LAST_JAWS_PAST: torch.Tensor | None = None
+_STRADDLE_DEBUG_LAST_BETWEEN_JAWS: torch.Tensor | None = None
+_STRADDLE_DEBUG_LAST_Z_STRADDLED: torch.Tensor | None = None
+_STRADDLE_Z_LEFT_SUM: torch.Tensor | None = None
+_STRADDLE_Z_RIGHT_SUM: torch.Tensor | None = None
+_STRADDLE_ACHIEVED_STEP_COUNT: torch.Tensor | None = None
+_STRADDLE_Z_LEFT_LAST: torch.Tensor | None = None
+_STRADDLE_Z_RIGHT_LAST: torch.Tensor | None = None
+_STRADDLE_GAP_LEFT_SUM: torch.Tensor | None = None
+_STRADDLE_GAP_RIGHT_SUM: torch.Tensor | None = None
+_STRADDLE_GAP_LEFT_LAST: torch.Tensor | None = None
+_STRADDLE_GAP_RIGHT_LAST: torch.Tensor | None = None
+_STRADDLE_CLOSEDNESS_SUM: torch.Tensor | None = None
+_STRADDLE_CLOSEDNESS_LAST: torch.Tensor | None = None
 
 
-def _grasp_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
-    global _GRASP_DEBUG_JOINT_SUM, _GRASP_DEBUG_READY_SUM, _GRASP_DEBUG_STEP_COUNT
-    global _GRASP_DEBUG_JAWS_PAST_SUM, _GRASP_DEBUG_BETWEEN_JAWS_SUM, _GRASP_DEBUG_HEIGHT_OK_SUM
-    global _GRASP_DEBUG_LAST_GQ, _GRASP_DEBUG_LAST_READY
-    global _GRASP_DEBUG_LAST_JAWS_PAST, _GRASP_DEBUG_LAST_BETWEEN_JAWS, _GRASP_DEBUG_LAST_HEIGHT_OK
-    global _GRASP_DEBUG_LAST_HEIGHT_FACTOR
+def _straddle_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
+    global _STRADDLE_DEBUG_JOINT_SUM, _STRADDLE_DEBUG_READY_SUM, _STRADDLE_DEBUG_STEP_COUNT
+    global _STRADDLE_DEBUG_JAWS_PAST_SUM, _STRADDLE_DEBUG_BETWEEN_JAWS_SUM, _STRADDLE_DEBUG_Z_STRADDLED_SUM
+    global _STRADDLE_DEBUG_LAST_GQ, _STRADDLE_DEBUG_LAST_READY
+    global _STRADDLE_DEBUG_LAST_JAWS_PAST, _STRADDLE_DEBUG_LAST_BETWEEN_JAWS, _STRADDLE_DEBUG_LAST_Z_STRADDLED
+    global _STRADDLE_Z_LEFT_SUM, _STRADDLE_Z_RIGHT_SUM, _STRADDLE_ACHIEVED_STEP_COUNT
+    global _STRADDLE_Z_LEFT_LAST, _STRADDLE_Z_RIGHT_LAST
+    global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
+    global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
+    global _STRADDLE_CLOSEDNESS_SUM, _STRADDLE_CLOSEDNESS_LAST
     n = env.num_envs
     if (
-        _GRASP_DEBUG_JOINT_SUM is None
-        or _GRASP_DEBUG_JOINT_SUM.shape[0] != n
-        or _GRASP_DEBUG_JOINT_SUM.device != env.device
+        _STRADDLE_DEBUG_JOINT_SUM is None
+        or _STRADDLE_DEBUG_JOINT_SUM.shape[0] != n
+        or _STRADDLE_DEBUG_JOINT_SUM.device != env.device
     ):
-        _GRASP_DEBUG_JOINT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_READY_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_JAWS_PAST_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_BETWEEN_JAWS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_HEIGHT_OK_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_STEP_COUNT = torch.zeros(n, device=env.device, dtype=torch.long)
-        _GRASP_DEBUG_LAST_GQ = torch.zeros(n, device=env.device, dtype=torch.float32)
-        _GRASP_DEBUG_LAST_READY = torch.zeros(n, device=env.device, dtype=torch.bool)
-        _GRASP_DEBUG_LAST_JAWS_PAST = torch.zeros(n, device=env.device, dtype=torch.bool)
-        _GRASP_DEBUG_LAST_BETWEEN_JAWS = torch.zeros(n, device=env.device, dtype=torch.bool)
-        _GRASP_DEBUG_LAST_HEIGHT_OK = torch.zeros(n, device=env.device, dtype=torch.bool)
-        _GRASP_DEBUG_LAST_HEIGHT_FACTOR = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_JOINT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_READY_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_JAWS_PAST_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_BETWEEN_JAWS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_Z_STRADDLED_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_STEP_COUNT = torch.zeros(n, device=env.device, dtype=torch.long)
+        _STRADDLE_DEBUG_LAST_GQ = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_DEBUG_LAST_READY = torch.zeros(n, device=env.device, dtype=torch.bool)
+        _STRADDLE_DEBUG_LAST_JAWS_PAST = torch.zeros(n, device=env.device, dtype=torch.bool)
+        _STRADDLE_DEBUG_LAST_BETWEEN_JAWS = torch.zeros(n, device=env.device, dtype=torch.bool)
+        _STRADDLE_DEBUG_LAST_Z_STRADDLED = torch.zeros(n, device=env.device, dtype=torch.bool)
+        _STRADDLE_Z_LEFT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_Z_RIGHT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_ACHIEVED_STEP_COUNT = torch.zeros(n, device=env.device, dtype=torch.long)
+        _STRADDLE_Z_LEFT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_Z_RIGHT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_GAP_LEFT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_GAP_RIGHT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_GAP_LEFT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_GAP_RIGHT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_CLOSEDNESS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_CLOSEDNESS_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
 
 
-def _read_grasp_gripper_debug_state(
+def _read_straddle_debug_sample(
     env: ManagerBasedEnv,
     asset_cfg: SceneEntityCfg,
     open_width_m: float,
-    closed_target_m: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    proximity_sigma_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    width_gap_target_left_m: float = 0.012,
+    width_gap_target_right_m: float = 0.003,
+    gap_tolerance_m: float = 0.004,
+    min_open_width_m: float | None = None,
+    open_width_tolerance_m: float = 0.002,
+    min_along_m: float = 0.0,
+    min_straddle_sep_m: float = 0.0005,
+    min_span_frac: float = 0.01,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(z_left_m, z_right_m, gap_left_m, gap_right_m, straddle_achieved)`` per env."""
+    z_left, z_right = straddle_finger_pcb_z_vertical_distances(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        asset_cfg,
+        half_length_m,
+    )
+    parts = _straddle_asymmetric_parts(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        asset_cfg,
+        half_length_m,
+        open_width_m,
+        proximity_sigma_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        gap_tolerance_m=gap_tolerance_m,
+        min_open_width_m=min_open_width_m,
+        open_width_tolerance_m=open_width_tolerance_m,
+        min_along_m=min_along_m,
+        min_straddle_sep_m=min_straddle_sep_m,
+        min_span_frac=min_span_frac,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return z_left, z_right, gap_left, gap_right, parts["achieved"]
+
+
+def _read_straddle_z_debug_sample(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Backward-compatible wrapper — Z distances and achieved mask only."""
+    z_left, z_right, _, _, achieved = _read_straddle_debug_sample(*args, **kwargs)
+    return z_left, z_right, achieved
+
+
+def _straddle_gripper_debug_accumulate_step(
+    gap_left: torch.Tensor,
+    gap_right: torch.Tensor,
+    achieved: torch.Tensor,
+    closedness: torch.Tensor | None = None,
+) -> None:
+    """Accumulate per-step jaw gaps and closedness for episode-mean TensorBoard scalars."""
+    global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
+    global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
+    global _STRADDLE_ACHIEVED_STEP_COUNT, _STRADDLE_DEBUG_STEP_COUNT
+    global _STRADDLE_CLOSEDNESS_SUM, _STRADDLE_CLOSEDNESS_LAST
+    gap_left_f = gap_left.detach().to(dtype=torch.float32)
+    gap_right_f = gap_right.detach().to(dtype=torch.float32)
+    _STRADDLE_GAP_LEFT_SUM += gap_left_f
+    _STRADDLE_GAP_RIGHT_SUM += gap_right_f
+    _STRADDLE_GAP_LEFT_LAST = gap_left_f
+    _STRADDLE_GAP_RIGHT_LAST = gap_right_f
+    _STRADDLE_ACHIEVED_STEP_COUNT += achieved.detach().to(dtype=torch.long)
+    _STRADDLE_DEBUG_STEP_COUNT += 1
+    if closedness is not None:
+        closed_f = closedness.detach().to(dtype=torch.float32)
+        _STRADDLE_CLOSEDNESS_SUM += closed_f
+        _STRADDLE_CLOSEDNESS_LAST = closed_f
+
+
+def _straddle_gripper_debug_accumulate_straddle_metrics(
+    z_left: torch.Tensor,
+    z_right: torch.Tensor,
+    gap_left: torch.Tensor,
+    gap_right: torch.Tensor,
+    achieved: torch.Tensor,
+) -> None:
+    """Accumulate finger–PCB Z and lateral gap samples while straddle is held."""
+    global _STRADDLE_Z_LEFT_SUM, _STRADDLE_Z_RIGHT_SUM, _STRADDLE_ACHIEVED_STEP_COUNT
+    global _STRADDLE_Z_LEFT_LAST, _STRADDLE_Z_RIGHT_LAST
+    global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
+    global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
+    mask = achieved.to(dtype=torch.bool)
+    z_left_f = z_left.detach().to(dtype=torch.float32)
+    z_right_f = z_right.detach().to(dtype=torch.float32)
+    gap_left_f = gap_left.detach().to(dtype=torch.float32)
+    gap_right_f = gap_right.detach().to(dtype=torch.float32)
+    _STRADDLE_Z_LEFT_SUM += torch.where(mask, z_left_f, torch.zeros_like(z_left_f))
+    _STRADDLE_Z_RIGHT_SUM += torch.where(mask, z_right_f, torch.zeros_like(z_right_f))
+    _STRADDLE_GAP_LEFT_SUM += torch.where(mask, gap_left_f, torch.zeros_like(gap_left_f))
+    _STRADDLE_GAP_RIGHT_SUM += torch.where(mask, gap_right_f, torch.zeros_like(gap_right_f))
+    _STRADDLE_ACHIEVED_STEP_COUNT += mask.to(dtype=torch.long)
+    _STRADDLE_Z_LEFT_LAST = torch.where(mask, z_left_f, _STRADDLE_Z_LEFT_LAST)
+    _STRADDLE_Z_RIGHT_LAST = torch.where(mask, z_right_f, _STRADDLE_Z_RIGHT_LAST)
+    _STRADDLE_GAP_LEFT_LAST = torch.where(mask, gap_left_f, _STRADDLE_GAP_LEFT_LAST)
+    _STRADDLE_GAP_RIGHT_LAST = torch.where(mask, gap_right_f, _STRADDLE_GAP_RIGHT_LAST)
+
+
+def _straddle_gripper_debug_accumulate_straddle_z(
+    z_left: torch.Tensor,
+    z_right: torch.Tensor,
+    achieved: torch.Tensor,
+) -> None:
+    """Deprecated alias — gaps omitted."""
+    zeros = torch.zeros_like(z_left)
+    _straddle_gripper_debug_accumulate_straddle_metrics(z_left, z_right, zeros, zeros, achieved)
+
+
+def _read_straddle_gripper_debug_state(
+    env: ManagerBasedEnv,
+    asset_cfg: SceneEntityCfg,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
@@ -1585,12 +1744,9 @@ def _read_grasp_gripper_debug_state(
     min_along_m: float,
     min_straddle_sep_m: float,
     min_span_frac: float,
-    jaw_thick_gate_std_m: float | None,
-    min_height_factor: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
-    """Return ``(left_carriage_joint, straddle_ready, closedness, ready_parts)`` per env."""
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+    """Return ``(left_carriage_joint, straddle_ready, ready_parts)`` per env."""
     robot = env.scene[asset_cfg.name]
     gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
     parts = _pcb_open_straddle_ready_parts(
@@ -1600,171 +1756,177 @@ def _read_grasp_gripper_debug_state(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m=pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         min_span_frac=min_span_frac,
         min_along_m=min_along_m,
         min_straddle_sep_m=min_straddle_sep_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_height_factor=min_height_factor,
     )
     ready = parts["ready"]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    return gq, ready, closedness, parts
+    return gq, ready, parts
 
 
-def _grasp_gripper_debug_accumulate_tensors(
+def _straddle_gripper_debug_accumulate_tensors(
     gq: torch.Tensor, ready: torch.Tensor, parts: dict[str, torch.Tensor]
 ) -> None:
     """Add one control-step sample to per-env episode accumulators."""
-    global _GRASP_DEBUG_JOINT_SUM, _GRASP_DEBUG_READY_SUM, _GRASP_DEBUG_STEP_COUNT
-    global _GRASP_DEBUG_JAWS_PAST_SUM, _GRASP_DEBUG_BETWEEN_JAWS_SUM, _GRASP_DEBUG_HEIGHT_OK_SUM
-    global _GRASP_DEBUG_LAST_GQ, _GRASP_DEBUG_LAST_READY
-    global _GRASP_DEBUG_LAST_JAWS_PAST, _GRASP_DEBUG_LAST_BETWEEN_JAWS, _GRASP_DEBUG_LAST_HEIGHT_OK
-    global _GRASP_DEBUG_LAST_HEIGHT_FACTOR
-    _GRASP_DEBUG_JOINT_SUM += gq.detach()
-    _GRASP_DEBUG_READY_SUM += ready.to(dtype=torch.float32).detach()
-    _GRASP_DEBUG_JAWS_PAST_SUM += parts["jaws_past"].to(dtype=torch.float32).detach()
-    _GRASP_DEBUG_BETWEEN_JAWS_SUM += parts["between_jaws"].to(dtype=torch.float32).detach()
-    _GRASP_DEBUG_HEIGHT_OK_SUM += parts["height_ok"].to(dtype=torch.float32).detach()
-    _GRASP_DEBUG_STEP_COUNT += 1
-    _GRASP_DEBUG_LAST_GQ = gq.detach()
-    _GRASP_DEBUG_LAST_READY = ready.detach().bool()
-    _GRASP_DEBUG_LAST_JAWS_PAST = parts["jaws_past"].detach().bool()
-    _GRASP_DEBUG_LAST_BETWEEN_JAWS = parts["between_jaws"].detach().bool()
-    _GRASP_DEBUG_LAST_HEIGHT_OK = parts["height_ok"].detach().bool()
-    _GRASP_DEBUG_LAST_HEIGHT_FACTOR = parts["height_factor"].detach()
+    global _STRADDLE_DEBUG_JOINT_SUM, _STRADDLE_DEBUG_READY_SUM, _STRADDLE_DEBUG_STEP_COUNT
+    global _STRADDLE_DEBUG_JAWS_PAST_SUM, _STRADDLE_DEBUG_BETWEEN_JAWS_SUM, _STRADDLE_DEBUG_Z_STRADDLED_SUM
+    global _STRADDLE_DEBUG_LAST_GQ, _STRADDLE_DEBUG_LAST_READY
+    global _STRADDLE_DEBUG_LAST_JAWS_PAST, _STRADDLE_DEBUG_LAST_BETWEEN_JAWS, _STRADDLE_DEBUG_LAST_Z_STRADDLED
+    _STRADDLE_DEBUG_JOINT_SUM += gq.detach()
+    _STRADDLE_DEBUG_READY_SUM += ready.to(dtype=torch.float32).detach()
+    _STRADDLE_DEBUG_JAWS_PAST_SUM += parts["jaws_past"].to(dtype=torch.float32).detach()
+    _STRADDLE_DEBUG_BETWEEN_JAWS_SUM += parts["between_jaws"].to(dtype=torch.float32).detach()
+    _STRADDLE_DEBUG_Z_STRADDLED_SUM += parts["z_straddled"].to(dtype=torch.float32).detach()
+    _STRADDLE_DEBUG_STEP_COUNT += 1
+    _STRADDLE_DEBUG_LAST_GQ = gq.detach()
+    _STRADDLE_DEBUG_LAST_READY = ready.detach().bool()
+    _STRADDLE_DEBUG_LAST_JAWS_PAST = parts["jaws_past"].detach().bool()
+    _STRADDLE_DEBUG_LAST_BETWEEN_JAWS = parts["between_jaws"].detach().bool()
+    _STRADDLE_DEBUG_LAST_Z_STRADDLED = parts["z_straddled"].detach().bool()
 
 
-def grasp_gripper_debug_accumulate(
+def straddle_gripper_debug_accumulate(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    pcb_half_thickness_m: float,
-    min_along_m: float,
-    min_straddle_sep_m: float,
-    min_span_frac: float,
-    jaw_thick_gate_std_m: float | None,
-    min_height_factor: float,
-    tip_offset_m: float = 0.0,
+    std: float,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Zero-weight reward hook: accumulate debug stats before episode reset."""
-    _grasp_gripper_debug_ensure_buffers(env)
-    gq, ready, _, parts = _read_grasp_gripper_debug_state(
+    """Zero-weight reward hook: accumulate gap / closedness stats before episode reset."""
+    del asset_cfg
+    _straddle_gripper_debug_ensure_buffers(env)
+    gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
         env,
-        asset_cfg,
-        open_width_m,
-        closed_target_m,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
+        gripper_joint_cfg,
         half_length_m,
-        pcb_half_thickness_m,
-        min_along_m,
-        min_straddle_sep_m,
-        min_span_frac,
-        jaw_thick_gate_std_m,
-        min_height_factor,
-        tip_offset_m,
-        wrist_body_cfg,
     )
-    _grasp_gripper_debug_accumulate_tensors(gq, ready, parts)
+    closedness = straddle_finger_target_closedness(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    achieved = closedness >= float(closedness_threshold)
+    _straddle_gripper_debug_accumulate_step(gap_left, gap_right, achieved, closedness)
     return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
 
-def grasp_gripper_debug_step(
+def straddle_gripper_debug_step(
     env: ManagerBasedEnv,
     env_ids: Sequence[int] | None,
     asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    pcb_half_thickness_m: float,
-    min_along_m: float,
-    min_straddle_sep_m: float,
-    min_span_frac: float,
-    jaw_thick_gate_std_m: float | None,
-    min_height_factor: float,
-    tip_offset_m: float = 0.0,
+    std: float,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
     wrist_body_cfg: SceneEntityCfg | None = None,
     print_every_control_steps: int = 32,
     print_env_id: int = 0,
     enable_print: bool = False,
 ) -> None:
-    """Print gripper debug metrics (play / low ``num_envs``). TensorBoard uses reward + curriculum."""
-    gq, ready, closedness, parts = _read_grasp_gripper_debug_state(
+    """Accumulate gap / closedness stats each step; optional compact console line for play."""
+    del env_ids, asset_cfg
+
+    _straddle_gripper_debug_ensure_buffers(env)
+    gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
         env,
-        asset_cfg,
-        open_width_m,
-        closed_target_m,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
+        gripper_joint_cfg,
         half_length_m,
-        pcb_half_thickness_m,
-        min_along_m,
-        min_straddle_sep_m,
-        min_span_frac,
-        jaw_thick_gate_std_m,
-        min_height_factor,
-        tip_offset_m,
-        wrist_body_cfg,
     )
+    closedness = straddle_finger_target_closedness(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    dist_left, dist_right = _straddle_width_target_tip_dists(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m,
+    )
+    achieved = closedness >= float(closedness_threshold)
+    _straddle_gripper_debug_accumulate_step(gap_left, gap_right, achieved, closedness)
 
-    do_print = enable_print or env.num_envs <= 4
+    do_print = enable_print or env.num_envs <= 8
     if not do_print:
         return
     if int(env.common_step_counter) % int(print_every_control_steps) != 0:
         return
     eid = int(print_env_id) % env.num_envs
     print(
-        f"[grasp_debug] step={int(env.common_step_counter)} env={eid} "
-        f"left_carriage_joint={gq[eid].item():.6f} "
-        f"ready={bool(ready[eid].item())} "
-        f"jaws_past={bool(parts['jaws_past'][eid].item())} "
-        f"between_jaws={bool(parts['between_jaws'][eid].item())} "
-        f"height_ok={bool(parts['height_ok'][eid].item())} "
-        f"height_factor={parts['height_factor'][eid].item():.3f} "
-        f"closedness={closedness[eid].item():.3f}",
+        f"[straddle] step={int(env.common_step_counter)} env={eid} "
+        f"dist_L={dist_left[eid].item()*1000:.1f}mm dist_R={dist_right[eid].item()*1000:.1f}mm "
+        f"gap_L={gap_left[eid].item()*1000:.1f}mm gap_R={gap_right[eid].item()*1000:.1f}mm "
+        f"closedness={closedness[eid].item():.3f} "
+        f"success={bool(achieved[eid].item())} "
+        f"(std={float(std)*1000:.1f}mm)",
         flush=True,
     )
 
 
-def grasp_gripper_debug_curriculum(
+def straddle_gripper_debug_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    pcb_half_thickness_m: float,
-    min_along_m: float,
-    min_straddle_sep_m: float,
-    min_span_frac: float,
-    jaw_thick_gate_std_m: float | None,
-    min_height_factor: float,
-    tip_offset_m: float = 0.0,
+    std: float,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> dict[str, float]:
-    """Log episode gripper debug means to TensorBoard via ``Curriculum/grasp_gripper_debug/*``."""
-    global _GRASP_DEBUG_JOINT_SUM, _GRASP_DEBUG_READY_SUM, _GRASP_DEBUG_STEP_COUNT
-    global _GRASP_DEBUG_JAWS_PAST_SUM, _GRASP_DEBUG_BETWEEN_JAWS_SUM, _GRASP_DEBUG_HEIGHT_OK_SUM
-    global _GRASP_DEBUG_LAST_GQ, _GRASP_DEBUG_LAST_READY
-    global _GRASP_DEBUG_LAST_JAWS_PAST, _GRASP_DEBUG_LAST_BETWEEN_JAWS, _GRASP_DEBUG_LAST_HEIGHT_OK
-    global _GRASP_DEBUG_LAST_HEIGHT_FACTOR
-    _grasp_gripper_debug_ensure_buffers(env)
+    """Log episode closedness / gap means to TensorBoard via ``Curriculum/straddle_gripper_debug/*``."""
+    del (
+        asset_cfg,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        std,
+        finger_offset_m,
+        closedness_threshold,
+        wrist_body_cfg,
+    )
+    global _STRADDLE_DEBUG_STEP_COUNT, _STRADDLE_ACHIEVED_STEP_COUNT
+    global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
+    global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
+    global _STRADDLE_CLOSEDNESS_SUM, _STRADDLE_CLOSEDNESS_LAST
+    _straddle_gripper_debug_ensure_buffers(env)
     if isinstance(env_ids, slice):
         ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     elif not isinstance(env_ids, torch.Tensor):
@@ -1774,118 +1936,184 @@ def grasp_gripper_debug_curriculum(
     if ids.numel() == 0:
         return {}
 
-    gq_live, ready_live, _, parts_live = _read_grasp_gripper_debug_state(
+    counts = _STRADDLE_DEBUG_STEP_COUNT[ids].to(dtype=torch.float32).clamp(min=1.0)
+    gap_left_mean = (_STRADDLE_GAP_LEFT_SUM[ids] / counts).mean()
+    gap_right_mean = (_STRADDLE_GAP_RIGHT_SUM[ids] / counts).mean()
+    gap_left_live = _STRADDLE_GAP_LEFT_LAST[ids].mean()
+    gap_right_live = _STRADDLE_GAP_RIGHT_LAST[ids].mean()
+    closedness_mean = (_STRADDLE_CLOSEDNESS_SUM[ids] / counts).mean()
+    closedness_live = _STRADDLE_CLOSEDNESS_LAST[ids].mean()
+    success_frac = (_STRADDLE_ACHIEVED_STEP_COUNT[ids] / counts).mean()
+
+    _STRADDLE_DEBUG_STEP_COUNT[ids] = 0
+    _STRADDLE_GAP_LEFT_SUM[ids] = 0.0
+    _STRADDLE_GAP_RIGHT_SUM[ids] = 0.0
+    _STRADDLE_CLOSEDNESS_SUM[ids] = 0.0
+    _STRADDLE_ACHIEVED_STEP_COUNT[ids] = 0
+
+    return {
+        "closedness_mean": float(closedness_mean.item()),
+        "closedness_live": float(closedness_live.item()),
+        "success_frac": float(success_frac.item()),
+        "gap_left_m_mean": float(gap_left_mean.item()),
+        "gap_right_m_mean": float(gap_right_mean.item()),
+        "gap_left_m_live": float(gap_left_live.item()),
+        "gap_right_m_live": float(gap_right_live.item()),
+    }
+
+
+
+
+def _trailing_edge_finger_pcb_width_gaps(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_width_m: float,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Jaw-axis clearances (m) from trailing-edge centre to each pad (joint-based span)."""
+    del pcb_half_width_m
+    return _trailing_edge_jaw_opening_gaps(
         env,
-        asset_cfg,
-        open_width_m,
-        closed_target_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+    )
+
+
+def _straddle_jaw_span_gap_quality(
+    gap_left: torch.Tensor,
+    gap_right: torch.Tensor,
+    target_jaw_span_m: float,
+    target_left_m: float,
+    target_right_m: float,
+    jaw_span_sigma_m: float,
+    gap_sigma_m: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return ``(span_q, gap_q, span_q * gap_q)`` for asymmetric open-straddle shaping."""
+    jaw_span = gap_left + gap_right
+    span_sig = float(jaw_span_sigma_m) + 1e-9
+    span_q = torch.exp(-torch.abs(jaw_span - float(target_jaw_span_m)) / span_sig)
+    gap_q = _asymmetric_width_gap_quality(
+        gap_left, gap_right, float(target_left_m), float(target_right_m), float(gap_sigma_m)
+    )
+    return span_q, gap_q, span_q * gap_q
+
+
+def straddle_predeep_open_gap_approach_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_jaw_span_m: float,
+    width_gap_target_left_m: float,
+    width_gap_target_right_m: float,
+    jaw_span_sigma_m: float,
+    width_gap_sigma_m: float,
+    predeep_along_gate_m: float = 0.0,
+    pcb_half_thickness_m: float = 0.0005,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    height_gate_std_m: float | None = None,
+) -> torch.Tensor:
+    """Reward open asymmetric span + gaps while approaching **before** deep along (``along < gate``).
+
+    Encourages the policy to reach ``target_jaw_span_m`` (e.g. 20 mm) with the correct
+    left/right clearances while still behind the trailing face, so ``jaw_along_deep`` can
+    take over only after span and gap are aligned.
+    """
+    geom = _fingers_trailing_edge_geometry(
+        env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        min_along_m,
-        min_straddle_sep_m,
-        min_span_frac,
-        jaw_thick_gate_std_m,
-        min_height_factor,
-        tip_offset_m,
+        1.0,
         wrist_body_cfg,
     )
-    # Reward accumulation runs before reset; if an env never stepped, fall back to live read.
-    empty = _GRASP_DEBUG_STEP_COUNT[ids] == 0
-    if bool(empty.any().item()):
-        empty_ids = ids[empty]
-        _GRASP_DEBUG_JOINT_SUM[empty_ids] = gq_live[empty_ids].detach()
-        _GRASP_DEBUG_READY_SUM[empty_ids] = ready_live[empty_ids].to(dtype=torch.float32).detach()
-        _GRASP_DEBUG_JAWS_PAST_SUM[empty_ids] = parts_live["jaws_past"][empty_ids].to(dtype=torch.float32).detach()
-        _GRASP_DEBUG_BETWEEN_JAWS_SUM[empty_ids] = (
-            parts_live["between_jaws"][empty_ids].to(dtype=torch.float32).detach()
+    along_min = torch.minimum(geom["along_l"], geom["along_r"])
+    mask = (along_min < float(predeep_along_gate_m)).to(geom["along_l"].dtype)
+    gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+    )
+    _, _, quality = _straddle_jaw_span_gap_quality(
+        gap_left,
+        gap_right,
+        float(target_jaw_span_m),
+        float(width_gap_target_left_m),
+        float(width_gap_target_right_m),
+        float(jaw_span_sigma_m),
+        float(width_gap_sigma_m),
+    )
+    rew = mask * quality
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            wrist_body_cfg,
         )
-        _GRASP_DEBUG_HEIGHT_OK_SUM[empty_ids] = parts_live["height_ok"][empty_ids].to(dtype=torch.float32).detach()
-        _GRASP_DEBUG_STEP_COUNT[empty_ids] = 1
-
-    counts = _GRASP_DEBUG_STEP_COUNT[ids].to(dtype=torch.float32).clamp(min=1.0)
-    joint_mean = (_GRASP_DEBUG_JOINT_SUM[ids] / counts).mean()
-    ready_frac = (_GRASP_DEBUG_READY_SUM[ids] / counts).mean()
-    jaws_past_frac = (_GRASP_DEBUG_JAWS_PAST_SUM[ids] / counts).mean()
-    between_jaws_frac = (_GRASP_DEBUG_BETWEEN_JAWS_SUM[ids] / counts).mean()
-    height_ok_frac = (_GRASP_DEBUG_HEIGHT_OK_SUM[ids] / counts).mean()
-    last_gq = gq_live[ids].mean()
-    last_ready = ready_live[ids].to(dtype=torch.float32).mean()
-    last_jaws_past = parts_live["jaws_past"][ids].to(dtype=torch.float32).mean()
-    last_between_jaws = parts_live["between_jaws"][ids].to(dtype=torch.float32).mean()
-    last_height_ok = parts_live["height_ok"][ids].to(dtype=torch.float32).mean()
-    last_height_factor = parts_live["height_factor"][ids].mean()
-    robot = env.scene[asset_cfg.name]
-    jid = asset_cfg.joint_ids[0]
-    target_last = robot.data.joint_pos_target[ids, jid].mean()
-    closedness_last = _gripper_closedness_to_target(
-        last_gq.unsqueeze(0), open_width_m, closed_target_m
-    ).mean()
-
-    _GRASP_DEBUG_JOINT_SUM[ids] = 0.0
-    _GRASP_DEBUG_READY_SUM[ids] = 0.0
-    _GRASP_DEBUG_JAWS_PAST_SUM[ids] = 0.0
-    _GRASP_DEBUG_BETWEEN_JAWS_SUM[ids] = 0.0
-    _GRASP_DEBUG_HEIGHT_OK_SUM[ids] = 0.0
-    _GRASP_DEBUG_STEP_COUNT[ids] = 0
-
-    return {
-        "left_carriage_joint_mean": float(joint_mean.item()),
-        "straddle_ready_frac": float(ready_frac.item()),
-        "jaws_past_frac": float(jaws_past_frac.item()),
-        "between_jaws_frac": float(between_jaws_frac.item()),
-        "height_ok_frac": float(height_ok_frac.item()),
-        "left_carriage_joint_last": float(last_gq.item()),
-        "straddle_ready_last": float(last_ready.item()),
-        "jaws_past_last": float(last_jaws_past.item()),
-        "between_jaws_last": float(last_between_jaws.item()),
-        "height_ok_last": float(last_height_ok.item()),
-        "height_factor_last": float(last_height_factor.item()),
-        "joint_pos_target_last": float(target_last.item()),
-        "gripper_closedness_last": float(closedness_last.item()),
-    }
+        rew = rew * height_gate
+    return rew
 
 
-def _grasp_closing_ready_gate(
+def straddle_lateral_gap_shaping(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
     half_length_m: float,
-    proximity_sigma_m: float,
-    pcb_half_thickness_m: float,
-    tip_offset_m: float,
-    wrist_body_cfg: SceneEntityCfg | None,
-    min_straddle_sep_m: float,
-    width_sigma_m: float,
-    width_weight: float = 3.0,
-    jaw_thick_gate_std_m: float | None = None,
-    min_along_m: float = 0.0,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    along_margin_m: float | None = None,
-    midpoint_thick_gate_m: float | None = None,
+    width_gap_target_left_m: float,
+    width_gap_target_right_m: float,
+    width_gap_sigma_m: float,
+    wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Soft closing-ready gate — same ``pcb_between_gripper_fingers`` quality as the reward term."""
-    return pcb_between_gripper_fingers(
+    """Dense reward for symmetric jaw-axis clearances (±20 mm at trailing edge, 40 mm span)."""
+    gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
         env,
-        proximity_sigma_m,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
+        gripper_joint_cfg,
         half_length_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-        min_span_frac=min_span_frac,
-        width_sigma_m=width_sigma_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
     )
+    return _asymmetric_width_gap_quality(
+        gap_left,
+        gap_right,
+        float(width_gap_target_left_m),
+        float(width_gap_target_right_m),
+        float(width_gap_sigma_m),
+    )
+
+
+def _asymmetric_width_gap_quality(
+    gap_left: torch.Tensor,
+    gap_right: torch.Tensor,
+    target_left_m: float,
+    target_right_m: float,
+    sigma_m: float,
+) -> torch.Tensor:
+    """Soft quality in ``[0, 1]`` when each side matches its target lateral clearance."""
+    sig = float(sigma_m) + 1e-9
+    ql = torch.exp(-torch.abs(gap_left - float(target_left_m)) / sig)
+    qr = torch.exp(-torch.abs(gap_right - float(target_right_m)) / sig)
+    return torch.sqrt(ql * qr)
 
 
 def pcb_between_gripper_fingers(
@@ -1896,7 +2124,6 @@ def pcb_between_gripper_fingers(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_span_frac: float = 0.01,
     width_sigma_m: float = 0.010,
@@ -1905,12 +2132,15 @@ def pcb_between_gripper_fingers(
     width_weight: float = 3.0,
     jaw_thick_gate_std_m: float | None = 0.003,
     ready_aligned_graspable: bool = False,
+    pcb_half_width_m: float | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    width_gap_sigma_m: float | None = None,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Straddle-quality reward: how well the PCB is positioned between the jaws (position only).
 
-    Five multiplicative factors — purely geometric, **no closedness** (closing is handled by
-    the separate ``gripper_closing_reward`` term so the closing gradient is not diluted or
-    suppressed by these position factors):
+    Four multiplicative geometric factors (no gripper closedness):
 
     1. ``is_graspable``  — hard gate: ``jaws_past_edge`` only when ``ready_aligned_graspable``;
                            otherwise Z-straddle × height factor × jaws past trailing face.
@@ -1918,36 +2148,44 @@ def pcb_between_gripper_fingers(
                            wide enough to physically contain the board (not closed in empty air).
     3. ``prox``          — ``exp(-max(dist_l, dist_r)/σ)`` — both jaws near trailing-edge
                            targets (one-sided along). σ=proximity_sigma_m spans the approach.
-    4. ``width_centre``  — ``exp(-|mean_Y_err|/σ_w)`` — jaws centred along the PCB short edge.
+    4. ``width_centre``  — symmetric ``exp(-|mean_Y_err|/σ_w)``, **or** asymmetric lateral
+                           gap quality when ``width_gap_target_*`` are set (trailing-edge
+                           centre biased toward ``gripper_right`` with unequal clearances).
     """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    if gripper_joint_cfg is not None:
+        left, right = gripper_jaw_pad_tips_world(env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg)
+    else:
+        left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
 
     geom = _fingers_trailing_edge_geometry(
         env, pcb_cfg, left_finger_cfg, right_finger_cfg,
         half_length_m, pcb_half_thickness_m,
-        width_weight,
-        tip_offset_m=tip_offset_m, wrist_body_cfg=wrist_body_cfg,
+        width_weight, wrist_body_cfg=wrist_body_cfg,
     )
 
     along_min = float(min_along_m)
     jaws_past_edge = (geom["along_l"] >= along_min) & (geom["along_r"] >= along_min)
     if ready_aligned_graspable:
         is_graspable = jaws_past_edge.to(left.dtype)
+    elif (
+        width_gap_target_left_m is not None
+        and width_gap_target_right_m is not None
+        and gripper_joint_cfg is not None
+    ):
+        is_graspable = (
+            _width_straddle_ready_mask(
+                env, pcb_cfg, left, right, min_straddle_sep_m, min_span_frac
+            )
+            & jaws_past_edge
+        ).to(left.dtype)
     else:
         w_left, w_right = _finger_thickness_offsets(
-            env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+            env, pcb_cfg, left_finger_cfg, right_finger_cfg, wrist_body_cfg
         )
         straddle_gap = torch.abs(w_left - w_right)
         separated = straddle_gap >= float(min_straddle_sep_m)
         z_straddled = (w_left * w_right < 0.0) & separated
-        height_factor = (
-            _jaw_trailing_height_factor(geom, jaw_thick_gate_std_m)
-            if jaw_thick_gate_std_m is not None
-            else torch.ones_like(left[:, 0])
-        )
-        is_graspable = (z_straddled & jaws_past_edge).to(left.dtype) * height_factor
+        is_graspable = (z_straddled & jaws_past_edge).to(left.dtype)
 
     # Factor 2: PCB centre in jaw span along thickness — requires open span, not closed-in-air.
     between_jaws = _pcb_between_jaws_mask(
@@ -1959,403 +2197,37 @@ def pcb_between_gripper_fingers(
     dist_l_os, dist_r_os = _one_sided_trailing_finger_dists(geom, width_weight=width_weight)
     prox = torch.exp(-torch.maximum(dist_l_os, dist_r_os) / sig)
 
-    # Factor 4: width-centring along PCB short-edge axis (body +Y).
-    mean_width_err = 0.5 * (geom["width_l"] + geom["width_r"])
-    wsig = float(width_sigma_m) + 1e-9
-    width_centre = torch.exp(-torch.abs(mean_width_err) / wsig)
+    # Factor 4: width shaping along PCB short-edge axis (body +Y).
+    if (
+        pcb_half_width_m is not None
+        and width_gap_target_left_m is not None
+        and width_gap_target_right_m is not None
+        and gripper_joint_cfg is not None
+    ):
+        gap_l, gap_r = _trailing_edge_finger_pcb_width_gaps(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            float(pcb_half_width_m),
+            wrist_body_cfg,
+        )
+        gap_sig = float(width_gap_sigma_m if width_gap_sigma_m is not None else width_sigma_m)
+        width_centre = _asymmetric_width_gap_quality(
+            gap_l,
+            gap_r,
+            float(width_gap_target_left_m),
+            float(width_gap_target_right_m),
+            gap_sig,
+        )
+    else:
+        mean_width_err = 0.5 * (geom["width_l"] + geom["width_r"])
+        wsig = float(width_sigma_m) + 1e-9
+        width_centre = torch.exp(-torch.abs(mean_width_err) / wsig)
 
     return is_graspable * between_jaws * prox * width_centre
-
-
-# Consecutive env steps with straddle quality + gripper closedness above hold thresholds.
-_GRASP_HOLD_STEPS: torch.Tensor | None = None
-_GRASP_HOLD_PAID: torch.Tensor | None = None
-
-
-def pcb_between_gripper_fingers_hold_reward(
-    env: ManagerBasedRLEnv,
-    proximity_sigma_m: float,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    gripper_joint_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float = 0.00125,
-    pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_span_frac: float = 0.05,
-    width_sigma_m: float = 0.020,
-    hold_threshold: float = 0.25,
-    min_closedness: float = 0.85,
-    max_hold_steps: int = 80,
-    sparse_once: bool = False,
-) -> torch.Tensor:
-    """Hold bonus while straddle quality stays high **and** the gripper closes.
-
-    * ``sparse_once=False`` (slide/insert): per-step ``quality × closedness × hold_frac``.
-    * ``sparse_once=True`` (grasp): one-shot ``quality × closedness`` when the hold counter
-      first reaches ``max_hold_steps``; no per-step farming until timeout.
-    """
-    global _GRASP_HOLD_STEPS, _GRASP_HOLD_PAID
-    quality = pcb_between_gripper_fingers(
-        env,
-        proximity_sigma_m,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        pcb_half_thickness_m,
-        tip_offset_m,
-        wrist_body_cfg,
-        min_span_frac,
-        width_sigma_m,
-    )
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-
-    first_step = env.episode_length_buf == 1
-    grasping = (quality >= float(hold_threshold)) & (closedness >= float(min_closedness))
-    if (
-        _GRASP_HOLD_STEPS is None
-        or _GRASP_HOLD_STEPS.shape[0] != env.num_envs
-        or _GRASP_HOLD_STEPS.device != env.device
-    ):
-        _GRASP_HOLD_STEPS = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
-    prev_steps = _GRASP_HOLD_STEPS
-    if sparse_once:
-        if (
-            _GRASP_HOLD_PAID is None
-            or _GRASP_HOLD_PAID.shape[0] != env.num_envs
-            or _GRASP_HOLD_PAID.device != env.device
-        ):
-            _GRASP_HOLD_PAID = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
-        _GRASP_HOLD_PAID = torch.where(first_step, torch.zeros_like(_GRASP_HOLD_PAID), _GRASP_HOLD_PAID)
-    _GRASP_HOLD_STEPS = torch.where(
-        first_step | (~grasping),
-        torch.zeros_like(_GRASP_HOLD_STEPS),
-        _GRASP_HOLD_STEPS + 1,
-    )
-    bonus = quality * closedness
-    if sparse_once:
-        max_steps = int(max_hold_steps)
-        just_completed = (
-            grasping
-            & (prev_steps < max_steps)
-            & (_GRASP_HOLD_STEPS >= max_steps)
-            & (~_GRASP_HOLD_PAID)
-        )
-        _GRASP_HOLD_PAID = _GRASP_HOLD_PAID | just_completed
-        return torch.where(just_completed, bonus, torch.zeros_like(quality))
-    hold_frac = (
-        _GRASP_HOLD_STEPS.to(dtype=quality.dtype) / float(max(max_hold_steps, 1))
-    ).clamp(0.0, 1.0)
-    return torch.where(grasping, bonus * hold_frac, torch.zeros_like(quality))
-
-
-def gripper_closing_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float = 0.00125,
-    pcb_cfg: SceneEntityCfg | None = None,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    half_length_m: float | None = None,
-    proximity_sigma_m: float = 0.040,
-    pcb_half_thickness_m: float = 0.00125,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.020,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_straddle_sep_m: float = 0.0005,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_along_m: float = 0.0,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    along_margin_m: float | None = None,
-    midpoint_thick_gate_m: float | None = None,
-    min_straddle_quality: float | None = None,
-    use_hard_straddle_gate: bool = False,
-    min_height_factor: float = 0.70,
-) -> torch.Tensor:
-    """Closing reward gated on straddle readiness × closedness.
-
-    Grasp phase sets ``use_hard_straddle_gate=True`` so proximity-shaped quality cannot
-    unlock closing before a true open straddle (Z-straddle + jaws past edge + in span).
-    """
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-
-    if pcb_cfg is None or left_finger_cfg is None or right_finger_cfg is None:
-        return closedness
-
-    if use_hard_straddle_gate:
-        gate = pcb_open_straddle_ready(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            float(half_length_m) if half_length_m is not None else 0.0,
-            pcb_half_thickness_m=float(pcb_half_thickness_m),
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-            min_span_frac=min_span_frac,
-            min_along_m=min_along_m,
-            min_straddle_sep_m=min_straddle_sep_m,
-            jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-            min_height_factor=min_height_factor,
-        )
-    else:
-        quality = _grasp_closing_ready_gate(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            float(half_length_m) if half_length_m is not None else 0.0,
-            proximity_sigma_m,
-            float(pcb_half_thickness_m),
-            tip_offset_m,
-            wrist_body_cfg,
-            min_straddle_sep_m,
-            width_sigma_m,
-            width_weight,
-            jaw_thick_gate_std_m,
-            min_along_m,
-            min_span_frac,
-            gate_dist_m,
-            along_margin_m,
-            midpoint_thick_gate_m,
-        )
-        if min_straddle_quality is not None:
-            gate = (quality >= float(min_straddle_quality)).to(closedness.dtype)
-        else:
-            gate = quality
-    return gate * closedness
-
-
-# Previous-step closedness for per-step closing progress (grasp phase).
-_GRIPPER_CLOSING_PREV: torch.Tensor | None = None
-
-
-def gripper_closing_progress_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    proximity_sigma_m: float = 0.040,
-    pcb_half_thickness_m: float = 0.00125,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.020,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_straddle_sep_m: float = 0.0005,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_along_m: float = 0.0,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    max_step: float = 0.08,
-    use_hard_straddle_gate: bool = True,
-    min_height_factor: float = 0.70,
-    min_straddle_quality: float = 0.20,
-) -> torch.Tensor:
-    """Per-step reward for increasing gripper closedness after open straddle is achieved."""
-    global _GRIPPER_CLOSING_PREV
-
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-
-    if use_hard_straddle_gate:
-        straddle_ready = pcb_open_straddle_ready(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            pcb_half_thickness_m=float(pcb_half_thickness_m),
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-            min_span_frac=min_span_frac,
-            min_along_m=min_along_m,
-            min_straddle_sep_m=min_straddle_sep_m,
-            jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-            min_height_factor=min_height_factor,
-        )
-    else:
-        quality = _grasp_closing_ready_gate(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            proximity_sigma_m,
-            float(pcb_half_thickness_m),
-            tip_offset_m,
-            wrist_body_cfg,
-            min_straddle_sep_m,
-            width_sigma_m,
-            width_weight,
-            jaw_thick_gate_std_m,
-            min_along_m,
-            min_span_frac,
-            gate_dist_m,
-        )
-        straddle_ready = (quality >= float(min_straddle_quality)).to(closedness.dtype)
-
-    if (
-        _GRIPPER_CLOSING_PREV is None
-        or _GRIPPER_CLOSING_PREV.shape[0] != closedness.shape[0]
-        or _GRIPPER_CLOSING_PREV.device != closedness.device
-    ):
-        _GRIPPER_CLOSING_PREV = closedness.clone()
-        return torch.zeros_like(closedness)
-
-    first_step = env.episode_length_buf == 1
-    _GRIPPER_CLOSING_PREV = torch.where(first_step, closedness, _GRIPPER_CLOSING_PREV)
-    step_scale = float(max_step) + 1e-9
-    progress = (closedness - _GRIPPER_CLOSING_PREV).clamp(0.0, step_scale) / step_scale
-    _GRIPPER_CLOSING_PREV = closedness.clone()
-    return straddle_ready * progress
-
-
-def gripper_mouth_gated_closing_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    target_lead_xyz_env: tuple[float, float, float],
-    sigma_m: float = 0.10,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    gate_dist_m: float | None = None,
-    pcb_half_thickness_m: float = 0.00125,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """Closing credit gated by mouth proximity and (optionally) straddle / trailing-edge alignment.
-
-    Returns ``mouth_proximity × straddle_gate × closedness``. Proximity is
-    ``exp(-‖lead_env - target‖ / sigma_m)``; closedness is normalized carriage pinch.
-    Credit concentrates near the mouth so the policy learns arm poses that avoid
-    jaw-opening collisions during the final approach (gripper is PD-held, not actuated).
-    """
-    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
-    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    dist = torch.norm(lead_env - tgt, dim=-1)
-    proximity = torch.exp(-dist / (float(sigma_m) + 1e-9))
-
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    reward = proximity * closedness
-
-    if left_finger_cfg is not None and right_finger_cfg is not None:
-        w_left, w_right = _finger_thickness_offsets(
-            env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-        )
-        is_straddled = (w_left * w_right < 0.0).to(closedness.dtype)
-        gate = is_straddled
-        if gate_dist_m is not None:
-            near_edge = _both_jaws_near_trailing_edge(
-                env,
-                pcb_cfg,
-                left_finger_cfg,
-                right_finger_cfg,
-                half_length_m,
-                gate_dist_m,
-                pcb_half_thickness_m,
-                width_weight,
-                tip_offset_m,
-                wrist_body_cfg,
-            )
-            gate = is_straddled * near_edge.to(dtype=closedness.dtype)
-        reward = reward * gate
-    return reward
-
-
-def premature_close_penalty(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    closed_target_m: float = 0.00125,
-    half_length_m: float | None = None,
-    proximity_sigma_m: float = 0.040,
-    pcb_half_thickness_m: float = 0.00125,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.020,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    min_straddle_sep_m: float = 0.0005,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_along_m: float = 0.0,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    along_margin_m: float | None = None,
-    midpoint_thick_gate_m: float | None = None,
-    use_hard_straddle_gate: bool = False,
-    min_height_factor: float = 0.70,
-) -> torch.Tensor:
-    """Returns ``closedness`` when closing before straddle is ready, else 0."""
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    if use_hard_straddle_gate:
-        ready = pcb_open_straddle_ready(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            float(half_length_m) if half_length_m is not None else 0.0,
-            pcb_half_thickness_m=float(pcb_half_thickness_m),
-            tip_offset_m=tip_offset_m,
-            wrist_body_cfg=wrist_body_cfg,
-            min_span_frac=min_span_frac,
-            min_along_m=min_along_m,
-            min_straddle_sep_m=min_straddle_sep_m,
-            jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-            min_height_factor=min_height_factor,
-        )
-    else:
-        ready = _grasp_closing_ready_gate(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            float(half_length_m) if half_length_m is not None else 0.0,
-            proximity_sigma_m,
-            float(pcb_half_thickness_m),
-            tip_offset_m,
-            wrist_body_cfg,
-            min_straddle_sep_m,
-            width_sigma_m,
-            width_weight,
-            jaw_thick_gate_std_m,
-            min_along_m,
-            min_span_frac,
-            gate_dist_m,
-            along_margin_m,
-            midpoint_thick_gate_m,
-        )
-    if use_hard_straddle_gate:
-        not_ready = (~ready).to(closedness.dtype)
-    else:
-        not_ready = 1.0 - ready
-    return not_ready * closedness
 
 
 def pcb_finger_object_proximity(
@@ -2366,7 +2238,6 @@ def pcb_finger_object_proximity(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float = 0.00125,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Per-finger tanh proximity to opposite-side trailing-edge targets.
@@ -2376,9 +2247,7 @@ def pcb_finger_object_proximity(
     targets sit on opposite faces of the board, so maximising this term already steers the jaws
     toward a straddle without any hard ``between`` gate.
     """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     left_tgt, right_tgt = _finger_trailing_edge_grasp_targets(
         env, pcb_cfg, half_length_m, pcb_half_thickness_m
     )
@@ -2392,6 +2261,125 @@ def pcb_finger_object_proximity(
     )
 
 
+def _straddle_width_target_tip_dists(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-jaw one-sided 3D distance (m) to trailing-edge centre ±offset along body +Y.
+
+    Along the PCB long axis, error is one-sided: once a pad is at or past the trailing face
+    (``along ≥ 0`` vs the target), further forward motion does not increase distance.
+    """
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    y_w = pcb_body_axis_y_world(env, pcb_cfg)
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    off = float(finger_offset_m)
+    left_tgt = center + y_w * off
+    right_tgt = center - y_w * off
+    left, right = gripper_jaw_pad_tips_world(env, left_finger_cfg, right_finger_cfg, gripper_joint_cfg)
+
+    def _one_sided_dist(tip: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+        delta = tip - tgt
+        along = torch.sum(delta * x_w, dim=-1)
+        width = torch.sum(delta * y_w, dim=-1)
+        thick = torch.sum(delta * z_w, dim=-1)
+        along_err = torch.clamp(-along, min=0.0)
+        return torch.sqrt(along_err**2 + width**2 + thick**2 + 1e-6)
+
+    return _one_sided_dist(left, left_tgt), _one_sided_dist(right, right_tgt)
+
+
+def straddle_finger_target_closedness(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Composite closedness in ``[0, 1]`` from per-jaw distance to trailing-edge ±offset targets.
+
+    Each jaw: ``q = 1 - tanh(dist / std)``.  Returns ``0.5 * (q_left + q_right)``.
+    Use ``std ≈ 0.03–0.05`` m for approach shaping; ``std ≈ 0.005`` m is too tight for
+    far-field gradient (closedness stays ~0 until pads are within ~1 cm).
+    """
+    del wrist_body_cfg
+    lfinger_dist, rfinger_dist = _straddle_width_target_tip_dists(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m,
+    )
+    sig = float(std) + 1e-9
+    left_q = 1.0 - torch.tanh(lfinger_dist / sig)
+    right_q = 1.0 - torch.tanh(rfinger_dist / sig)
+    return 0.5 * (left_q + right_q)
+
+
+def straddle_finger_target_success(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    closedness_threshold: float = 0.5,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Episode success when :func:`straddle_finger_target_closedness` ≥ ``closedness_threshold``."""
+    closedness = straddle_finger_target_closedness(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return closedness >= float(closedness_threshold)
+
+
+def straddle_finger_trailing_width_proximity(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Per-jaw proximity reward — same closedness index as straddle success (dense shaping)."""
+    return straddle_finger_target_closedness(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+
+
 def pcb_midpoint_trailing_edge_proximity(
     env: ManagerBasedRLEnv,
     std: float,
@@ -2399,26 +2387,25 @@ def pcb_midpoint_trailing_edge_proximity(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    midpoint_jaw_offset_m: float = 0.0,
 ) -> torch.Tensor:
-    """Midpoint-to-trailing-edge-centre proximity: ``1 - tanh(edge_dist / std)``.
+    """Midpoint-to-trailing-edge proximity: ``1 - tanh(edge_dist / std)``.
 
-    Uses the **gripper midpoint** (average of left/right pad tips) vs the PCB trailing short-edge
-    face *centre* (no ±half_thickness split).  This is a pure 3D approach signal with no
-    implicit jaw-closing incentive: the target is the centre of the trailing face and the reward
-    is invariant to how far the jaws are spread in Z.
+    Uses the **gripper midpoint** vs the PCB trailing short-edge target (face centre plus optional
+    ``midpoint_jaw_offset_m`` toward ``gripper_right`` along body −Z when jaws are thickness-aligned).
 
     Contrast with :func:`pcb_finger_object_proximity` which targets each jaw to ±half_thickness —
     that per-jaw Z gradient inadvertently pulls the jaws *closed* during the approach phase.
     """
+    target_offset_w = straddle_midpoint_target_offset_w(env, pcb_cfg, midpoint_jaw_offset_m)
     _, _, _, _, edge_dist = _gripper_mid_trailing_edge_errors(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
+        target_offset_w=target_offset_w,
         wrist_body_cfg=wrist_body_cfg,
     )
     sig = float(std) + 1e-9
@@ -2433,7 +2420,6 @@ def jaw_thickness_height_alignment(
     half_length_m: float,
     std: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Dense reward for each jaw tip being at its correct HEIGHT target along the PCB thickness axis.
@@ -2459,7 +2445,6 @@ def jaw_thickness_height_alignment(
         half_length_m,
         pcb_half_thickness_m,
         1.0,
-        tip_offset_m,
         wrist_body_cfg,
     )
     sig = float(std) + 1e-9
@@ -2468,36 +2453,46 @@ def jaw_thickness_height_alignment(
     return torch.minimum(left_rew, right_rew)
 
 
+def _gripper_jaw_axis_pcb_body_alignment(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    body_axis_fn,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Cosine-similarity reward: jaw-separation vector aligned with a PCB body axis."""
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
+    jaw_vec = left - right
+    jaw_norm = jaw_vec / jaw_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+    axis_w = body_axis_fn(env, pcb_cfg)
+    return torch.abs(torch.sum(jaw_norm * axis_w, dim=-1))
+
+
 def gripper_jaw_axis_pcb_z_alignment(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """Cosine-similarity reward: jaw-separation vector aligned with PCB thickness (Z-body) axis.
-
-    The vector from right jaw tip to left jaw tip should point along the PCB body +Z direction
-    (thickness axis ≈ world +Z for a flat PCB).  When the jaws open/close in this direction the
-    gripper can straddle the PCB through its 1 mm thickness.
-
-    Returns 1.0 when jaw axis is perfectly aligned with PCB Z, 0.0 when perpendicular.  The
-    absolute value handles both ``left-above / right-below`` and the mirror orientation so that
-    the arm can discover either valid wrist-roll configuration from the start of training.
-
-    This reward is critical when the wrist-roll joint (joint_4) starts at the wrong angle: it
-    creates a continuous gradient that guides the policy to rotate the wrist until the jaw axis
-    lines up with the PCB thickness direction.
-    """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    """Cosine-similarity reward: jaw-separation vector aligned with PCB thickness (Z-body) axis."""
+    return _gripper_jaw_axis_pcb_body_alignment(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, pcb_body_axis_z_world, wrist_body_cfg
     )
-    jaw_vec = left - right                                        # right→left vector
-    jaw_norm = jaw_vec / jaw_vec.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-    z_w = pcb_body_axis_z_world(env, pcb_cfg)                    # PCB thickness axis (≈ world Z)
-    cos_sim = torch.abs(torch.sum(jaw_norm * z_w, dim=-1))       # 1=aligned, 0=perpendicular
-    return cos_sim
+
+
+def gripper_jaw_axis_pcb_y_alignment(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Cosine-similarity reward: jaw axis parallel to PCB body +Y (78.5 mm trailing short edge)."""
+    return _gripper_jaw_axis_pcb_body_alignment(
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, pcb_body_axis_y_world, wrist_body_cfg
+    )
 
 
 def gripper_midpoint_pcb_center_height(
@@ -2507,7 +2502,6 @@ def gripper_midpoint_pcb_center_height(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     std: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Dense reward for the gripper midpoint Z height matching the PCB trailing-edge centre Z.
@@ -2523,9 +2517,7 @@ def gripper_midpoint_pcb_center_height(
     (which is local, std ≈ PCB half-thickness) and active from any arm height during approach.
     """
     center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     midpoint = 0.5 * (left + right)
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
     dz = torch.abs(torch.sum((midpoint - center) * z_w, dim=-1))
@@ -2540,7 +2532,6 @@ def jaw_along_approach_reward(
     half_length_m: float,
     std: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     height_gate_std_m: float | None = None,
 ) -> torch.Tensor:
@@ -2567,7 +2558,6 @@ def jaw_along_approach_reward(
         half_length_m,
         pcb_half_thickness_m,
         1.0,
-        tip_offset_m,
         wrist_body_cfg,
     )
     sig = float(std) + 1e-9
@@ -2585,7 +2575,6 @@ def jaw_along_approach_reward(
             right_finger_cfg,
             half_length_m,
             float(height_gate_std_m),
-            tip_offset_m,
             wrist_body_cfg,
         )
         along_rew = along_rew * height_gate
@@ -2617,16 +2606,24 @@ def jaw_along_deep_approach_reward(
     target_along_m: float,
     std: float,
     pcb_half_thickness_m: float = 0.0005,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     overshoot_std_m: float = 0.005,
     height_gate_std_m: float | None = None,
+    predeep_jaw_span_m: float | None = None,
+    predeep_gap_left_m: float | None = None,
+    predeep_gap_right_m: float | None = None,
+    predeep_span_sigma_m: float = 0.004,
+    predeep_gap_sigma_m: float = 0.004,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Deep along reward: peak at ``target_along_m`` past the trailing face, decay beyond (overshoot).
 
     Before the target the reward rises one-sided (same as legacy deep approach).  Past the target
     an overshoot factor ``1 - tanh((along - target) / overshoot_std_m)`` decays credit so the
     policy does not keep driving into the PCB after straddle.  Both jaws must satisfy (min).
+
+    When ``predeep_jaw_span_m`` is set, credit is multiplied by soft span+gap quality so deep
+    advance only pays after the 20 mm asymmetric open is established during pre-deep approach.
     """
     geom = _fingers_trailing_edge_geometry(
         env,
@@ -2636,13 +2633,37 @@ def jaw_along_deep_approach_reward(
         half_length_m,
         pcb_half_thickness_m,
         1.0,
-        tip_offset_m,
         wrist_body_cfg,
     )
     target = float(target_along_m)
     left_rew = _jaw_along_deep_single_reward(geom["along_l"], target, std, overshoot_std_m)
     right_rew = _jaw_along_deep_single_reward(geom["along_r"], target, std, overshoot_std_m)
     deep_rew = torch.minimum(left_rew, right_rew)
+    if (
+        predeep_jaw_span_m is not None
+        and predeep_gap_left_m is not None
+        and predeep_gap_right_m is not None
+        and gripper_joint_cfg is not None
+    ):
+        gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            wrist_body_cfg,
+        )
+        _, _, predeep_q = _straddle_jaw_span_gap_quality(
+            gap_left,
+            gap_right,
+            float(predeep_jaw_span_m),
+            float(predeep_gap_left_m),
+            float(predeep_gap_right_m),
+            float(predeep_span_sigma_m),
+            float(predeep_gap_sigma_m),
+        )
+        deep_rew = deep_rew * predeep_q
     if height_gate_std_m is not None:
         height_gate = gripper_midpoint_pcb_center_height(
             env,
@@ -2651,7 +2672,6 @@ def jaw_along_deep_approach_reward(
             right_finger_cfg,
             half_length_m,
             float(height_gate_std_m),
-            tip_offset_m,
             wrist_body_cfg,
         )
         deep_rew = deep_rew * height_gate
@@ -2665,23 +2685,24 @@ def gripper_midpoint_along_approach_reward(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     std: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     height_gate_std_m: float | None = None,
+    midpoint_jaw_offset_m: float = 0.0,
 ) -> torch.Tensor:
     """Reward for the gripper midpoint advancing along the PCB long axis to the trailing edge.
 
     Complements ``jaw_along_approach_reward`` (per-jaw tips): the arm often moves the wrist
-  midpoint first while jaws are still open, so this provides a direct +Y advance signal before
+    midpoint first while jaws are still open, so this provides a direct +Y advance signal before
     the jaw tips reach the trailing-edge face targets.
     """
+    target_offset_w = straddle_midpoint_target_offset_w(env, pcb_cfg, midpoint_jaw_offset_m)
     along, _, _, _, _ = _gripper_mid_trailing_edge_errors(
         env,
         pcb_cfg,
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
+        target_offset_w=target_offset_w,
         wrist_body_cfg=wrist_body_cfg,
     )
     sig = float(std) + 1e-9
@@ -2695,65 +2716,12 @@ def gripper_midpoint_along_approach_reward(
             right_finger_cfg,
             half_length_m,
             float(height_gate_std_m),
-            tip_offset_m,
             wrist_body_cfg,
         )
         along_rew = along_rew * height_gate
     return along_rew
 
 
-def close_behind_trailing_edge_penalty(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    std: float,
-    closed_target_m: float = 0.00125,
-    pcb_half_thickness_m: float = 0.0005,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """Penalty for closing the gripper while still behind the trailing short-edge face.
-
-    Returns ``closedness × tanh(behind / std)`` where ``behind`` is how far the worst jaw tip
-    or gripper midpoint is short of the trailing edge along the PCB long axis.  Zero when at
-    or past the edge; grows as the gripper closes farther behind the face — directly targets
-    the "closed before Y-approach" failure mode.
-    """
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    geom = _fingers_trailing_edge_geometry(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        pcb_half_thickness_m,
-        width_weight,
-        tip_offset_m,
-        wrist_body_cfg,
-    )
-    behind_jaws = torch.maximum(
-        torch.clamp(-geom["along_l"], min=0.0),
-        torch.clamp(-geom["along_r"], min=0.0),
-    )
-    along_mid, _, _, _, _ = _gripper_mid_trailing_edge_errors(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    behind = torch.maximum(behind_jaws, torch.clamp(-along_mid, min=0.0))
-    sig = float(std) + 1e-9
-    return closedness * torch.tanh(behind / sig)
 
 
 def gripper_jaw_belt_corridor_penalty(
@@ -2766,7 +2734,6 @@ def gripper_jaw_belt_corridor_penalty(
     height_z_max_env: float,
     height_z_min_env: float | None = None,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    corridor_tip_offset_m: float = 0.0,
     jaw_lateral_half_width_m: float = 0.010,
     wrist_lateral_half_width_m: float = 0.012,
     overflow_sigma_m: float = 0.008,
@@ -2784,7 +2751,6 @@ def gripper_jaw_belt_corridor_penalty(
         right_finger_cfg,
         origins,
         wrist_body_cfg=wrist_body_cfg,
-        corridor_tip_offset_m=corridor_tip_offset_m,
         jaw_lateral_half_width_m=jaw_lateral_half_width_m,
         wrist_lateral_half_width_m=wrist_lateral_half_width_m,
     )
@@ -2814,13 +2780,12 @@ def gripper_mid_thickness_offset_obs(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     scale_m: float = 0.012,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Obs: signed offset along PCB thickness axis (jaw mid vs board center), scaled to ~[-1, 1]."""
     pcb = env.scene[pcb_cfg.name]
     pcb_pos = pcb.data.root_pos_w
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     z_w = pcb_body_axis_z_world(env, pcb_cfg)
     w = torch.sum((mid - pcb_pos) * z_w, dim=-1)
     return torch.clamp(w / (scale_m + 1e-6), -1.0, 1.0).unsqueeze(-1)
@@ -2835,7 +2800,6 @@ def gripper_trailing_edge_error_obs(
     scale_along_m: float = 0.12,
     scale_width_m: float = 0.04,
     scale_thick_m: float = 0.05,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Obs: jaw-mid error vs trailing short-edge centre in PCB frame, scaled to ~[-1, 1].
@@ -2843,7 +2807,7 @@ def gripper_trailing_edge_error_obs(
     Components are ``along`` (long axis), ``width`` (short edge), ``thick`` (board thickness).
     """
     along, width, thick, _, _ = _gripper_mid_trailing_edge_errors(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m, **_gripper_tip_params(tip_offset_m, wrist_body_cfg)
+        env, pcb_cfg, left_finger_cfg, right_finger_cfg, half_length_m
     )
     sa = float(scale_along_m) + 1e-6
     sw = float(scale_width_m) + 1e-6
@@ -2868,7 +2832,6 @@ def gripper_jaw_rail_vertical_shaping(
     gate_dist_m: float = 0.12,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Shaping ``[0, 1]``: reward jaw rail parallel to world +Z (top/bottom thickness close).
@@ -2876,9 +2839,7 @@ def gripper_jaw_rail_vertical_shaping(
     Carriage must **not** stay level (∥ XY); the left↔right rail is rolled vertical so fingers
     straddle PCB thickness.
     """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
@@ -2887,7 +2848,6 @@ def gripper_jaw_rail_vertical_shaping(
         half_length_m,
         gate_dist_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
         min_finger_sep_m,
         left,
@@ -2906,7 +2866,6 @@ def gripper_wrist_carriage_push_axis_shaping(
     gate_dist_m: float = 0.12,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     yaw_only: bool = True,
@@ -2919,9 +2878,7 @@ def gripper_wrist_carriage_push_axis_shaping(
     ``max_pitch_deg`` is set, wrist pitch is softly limited (not fully free, not full 3D lock).
     With ``yaw_only=False``, full 3D alignment with the push axis is used.
     """
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
@@ -2930,7 +2887,6 @@ def gripper_wrist_carriage_push_axis_shaping(
         half_length_m,
         gate_dist_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
         min_finger_sep_m,
         left,
@@ -2943,7 +2899,6 @@ def gripper_wrist_carriage_push_axis_shaping(
                 left_finger_cfg,
                 right_finger_cfg,
                 wrist_body_cfg,
-                tip_offset_m,
                 push_axis_world,
                 max_pitch_deg,
                 pitch_soft_deg,
@@ -2954,8 +2909,7 @@ def gripper_wrist_carriage_push_axis_shaping(
                 left_finger_cfg,
                 right_finger_cfg,
                 wrist_body_cfg,
-                tip_offset_m,
-                push_axis_world,
+        push_axis_world,
             )
     else:
         wc_align = gripper_wrist_carriage_align_axis(
@@ -2963,7 +2917,6 @@ def gripper_wrist_carriage_push_axis_shaping(
             left_finger_cfg,
             right_finger_cfg,
             wrist_body_cfg,
-            tip_offset_m,
             push_axis_world,
         )
     return wc_align * sep_ok * near
@@ -2978,13 +2931,10 @@ def gripper_jaw_rail_horizontal_penalty(
     gate_dist_m: float = 0.12,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """Penalty ``[0, 1]``: jaw rail lying in the XY plane (level carriage / width-pinch pose)."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
@@ -2993,7 +2943,6 @@ def gripper_jaw_rail_horizontal_penalty(
         half_length_m,
         gate_dist_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
         min_finger_sep_m,
         left,
@@ -3013,14 +2962,11 @@ def gripper_fingers_perpendicular_to_trailing_edge_shaping(
     gate_dist_m: float = 0.12,
     min_finger_sep_m: float = 0.006,
     width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
 ) -> torch.Tensor:
     """Combined orientation: ``jaw_rail_vertical * wrist_carriage_push`` (legacy single term)."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     near, sep_ok = _gripper_top_bottom_near_gate(
         env,
         pcb_cfg,
@@ -3029,7 +2975,6 @@ def gripper_fingers_perpendicular_to_trailing_edge_shaping(
         half_length_m,
         gate_dist_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
         min_finger_sep_m,
         left,
@@ -3041,7 +2986,6 @@ def gripper_fingers_perpendicular_to_trailing_edge_shaping(
         left_finger_cfg,
         right_finger_cfg,
         wrist_body_cfg,
-        tip_offset_m,
         push_axis_world,
     )
     return rail_z * wc_y * sep_ok * near
@@ -3053,15 +2997,12 @@ def gripper_pinch_orientation_cos_obs(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     min_finger_sep_m: float = 0.006,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     yaw_only_wrist_align: bool = False,
 ) -> torch.Tensor:
     """Two scalars in ``[0, 1]``: jaw rail ∥ +Z; wrist→carriage push alignment; sep-scaled."""
-    left, right = gripper_finger_tips_world(
-        env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
     _, n = _gripper_rail_unit_lr(left, right)
     rail_z = gripper_rail_align_world_z(env, left, right)
     if yaw_only_wrist_align:
@@ -3070,8 +3011,7 @@ def gripper_pinch_orientation_cos_obs(
             left_finger_cfg,
             right_finger_cfg,
             wrist_body_cfg,
-            tip_offset_m,
-            push_axis_world,
+        push_axis_world,
         )
     else:
         wc_y = gripper_wrist_carriage_align_axis(
@@ -3079,7 +3019,6 @@ def gripper_pinch_orientation_cos_obs(
             left_finger_cfg,
             right_finger_cfg,
             wrist_body_cfg,
-            tip_offset_m,
             push_axis_world,
         )
     sep_soft = torch.clamp(n / (float(min_finger_sep_m) + 1e-9), 0.0, 1.0)
@@ -3161,54 +3100,6 @@ def pcb_leading_edge_insertion_proximity_reward(
     )
     dist = torch.norm(lead_env - tgt, dim=-1)
     return torch.exp(-dist / (float(sigma_m) + 1e-9))
-
-
-
-def pcb_insertion_depth_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    slot_mouth_y_env: float,
-    max_depth_m: float = 0.20,
-) -> torch.Tensor:
-    """Reward for **PCB depth inside the slot**: leading edge past the slot mouth in +Y.
-
-    Zero while the leading edge has not yet crossed ``slot_mouth_y_env``.
-    Linearly increases up to ``max_depth_m`` of penetration (returns 1.0 at full insertion).
-    Use a positive weight; combine with ``insert_y_toward_slot`` which only fires before the mouth.
-    """
-    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
-    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
-    depth = torch.clamp(lead_y - float(slot_mouth_y_env), min=0.0, max=float(max_depth_m))
-    return depth / float(max_depth_m)
-
-
-def pcb_slot_mouth_milestone_bonus(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    slot_mouth_y_env: float,
-    state_attr: str = "_insert_milestone_slot_mouth",
-) -> torch.Tensor:
-    """One-shot sparse bonus when the PCB leading edge first crosses the slot mouth (+Y).
-
-    Fires once per episode the first time ``lead_y >= slot_mouth_y_env``.  State is cleared on
-    insert reset via :func:`_store_insert_progress_baselines`.
-    """
-    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
-    lead_y = (lead_w - env.scene.env_origins[:, :3])[:, 1]
-    crossed = lead_y >= float(slot_mouth_y_env)
-
-    if not hasattr(env, state_attr):
-        setattr(
-            env,
-            state_attr,
-            torch.zeros(env.num_envs, device=env.device, dtype=torch.bool),
-        )
-    flag: torch.Tensor = getattr(env, state_attr)
-    newly = crossed & ~flag
-    flag |= crossed
-    return newly.float()
 
 
 def _pcb_rail_parallel_quality(
@@ -3820,150 +3711,12 @@ def slide_success_bonus_reward(
     return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 
 
-def leading_edge_staged_xyz_approach_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    target_lead_xyz_env: tuple[float, float, float],
-    sigma_xyz_m: tuple[float, float, float] = (0.012, 0.05, 0.010),
-    tolerance_xyz_m: tuple[float, float, float] = (0.008, 0.020, 0.008),
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-) -> torch.Tensor:
-    """Staged dense shaping: leading-edge X, then Y, then Z toward env-local targets."""
-    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
-    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    sig = torch.tensor(sigma_xyz_m, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    tol = torch.tensor(tolerance_xyz_m, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    delta = torch.abs(lead_env - tgt)
-    x_ok = delta[:, 0] <= tol[:, 0]
-    y_ok = delta[:, 1] <= tol[:, 1]
-    prox_x = torch.exp(-delta[:, 0] / (sig[:, 0] + 1e-9))
-    prox_y = torch.exp(-delta[:, 1] / (sig[:, 1] + 1e-9)) * x_ok.to(prox_x.dtype)
-    prox_z = torch.exp(-delta[:, 2] / (sig[:, 2] + 1e-9)) * (x_ok & y_ok).to(prox_x.dtype)
-    return (prox_x + prox_y + prox_z) / 3.0
 
 
-def insert_mouth_compliance_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    mouth_y_env: float,
-    mouth_margin_m: float,
-    min_lateral_speed_m_s: float,
-    max_lateral_speed_m_s: float,
-    max_lift_m: float,
-    stall_depth_eps_m: float,
-    min_stall_steps: int,
-    gripper_joint_cfg: SceneEntityCfg,
-    max_gripper_gap_m: float,
-    open_width_m: float,
-    closed_target_m: float,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    vibrate_coef: float = 0.55,
-    lift_coef: float = 0.45,
-) -> torch.Tensor:
-    """Reward small lateral vibration or brief lift while stalled at the slot mouth (gripper closed)."""
-    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
-    near_mouth = torch.abs(lead_env[:, 1] - float(mouth_y_env)) <= float(mouth_margin_m)
-
-    penetration = torch.clamp(lead_env[:, 1] - float(mouth_y_env), min=0.0)
-    if not hasattr(env, "_insert_mouth_stall_count"):
-        env._insert_mouth_stall_count = torch.zeros(env.num_envs, device=env.device, dtype=torch.long)
-    if not hasattr(env, "_insert_mouth_prev_depth"):
-        env._insert_mouth_prev_depth = penetration.clone()
-    prev = env._insert_mouth_prev_depth
-    stalled = penetration - prev < float(stall_depth_eps_m)
-    count = env._insert_mouth_stall_count
-    count = torch.where(stalled, count + 1, torch.zeros_like(count))
-    env._insert_mouth_stall_count = count
-    env._insert_mouth_prev_depth = penetration.clone()
-    stall_ok = count >= int(min_stall_steps)
-
-    robot = env.scene[gripper_joint_cfg.name]
-    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-    grip_ok = gq < float(max_gripper_gap_m)
-
-    pcb = env.scene[pcb_cfg.name]
-    v = pcb.data.root_lin_vel_w
-    lateral = torch.abs(v[:, 0])
-    lo = float(min_lateral_speed_m_s)
-    hi = float(max_lateral_speed_m_s)
-    vib_score = ((lateral - lo) / (hi - lo + 1e-9)).clamp(0.0, 1.0)
-    vib_score = torch.where(lateral >= lo, vib_score, torch.zeros_like(vib_score))
-
-    if hasattr(env, "_insert_start_lead_z"):
-        ref_z = env._insert_start_lead_z
-    else:
-        ref_z = lead_env[:, 2].detach()
-    lift = torch.clamp(lead_env[:, 2] - ref_z, min=0.0, max=float(max_lift_m))
-    lift_score = lift / (float(max_lift_m) + 1e-9)
-
-    gate = near_mouth & stall_ok & grip_ok
-    score = float(vibrate_coef) * vib_score + float(lift_coef) * lift_score
-    return torch.where(gate, score, torch.zeros_like(score))
 
 
-def insert_backward_velocity_penalty(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    min_backward_speed_m_s: float = 0.002,
-) -> torch.Tensor:
-    """Penalty when PCB root velocity along −push axis exceeds threshold (collision kickback)."""
-    pcb = env.scene[pcb_cfg.name]
-    v = pcb.data.root_lin_vel_w
-    a = torch.tensor(axis_world, device=v.device, dtype=v.dtype)
-    a = a / torch.norm(a).clamp_min(1e-9)
-    v_push = torch.sum(v * a.unsqueeze(0), dim=-1)
-    return torch.relu(-v_push - float(min_backward_speed_m_s))
 
 
-def insert_gripper_closing_step_reward(
-    env: ManagerBasedRLEnv,
-    asset_cfg: SceneEntityCfg,
-    open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    pcb_cfg: SceneEntityCfg | None = None,
-    left_finger_cfg: SceneEntityCfg | None = None,
-    right_finger_cfg: SceneEntityCfg | None = None,
-    half_length_m: float | None = None,
-    gate_dist_m: float | None = None,
-    pcb_half_thickness_m: float = 0.00125,
-    width_weight: float = 3.0,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """Per-step closedness while ``left_carriage_joint`` stays below ``max_gripper_gap_m``."""
-    robot = env.scene[asset_cfg.name]
-    gq = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
-    gap_ok = gq < float(max_gripper_gap_m)
-    closedness = _gripper_closedness_to_target(gq, open_width_m, closed_target_m)
-    reward = torch.where(gap_ok, closedness, torch.zeros_like(closedness))
-
-    if pcb_cfg is None or left_finger_cfg is None or right_finger_cfg is None:
-        return reward
-
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
-    )
-    is_straddled = (w_left * w_right < 0.0).to(reward.dtype)
-    gate = is_straddled
-    if half_length_m is not None and gate_dist_m is not None:
-        near_edge = _both_jaws_near_trailing_edge(
-            env,
-            pcb_cfg,
-            left_finger_cfg,
-            right_finger_cfg,
-            half_length_m,
-            gate_dist_m,
-            pcb_half_thickness_m,
-            width_weight,
-            tip_offset_m,
-            wrist_body_cfg,
-        )
-        gate = is_straddled * near_edge.to(dtype=reward.dtype)
-    return reward * gate
 
 
 def gripper_gap_excess_penalty(
@@ -3990,78 +3743,10 @@ def pcb_root_center_z_excess_penalty(
     return torch.relu(z_env - ref - float(max_excess_m))
 
 
-def _insert_success_in_range(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    target_lead_xyz_env: tuple[float, float, float],
-    tolerance_xyz_m: tuple[float, float, float],
-    gripper_joint_cfg: SceneEntityCfg | None,
-    max_gripper_gap_m: float,
-    axis_world: tuple[float, float, float],
-) -> torch.Tensor:
-    """Leading short-edge centre inside XYZ box and gripper gap below threshold."""
-    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
-    tgt = torch.tensor(target_lead_xyz_env, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    tol = torch.tensor(tolerance_xyz_m, device=lead_env.device, dtype=lead_env.dtype).unsqueeze(0)
-    delta = torch.abs(lead_env - tgt)
-    in_range = (
-        (delta[:, 0] <= tol[:, 0])
-        & (delta[:, 1] <= tol[:, 1])
-        & (delta[:, 2] <= tol[:, 2])
-    )
-    if gripper_joint_cfg is not None:
-        robot = env.scene[gripper_joint_cfg.name]
-        gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]]
-        in_range = in_range & (gq < float(max_gripper_gap_m))
-    return in_range
 
 
-def insert_success(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    target_lead_xyz_env: tuple[float, float, float],
-    tolerance_xyz_m: tuple[float, float, float] = (0.008, 0.020, 0.008),
-    gripper_joint_cfg: SceneEntityCfg | None = None,
-    max_gripper_gap_m: float = 0.0013,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-) -> torch.Tensor:
-    """Insert success: staged leading-edge XYZ target reached with gripper still closed."""
-    return _insert_success_in_range(
-        env,
-        pcb_cfg,
-        half_length_m,
-        target_lead_xyz_env,
-        tolerance_xyz_m,
-        gripper_joint_cfg,
-        max_gripper_gap_m,
-        axis_world,
-    )
 
 
-def insert_success_bonus_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    target_lead_xyz_env: tuple[float, float, float],
-    tolerance_xyz_m: tuple[float, float, float] = (0.008, 0.020, 0.008),
-    gripper_joint_cfg: SceneEntityCfg | None = None,
-    max_gripper_gap_m: float = 0.0013,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-) -> torch.Tensor:
-    """Sparse bonus (1.0) when :func:`insert_success` conditions are met."""
-    achieved = _insert_success_in_range(
-        env,
-        pcb_cfg,
-        half_length_m,
-        target_lead_xyz_env,
-        tolerance_xyz_m,
-        gripper_joint_cfg,
-        max_gripper_gap_m,
-        axis_world,
-    )
-    return achieved.to(dtype=env.scene[pcb_cfg.name].data.root_pos_w.dtype)
 
 
 def pcb_root_height_below_env_minimum(
@@ -4207,167 +3892,10 @@ def pcb_long_axis_xy_rotation_exceeds(
     return align < float(min_xy_alignment)
 
 
-def _grasp_not_yet_achieved(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    min_between_quality: float,
-    min_closing_reward: float,
-    proximity_sigma_m: float,
-    pcb_half_thickness_m: float = 0.0005,
-    min_along_m: float = 0.0,
-    min_straddle_sep_m: float = 0.0005,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.010,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """True while a valid edge-centre grasp has **not** been achieved."""
-    return ~grasp_edge_center_achieved(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        gripper_joint_cfg,
-        half_length_m,
-        open_width_m,
-        closed_target_m,
-        max_gripper_gap_m,
-        min_between_quality,
-        min_closing_reward,
-        proximity_sigma_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        width_sigma_m=width_sigma_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_span_frac=min_span_frac,
-        gate_dist_m=gate_dist_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
 
 
-def pcb_tilt_before_grasp_termination(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    min_between_quality: float,
-    min_closing_reward: float,
-    proximity_sigma_m: float,
-    pcb_half_thickness_m: float = 0.0005,
-    min_along_m: float = 0.0,
-    min_straddle_sep_m: float = 0.0005,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.010,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
-    max_tilt_penalty: float = 0.01,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """Terminate on excessive thickness-axis tilt (board not flat) **before** grasp success."""
-    tilt_fail = pcb_tilt_beyond_limit(env, pcb_cfg, world_up=world_up, max_tilt_penalty=max_tilt_penalty)
-    pre_grasp = _grasp_not_yet_achieved(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        gripper_joint_cfg,
-        half_length_m,
-        open_width_m,
-        closed_target_m,
-        max_gripper_gap_m,
-        min_between_quality,
-        min_closing_reward,
-        proximity_sigma_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        width_sigma_m=width_sigma_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_span_frac=min_span_frac,
-        gate_dist_m=gate_dist_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    return tilt_fail & pre_grasp
 
 
-def pcb_xy_plane_rotation_before_grasp_termination(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    gripper_joint_cfg: SceneEntityCfg,
-    half_length_m: float,
-    open_width_m: float,
-    closed_target_m: float,
-    max_gripper_gap_m: float,
-    min_between_quality: float,
-    min_closing_reward: float,
-    proximity_sigma_m: float,
-    pcb_half_thickness_m: float = 0.0005,
-    min_along_m: float = 0.0,
-    min_straddle_sep_m: float = 0.0005,
-    width_weight: float = 3.0,
-    width_sigma_m: float = 0.010,
-    jaw_thick_gate_std_m: float | None = 0.003,
-    min_span_frac: float = 0.01,
-    gate_dist_m: float | None = None,
-    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
-    min_xy_alignment: float = 0.97,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> torch.Tensor:
-    """Terminate on excessive long-axis yaw in the XY plane **before** grasp success."""
-    yaw_fail = pcb_long_axis_xy_rotation_exceeds(
-        env, pcb_cfg, axis_world=axis_world, min_xy_alignment=min_xy_alignment
-    )
-    pre_grasp = _grasp_not_yet_achieved(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        gripper_joint_cfg,
-        half_length_m,
-        open_width_m,
-        closed_target_m,
-        max_gripper_gap_m,
-        min_between_quality,
-        min_closing_reward,
-        proximity_sigma_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        width_weight=width_weight,
-        width_sigma_m=width_sigma_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_span_frac=min_span_frac,
-        gate_dist_m=gate_dist_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-    )
-    return yaw_fail & pre_grasp
 
 
 # Counts consecutive env steps where the PCB moves backward (−Y).
@@ -4447,82 +3975,6 @@ def reset_robot_joints_to_values_randomized(
     robot.update(0.0)
 
 
-def snap_pcb_root_to_short_edge_grasp(
-    env: ManagerBasedRLEnv,
-    env_ids: torch.Tensor,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    rot_wxyz: tuple[float, float, float, float] | None = None,
-    velocity_scale: float = 0.0,
-    center_offset_body_m: tuple[float, float, float] = (0.0, 0.0, 0.0),
-    min_center_z_env_local: float | None = None,
-    max_center_z_env_local: float | None = None,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-    slot_mouth_y_env: float = 0.198,
-) -> None:
-    """Place PCB root so the push-face center matches the jaw midpoint (kinematic grasp contact).
-
-    Uses the same geometry as :func:`pcb_trailing_short_edge_center_w`. Solving
-    ``trailing = jaw_mid`` gives ``pcb_center = jaw_mid + sign * half_length * body+X_world``
-    where ``sign = sign(dot(body+X, push_axis))``.
-
-    ``center_offset_body_m`` nudges the root in **PCB body** axes (tune if the USD finger origins
-    sit on carriage housing so the analytic mid misses the actual pad gap).
-
-    Vertical alignment: PCB centre Z is set to the jaw midpoint Z (top/bottom pinch) so the board
-    stays kinematically attached to the fingers.
-
-    .. warning::
-        Do **not** pass a large ``min_center_z_env_local`` during insert-phase reset.
-        Values such as ``_PCB_CENTER_Z_ENV`` (+70 mm above the conveyor) raise the PCB centre
-        above the jaw midpoint, breaking the grasp and leaving the board overlapping the guide
-        rails where PhysX friction pins it in place.
-    """
-    pcb = env.scene[pcb_cfg.name]
-    robot = env.scene[left_finger_cfg.name]
-    robot.update(0.0)
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)[env_ids]
-    n = len(env_ids)
-    dtype = mid.dtype
-    device = env.device
-    if rot_wxyz is not None:
-        q = torch.tensor(rot_wxyz, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
-    elif hasattr(env, "_sampled_pcb_quat"):
-        q = env._sampled_pcb_quat[env_ids].to(device=device, dtype=dtype)
-    else:
-        raise RuntimeError(
-            "snap_pcb_root_to_short_edge_grasp requires rot_wxyz or a prior "
-            "reset_from_grasp_states call that sets env._sampled_pcb_quat."
-        )
-    local_x = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
-    x_w = math_utils.quat_apply(q, local_x)
-    push = torch.tensor(_DEFAULT_PUSH_AXIS_WORLD, device=device, dtype=dtype)
-    push = push / torch.norm(push).clamp_min(1e-9)
-    sign = torch.sign(torch.sum(x_w * push.unsqueeze(0).expand(n, -1), dim=-1))
-    sign = torch.where(torch.abs(sign) < 1e-6, torch.ones_like(sign), sign)
-    ob = torch.tensor(center_offset_body_m, device=device, dtype=dtype).unsqueeze(0).expand(n, -1)
-    off_w = math_utils.quat_apply(q, ob)
-    center_w = mid + sign.unsqueeze(-1) * float(half_length_m) * x_w + off_w
-    center_w[:, 2] = mid[:, 2]
-    origins_z = env.scene.env_origins[env_ids, 2]
-    if min_center_z_env_local is not None:
-        min_cz = origins_z + float(min_center_z_env_local)
-        center_w[:, 2] = torch.maximum(center_w[:, 2], min_cz)
-    if max_center_z_env_local is not None:
-        max_cz = origins_z + float(max_center_z_env_local)
-        center_w[:, 2] = torch.minimum(center_w[:, 2], max_cz)
-    root_pose = torch.cat([center_w, q], dim=-1)
-
-    default_root_state = pcb.data.default_root_state[env_ids].clone()
-    root_vel = default_root_state[:, 7:13] * velocity_scale
-    pcb.write_root_pose_to_sim(root_pose, env_ids=env_ids)
-    pcb.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
-    pcb.update(0.0)
-
-    _store_insert_progress_baselines(env, env_ids, pcb_cfg, half_length_m, slot_mouth_y_env)
 
 
 def _store_insert_progress_baselines(
@@ -4700,14 +4152,14 @@ def pcb_gripper_straddled_mask(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     min_straddle_sep_m: float = 0.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    min_span_frac: float = 0.01,
 ) -> torch.Tensor:
-    """True where PCB thickness-axis offsets from each jaw have opposite signs (straddle)."""
-    w_left, w_right = _finger_thickness_offsets(
-        env, pcb_cfg, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+    """True when the PCB is centred in an open width-axis jaw span (trailing-edge push straddle)."""
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
+    return _width_straddle_ready_mask(
+        env, pcb_cfg, left, right, min_straddle_sep_m, min_span_frac
     )
-    return (w_left * w_right < 0.0) & (torch.abs(w_left - w_right) >= float(min_straddle_sep_m))
 
 
 def pcb_gripper_straddle_lost(
@@ -4716,7 +4168,6 @@ def pcb_gripper_straddle_lost(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     min_straddle_sep_m: float = 0.0,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     min_episode_steps: int = 0,
 ) -> torch.Tensor:
@@ -4727,7 +4178,6 @@ def pcb_gripper_straddle_lost(
         left_finger_cfg,
         right_finger_cfg,
         min_straddle_sep_m=min_straddle_sep_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
     if min_episode_steps > 0:
@@ -4750,13 +4200,12 @@ def pcb_detached_from_gripper(
     width_weight: float = 3.0,
     min_height_env: float | None = None,
     min_episode_steps: int = 2,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     check_straddle: bool = True,
 ) -> torch.Tensor:
     """True when the PCB is no longer kinematically held by the gripper.
 
-    Uses the same trailing-edge grasp geometry as :func:`grasp_edge_center_achieved`, but with
+    Uses trailing-edge geometry relative to the gripper midpoint, but with
     **looser** detach thresholds so minor insertion wobble does not false-trigger while a real
     slip / drop does.
 
@@ -4772,8 +4221,6 @@ def pcb_detached_from_gripper(
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
     )
     if max_edge_along_m is not None or max_edge_in_plane_m is not None:
         lost_edge = torch.zeros(env.num_envs, device=env.device, dtype=torch.bool)
@@ -4791,7 +4238,6 @@ def pcb_detached_from_gripper(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     lost_fingers = torch.maximum(geom["dist_l"], geom["dist_r"]) > float(max_finger_dist_m)
@@ -4803,7 +4249,6 @@ def pcb_detached_from_gripper(
             left_finger_cfg,
             right_finger_cfg,
             min_straddle_sep_m=min_straddle_sep_m,
-            tip_offset_m=tip_offset_m,
             wrist_body_cfg=wrist_body_cfg,
         )
         detached = detached | lost_straddle
@@ -4837,7 +4282,6 @@ def pcb_extreme_drift_from_gripper(
     check_perp_drift: bool = True,
     check_vertical_sep: bool = True,
     check_flying: bool = True,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
     """True when the PCB has clearly escaped the gripper (large gap, slide, or tumbling).
@@ -4857,7 +4301,7 @@ def pcb_extreme_drift_from_gripper(
     :func:`pcb_detached_from_gripper` for moderate slip.
     """
     pcb = env.scene[pcb_cfg.name]
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     mid_root_dist = torch.norm(pcb.data.root_pos_w - mid, dim=-1)
     extreme_sep = mid_root_dist > (float(half_length_m) + float(max_extra_sep_m))
 
@@ -4869,7 +4313,6 @@ def pcb_extreme_drift_from_gripper(
         half_length_m,
         pcb_half_thickness_m,
         width_weight,
-        tip_offset_m,
         wrist_body_cfg,
     )
     finger_gap = torch.maximum(geom["dist_l"], geom["dist_r"]) > float(max_finger_dist_m)
@@ -4880,8 +4323,6 @@ def pcb_extreme_drift_from_gripper(
         left_finger_cfg,
         right_finger_cfg,
         half_length_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
     )
     edge_lost = edge_dist > float(max_edge_dist_m)
 
@@ -4920,7 +4361,6 @@ def pcb_dropped_from_gripper(
     distance_tolerance: float = 0.08,
     min_height: float = 0.02,
     check_grasp_geometry: bool = True,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     half_length_m: float = 0.12,
     max_edge_dist_m: float = 0.040,
@@ -4945,7 +4385,6 @@ def pcb_dropped_from_gripper(
             max_edge_dist_m=max_edge_dist_m,
             max_finger_dist_m=max_finger_dist_m,
             min_height_env=min_height_env,
-            tip_offset_m=tip_offset_m,
             wrist_body_cfg=wrist_body_cfg,
         )
 
@@ -4960,8 +4399,8 @@ def pcb_dropped_from_gripper(
 # ---------------------------------------------------------------------------
 
 # Module-level cache — loaded once on first call.
-_GRASP_STATE_BUFFER: dict | None = None
-_GRASP_BUFFER_PATH: str | None = None
+_STRADDLE_STATE_BUFFER: dict | None = None
+_STRADDLE_BUFFER_PATH: str | None = None
 
 
 def _buffer_gripper_closed_mask(buf: dict, max_gripper_gap_m: float) -> torch.Tensor | None:
@@ -4978,11 +4417,11 @@ def _compose_buffer_row_mask(buf: dict, path: str, max_gripper_gap_m: float = 0.
     return _buffer_gripper_closed_mask(buf, max_gripper_gap_m)
 
 
-def _load_grasp_state_buffer(path: str, max_gripper_gap_m: float = 0.001) -> dict:
-    """Load (or re-use cached) grasp terminal state .npz file."""
-    global _GRASP_STATE_BUFFER, _GRASP_BUFFER_PATH
-    if _GRASP_STATE_BUFFER is not None and _GRASP_BUFFER_PATH == path:
-        return _GRASP_STATE_BUFFER
+def _load_straddle_state_buffer(path: str, max_gripper_gap_m: float = 0.001) -> dict:
+    """Load (or re-use cached) straddle terminal state .npz file."""
+    global _STRADDLE_STATE_BUFFER, _STRADDLE_BUFFER_PATH
+    if _STRADDLE_STATE_BUFFER is not None and _STRADDLE_BUFFER_PATH == path:
+        return _STRADDLE_STATE_BUFFER
     data = np.load(path, allow_pickle=True)
     buffer: dict = {
         "joint_pos": torch.from_numpy(data["joint_pos"].astype(np.float32)),
@@ -4996,16 +4435,16 @@ def _load_grasp_state_buffer(path: str, max_gripper_gap_m: float = 0.001) -> dic
     buffer["row_mask"] = _compose_buffer_row_mask(buffer, path, max_gripper_gap_m)
     if buffer["row_mask"] is not None:
         n_ok = int(buffer["row_mask"].sum().item())
-        print(f"[GraspStateBuffer] {n_ok}/{n} rows pass insert sampling mask")
+        print(f"[StraddleStateBuffer] {n_ok}/{n} rows pass slide sampling mask")
         if n_ok == 0:
             raise RuntimeError(
-                f"No valid rows in grasp state buffer '{path}'. "
+                f"No valid rows in straddle state buffer '{path}'. "
                 "Re-collect slide_terminal_states.npz with collect_slide_states.py."
             )
-    _GRASP_STATE_BUFFER = buffer
-    _GRASP_BUFFER_PATH = path
-    print(f"[GraspStateBuffer] Loaded {n} terminal states from '{path}'")
-    return _GRASP_STATE_BUFFER
+    _STRADDLE_STATE_BUFFER = buffer
+    _STRADDLE_BUFFER_PATH = path
+    print(f"[StraddleStateBuffer] Loaded {n} terminal states from '{path}'")
+    return _STRADDLE_STATE_BUFFER
 
 
 def sync_gripper_position_target_to_sim(
@@ -5054,87 +4493,18 @@ def sync_gripper_position_target_to_sim(
     robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=env_ids)
 
 
-def hold_gripper_open_until_straddle(
+
+
+def hold_gripper_open(
     env: ManagerBasedEnv,
     env_ids: Sequence[int] | torch.Tensor | None,
     asset_cfg: SceneEntityCfg,
     joint_name: str,
     open_width_m: float,
-    pcb_cfg: SceneEntityCfg,
-    left_finger_cfg: SceneEntityCfg,
-    right_finger_cfg: SceneEntityCfg,
-    half_length_m: float,
-    pcb_half_thickness_m: float,
-    min_along_m: float,
-    min_straddle_sep_m: float,
-    min_span_frac: float,
-    jaw_thick_gate_std_m: float | None,
-    min_height_factor: float,
-    tip_offset_m: float = 0.0,
-    wrist_body_cfg: SceneEntityCfg | None = None,
-) -> None:
-    """Re-command open PD each control step until hard straddle (belt-and-suspenders with action gate)."""
-    if env_ids is None:
-        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
-    elif not isinstance(env_ids, torch.Tensor):
-        env_ids = torch.as_tensor(list(env_ids), device=env.device, dtype=torch.long)
-    if len(env_ids) == 0:
-        return
-
-    ready = pcb_open_straddle_ready(
-        env,
-        pcb_cfg,
-        left_finger_cfg,
-        right_finger_cfg,
-        half_length_m,
-        pcb_half_thickness_m=pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
-        wrist_body_cfg=wrist_body_cfg,
-        min_span_frac=min_span_frac,
-        min_along_m=min_along_m,
-        min_straddle_sep_m=min_straddle_sep_m,
-        jaw_thick_gate_std_m=jaw_thick_gate_std_m,
-        min_height_factor=min_height_factor,
-    ).reshape(env.num_envs).bool()
-    not_ready_ids = (~ready).nonzero(as_tuple=False).view(-1)
-    if not_ready_ids.numel() == 0:
-        return
-
-    robot: Articulation = env.scene[asset_cfg.name]
-    joint_ids, _ = robot.find_joints(joint_name)
-    jid = joint_ids[0]
-    target = torch.full(
-        (not_ready_ids.numel(), 1),
-        float(open_width_m),
-        device=env.device,
-        dtype=robot.data.joint_pos.dtype,
-    )
-    zeros = torch.zeros_like(target)
-    robot.set_joint_position_target(target, joint_ids=[jid], env_ids=not_ready_ids)
-    robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=not_ready_ids)
-
-
-def hold_gripper_closed(
-    env: ManagerBasedEnv,
-    env_ids: Sequence[int] | torch.Tensor | None,
-    asset_cfg: SceneEntityCfg,
-    joint_name: str = "left_carriage_joint",
-    closed_target_m: float = 0.00025,
     match_sim_state: bool = False,
     store_target: bool = False,
 ) -> None:
-    """Command the parallel gripper closed when it is excluded from the action space.
-
-    Insert training only actuates the arm.  Without this, ``joint_pos_target`` for the carriage
-    joint stays at its init value (0) while the reset pose is closed — the implicit PD then
-    drives the jaws open and the PCB slips.
-
-    At reset, pass ``match_sim_state=True`` and ``store_target=True`` so the PD target matches
-    the buffer pinch pose but is tightened to ``closed_target_m`` when the buffer row is looser.
-    Per-env targets are cached on ``env._gripper_hold_target_m`` for re-application during
-    the episode (``RelativeJointPositionActionWithGripperHold`` calls this after each arm
-    command; contact forces can otherwise drift the implicit target open).
-    """
+    """Command the parallel gripper to stay open (Phase 1 straddle / open-gripper slide)."""
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     elif not isinstance(env_ids, torch.Tensor):
@@ -5145,69 +4515,39 @@ def hold_gripper_closed(
     robot: Articulation = env.scene[asset_cfg.name]
     joint_ids, _ = robot.find_joints(joint_name)
     jid = joint_ids[0]
-    closed_val = float(closed_target_m)
+    open_val = float(open_width_m)
+
     if match_sim_state:
-        target = robot.data.joint_pos[env_ids, jid].clone()
-        # Smaller carriage joint value = tighter pinch; clamp looser buffer poses closed.
-        target = torch.minimum(
-            target,
-            torch.full_like(target, closed_val),
-        )
-    elif hasattr(env, "_gripper_hold_target_m"):
-        target = env._gripper_hold_target_m[env_ids].clone()
+        target = robot.data.joint_pos[env_ids, jid].unsqueeze(-1)
     else:
         target = torch.full(
-            (len(env_ids),),
-            closed_val,
+            (len(env_ids), 1),
+            open_val,
             device=env.device,
             dtype=robot.data.joint_pos.dtype,
         )
 
-    if store_target or not hasattr(env, "_gripper_hold_target_m"):
+    if store_target:
         if not hasattr(env, "_gripper_hold_target_m"):
             env._gripper_hold_target_m = torch.full(
                 (env.num_envs,),
-                closed_val,
+                open_val,
                 device=env.device,
                 dtype=robot.data.joint_pos.dtype,
             )
-        env._gripper_hold_target_m[env_ids] = target
+        env._gripper_hold_target_m[env_ids] = target.squeeze(-1)
 
-    target = target.unsqueeze(-1)
     zeros = torch.zeros_like(target)
     robot.set_joint_position_target(target, joint_ids=[jid], env_ids=env_ids)
     robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=env_ids)
 
-
-class RelativeJointPositionActionWithGripperHold(joint_actions.RelativeJointPositionAction):
-    """Relative arm deltas, then re-command the gripper closed after each action write.
-
-    Isaac Lab applies interval events after the physics substep loop; arm ``apply_action``
-    runs inside that loop and can leave the carriage joint target stale/open.  Re-applying
-    ``hold_gripper_closed`` here keeps the PD target closed on every physics substep.
-    """
-
-    cfg: "RelativeJointPositionActionWithGripperHoldCfg"
-
-    def apply_actions(self) -> None:
-        super().apply_actions()
-        hold_gripper_closed(
-            self._env,
-            None,
-            self.cfg.gripper_hold_asset_cfg,
-            joint_name=self.cfg.gripper_joint_name,
-            closed_target_m=self.cfg.gripper_closed_target_m,
-        )
-
-
-@configclass
-class RelativeJointPositionActionWithGripperHoldCfg(RelativeJointPositionActionCfg):
-    """Arm-only relative deltas with post-action gripper hold (Slide / Insert phases)."""
-
-    class_type: type[ActionTerm] = RelativeJointPositionActionWithGripperHold
-    gripper_hold_asset_cfg: SceneEntityCfg = MISSING
-    gripper_joint_name: str = "left_carriage_joint"
-    gripper_closed_target_m: float = 0.00025
+    # Snap sim state on reset only; interval steps rely on PD to avoid fighting contacts.
+    if not match_sim_state and store_target:
+        joint_pos = robot.data.joint_pos[env_ids].clone()
+        joint_pos[:, jid] = target.squeeze(-1)
+        joint_vel = robot.data.joint_vel[env_ids].clone()
+        joint_vel[:, jid] = 0.0
+        robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
 
 
 def _pcb_tilt_penalty_from_quat_batch(
@@ -5228,7 +4568,7 @@ def _pcb_tilt_penalty_from_quat_batch(
     return 1.0 - torch.clamp(align, max=1.0)
 
 
-def _sample_grasp_buffer_indices(
+def _sample_straddle_buffer_indices(
     pcb_pos_env: torch.Tensor,
     n_samples: int,
     pcb_z_reference: float,
@@ -5253,7 +4593,7 @@ def _sample_grasp_buffer_indices(
                 pick = torch.randint(0, fallback.numel(), (n_samples,), device="cpu")
                 return fallback[pick]
             raise RuntimeError(
-                "Grasp state buffer row_mask is empty — cannot sample a valid terminal state."
+                "Straddle state buffer row_mask is empty — cannot sample a valid terminal state."
             )
         return torch.randint(0, pcb_pos_env.shape[0], (n_samples,), device="cpu")
     pick = torch.randint(0, valid_idx.numel(), (n_samples,), device="cpu")
@@ -5272,7 +4612,7 @@ def _sample_buffer_row_indices(
     """Sample buffer rows with optional Z / tilt / row-mask filters."""
     n_buf = buf["pcb_pos_env"].shape[0]
     if z_ref is not None:
-        return _sample_grasp_buffer_indices(
+        return _sample_straddle_buffer_indices(
             buf["pcb_pos_env"],
             n_samples,
             float(z_ref),
@@ -5285,7 +4625,7 @@ def _sample_buffer_row_indices(
         valid_idx = torch.nonzero(row_mask.bool(), as_tuple=False).view(-1)
         if valid_idx.numel() == 0:
             raise RuntimeError(
-                "Grasp state buffer row_mask is empty — cannot sample a valid terminal state."
+                "Straddle state buffer row_mask is empty — cannot sample a valid terminal state."
             )
         pick = torch.randint(0, valid_idx.numel(), (n_samples,), device="cpu")
         return valid_idx[pick]
@@ -5297,11 +4637,10 @@ def _gripper_midpoint_z_w(
     env_ids: torch.Tensor,
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
 ) -> torch.Tensor:
-    """World Z of the gripper jaw midpoint (pad tips when ``tip_offset_m`` > 0)."""
-    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg)
+    """World Z of the gripper jaw midpoint."""
+    mid = gripper_midpoint_world(env, left_finger_cfg, right_finger_cfg)
     return mid[env_ids, 2]
 
 
@@ -5312,7 +4651,6 @@ def _lift_robot_wrist_z_by_delta(
     left_finger_cfg: SceneEntityCfg,
     right_finger_cfg: SceneEntityCfg,
     wrist_body_cfg: SceneEntityCfg | None,
-    tip_offset_m: float,
     delta_z_env: torch.Tensor,
     joint_names: tuple[str, ...] = ("joint_1", "joint_2"),
     joint_weights: tuple[float, ...] = (0.65, 0.35),
@@ -5342,7 +4680,7 @@ def _lift_robot_wrist_z_by_delta(
         joint_ids.append(ids[0])
 
     z_now = _gripper_midpoint_z_w(
-        env, env_ids, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+        env, env_ids, left_finger_cfg, right_finger_cfg, wrist_body_cfg
     )
     target_z = z_now + delta_z_env
 
@@ -5364,11 +4702,11 @@ def _lift_robot_wrist_z_by_delta(
         robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
         robot.update(0.0)
         z_now = _gripper_midpoint_z_w(
-            env, env_ids, left_finger_cfg, right_finger_cfg, tip_offset_m, wrist_body_cfg
+            env, env_ids, left_finger_cfg, right_finger_cfg, wrist_body_cfg
         )
 
-    if hasattr(env, "_insert_reset_joint_pos"):
-        env._insert_reset_joint_pos[env_ids] = robot.data.joint_pos[env_ids].clone()
+    if hasattr(env, "_slide_reset_joint_pos"):
+        env._slide_reset_joint_pos[env_ids] = robot.data.joint_pos[env_ids].clone()
 
 
 def _apply_robot_vertical_z_lift(
@@ -5400,8 +4738,8 @@ def _apply_robot_vertical_z_lift(
     joint_vel_new = torch.zeros_like(joint_pos_new)
     robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
     robot.update(0.0)
-    if hasattr(env, "_insert_reset_joint_pos"):
-        env._insert_reset_joint_pos[env_ids] = joint_pos_new.clone()
+    if hasattr(env, "_slide_reset_joint_pos"):
+        env._slide_reset_joint_pos[env_ids] = joint_pos_new.clone()
 
 
 def _zero_entity_velocities_after_reset(
@@ -5423,53 +4761,18 @@ def _zero_entity_velocities_after_reset(
         robot.update(0.0)
 
 
-def settle_physics_after_buffer_reset(
-    env: ManagerBasedEnv,
-    env_ids: torch.Tensor,
-    num_steps: int = 16,
-    pcb_cfg: SceneEntityCfg | None = None,
-    robot_cfg: SceneEntityCfg | None = None,
-    gripper_asset_cfg: SceneEntityCfg | None = None,
-    gripper_joint_name: str = "left_carriage_joint",
-    gripper_closed_target_m: float = 0.00025,
-    hold_gripper_closed_during_settle: bool = True,
-) -> None:
-    """Run a short passive physics settle after buffer teleports, then zero velocities."""
-    if len(env_ids) == 0 or num_steps <= 0:
-        return
-    env.scene.write_data_to_sim()
-    for _ in range(int(num_steps)):
-        if hold_gripper_closed_during_settle and gripper_asset_cfg is not None:
-            hold_gripper_closed(
-                env,
-                env_ids,
-                gripper_asset_cfg,
-                joint_name=gripper_joint_name,
-                closed_target_m=gripper_closed_target_m,
-            )
-        env.sim.step(render=False)
-        env.scene.update(dt=env.physics_dt)
-    _zero_entity_velocities_after_reset(env, env_ids, pcb_cfg=pcb_cfg, robot_cfg=robot_cfg)
-    if hold_gripper_closed_during_settle and gripper_asset_cfg is not None:
-        hold_gripper_closed(
-            env,
-            env_ids,
-            gripper_asset_cfg,
-            joint_name=gripper_joint_name,
-            closed_target_m=gripper_closed_target_m,
-            match_sim_state=True,
-            store_target=True,
-        )
 
 
-def reset_from_grasp_states(
+def reset_from_straddle_states(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     asset_cfg: SceneEntityCfg,
-    grasp_states_path: str,
+    straddle_states_path: str,
     velocity_scale: float = 0.0,
     gripper_joint_name: str = "left_carriage_joint",
     gripper_closed_target_m: float = 0.00025,
+    gripper_open_target_m: float | None = None,
+    gripper_hold_open: bool = False,
     pcb_z_filter_env: float | None = None,
     max_pcb_z_delta_m: float = 0.025,
     max_buffer_tilt_penalty: float | None = None,
@@ -5477,21 +4780,24 @@ def reset_from_grasp_states(
     max_rail_z_delta_m: float | None = None,
     apply_gripper_hold_on_reset: bool = True,
 ) -> None:
-    """Reset **robot joints only** by sampling from the saved grasp terminal-state buffer.
+    """Reset **robot joints only** by sampling from the saved straddle terminal-state buffer.
 
     Implements the Phase-2 initial-state distribution from Sequential Dexterity
-    (Chen et al. CoRL 2023): the terminal state distribution of Phase 1 (Grasp)
-    becomes the initial state distribution of Phase 2 (Insert).
+    (Chen et al. CoRL 2023): the terminal state distribution of Phase 1 (Straddle)
+    becomes the initial state distribution of Phase 2 (Slide).
 
-    Stores ``env._grasp_buffer_idx`` so :func:`reset_pcb_from_grasp_states` can load
+    Stores ``env._straddle_buffer_idx`` so :func:`reset_pcb_from_straddle_states` can load
     the matching ``pcb_pos_env`` / ``pcb_quat`` from the same buffer row.
 
     Parameters
     ----------
-    grasp_states_path:
-        Path to the .npz produced by ``scripts/collect_grasp_states.py``.
+    straddle_states_path:
+        Path to the .npz produced by ``scripts/collect_straddle_states.py`` (or legacy
+        ``collect_grasp_states.py``).
+    gripper_hold_open:
+        When True, PD-hold the gripper at ``gripper_open_target_m`` (open-gripper slide).
     """
-    buf = _load_grasp_state_buffer(grasp_states_path)
+    buf = _load_straddle_state_buffer(straddle_states_path)
     n_buf = buf["joint_pos"].shape[0]
     n_reset = len(env_ids)
     device = env.device
@@ -5511,9 +4817,9 @@ def reset_from_grasp_states(
         max_tilt_penalty=max_buffer_tilt_penalty,
         row_mask=row_mask,
     )
-    if not hasattr(env, "_grasp_buffer_idx"):
-        env._grasp_buffer_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
-    env._grasp_buffer_idx[env_ids] = idx.to(device=env.device)
+    if not hasattr(env, "_straddle_buffer_idx"):
+        env._straddle_buffer_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+    env._straddle_buffer_idx[env_ids] = idx.to(device=env.device)
 
     # ── Robot joints ──────────────────────────────────────────────────────────
     robot = env.scene[asset_cfg.name]
@@ -5538,24 +4844,39 @@ def reset_from_grasp_states(
     robot.write_joint_state_to_sim(joint_pos_new, joint_vel_new, env_ids=env_ids)
     robot.update(0.0)
 
-    # Insert obs: joint_pos relative to this reset pose (not HOME default).
-    if not hasattr(env, "_insert_reset_joint_pos"):
-        env._insert_reset_joint_pos = torch.zeros(
+    # Slide obs: joint_pos relative to this reset pose (not HOME default).
+    if not hasattr(env, "_slide_reset_joint_pos"):
+        env._slide_reset_joint_pos = torch.zeros(
             (env.num_envs, robot.num_joints), device=device, dtype=dtype
         )
-    env._insert_reset_joint_pos[env_ids] = joint_pos_new.clone()
+    env._slide_reset_joint_pos[env_ids] = joint_pos_new.clone()
 
     if apply_gripper_hold_on_reset:
-        # Match PD target to the buffer pinch pose; tighten if looser than ``gripper_closed_target_m``.
-        hold_gripper_closed(
-            env,
-            env_ids,
-            asset_cfg,
-            joint_name=gripper_joint_name,
-            closed_target_m=gripper_closed_target_m,
-            match_sim_state=True,
-            store_target=True,
-        )
+        gripper_ids, _ = robot.find_joints(gripper_joint_name)
+        if gripper_hold_open:
+            if gripper_open_target_m is not None:
+                open_target = float(gripper_open_target_m)
+            elif len(gripper_ids) > 0:
+                open_target = float(joint_pos_new[:, gripper_ids[0]].mean().item())
+            else:
+                open_target = 0.015
+            hold_gripper_open(
+                env,
+                env_ids,
+                asset_cfg,
+                joint_name=gripper_joint_name,
+                open_width_m=open_target,
+                match_sim_state=True,
+                store_target=True,
+            )
+        else:
+            joint_ids, _ = robot.find_joints(gripper_joint_name)
+            if len(joint_ids) > 0:
+                jid = joint_ids[0]
+                grip_target = joint_pos_new[:, jid].unsqueeze(-1)
+                robot.set_joint_position_target(grip_target, joint_ids=[jid], env_ids=env_ids)
+                zeros = torch.zeros_like(grip_target)
+                robot.set_joint_velocity_target(zeros, joint_ids=[jid], env_ids=env_ids)
     else:
         joint_ids, _ = robot.find_joints(gripper_joint_name)
         if len(joint_ids) > 0:
@@ -5572,11 +4893,11 @@ def reset_from_grasp_states(
     env._sampled_pcb_quat[env_ids] = pcb_quat_buf
 
 
-def reset_pcb_from_grasp_states(
+def reset_pcb_from_straddle_states(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     pcb_cfg: SceneEntityCfg,
-    grasp_states_path: str,
+    straddle_states_path: str,
     half_length_m: float,
     velocity_scale: float = 0.0,
     rail_center_z_env: float | None = None,
@@ -5590,7 +4911,6 @@ def reset_pcb_from_grasp_states(
     left_finger_cfg: SceneEntityCfg | None = None,
     right_finger_cfg: SceneEntityCfg | None = None,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    tip_offset_m: float = 0.0,
     wrist_lift_joint_names: tuple[str, ...] = ("joint_1", "joint_2"),
     wrist_lift_joint_weights: tuple[float, ...] = (0.65, 0.35),
     wrist_lift_max_iters: int = 12,
@@ -5606,7 +4926,7 @@ def reset_pcb_from_grasp_states(
 ) -> None:
     """Place the PCB at the Phase-1 terminal pose stored in the grasp buffer.
 
-    Must run **after** :func:`reset_from_grasp_states` so ``env._grasp_buffer_idx``
+    Must run **after** :func:`reset_from_straddle_states` so ``env._straddle_buffer_idx``
     points to the same buffer row as the robot joints.
 
     When ``snap_z_to_rail`` is True, centre Z is set to ``rail_center_z_env`` (+ optional
@@ -5614,17 +4934,17 @@ def reset_pcb_from_grasp_states(
     the arm wrist midpoint is raised to match the PCB Z delta before teleport.  Optional
     ``flatten_pcb_orientation`` replaces buffer quaternions with ``flat_rot_wxyz``.
     """
-    if not hasattr(env, "_grasp_buffer_idx"):
+    if not hasattr(env, "_straddle_buffer_idx"):
         raise RuntimeError(
-            "reset_pcb_from_grasp_states requires a prior reset_from_grasp_states call "
-            "that sets env._grasp_buffer_idx."
+            "reset_pcb_from_straddle_states requires a prior reset_from_straddle_states call "
+            "that sets env._straddle_buffer_idx."
         )
-    buf = _load_grasp_state_buffer(grasp_states_path)
+    buf = _load_straddle_state_buffer(straddle_states_path)
     pcb = env.scene[pcb_cfg.name]
     device = env.device
     dtype = torch.float32
 
-    idx = env._grasp_buffer_idx[env_ids].cpu()
+    idx = env._straddle_buffer_idx[env_ids].cpu()
     pos_env = buf["pcb_pos_env"][idx].to(device=device, dtype=dtype)
     delta_z_env = torch.zeros(len(env_ids), device=device, dtype=dtype)
     if snap_z_to_rail and rail_center_z_env is not None:
@@ -5645,7 +4965,6 @@ def reset_pcb_from_grasp_states(
                 left_finger_cfg,
                 right_finger_cfg,
                 wrist_body_cfg,
-                float(tip_offset_m),
                 delta_z_env,
                 joint_names=wrist_lift_joint_names,
                 joint_weights=wrist_lift_joint_weights,
@@ -5923,7 +5242,6 @@ def _insert_straddle_gate_mask(
     right_finger_cfg: SceneEntityCfg,
     half_length_m: float,
     pcb_half_thickness_m: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_sigma_m: float = 0.010,
 ) -> torch.Tensor:
@@ -5936,7 +5254,6 @@ def _insert_straddle_gate_mask(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         width_sigma_m=width_sigma_m,
     )
@@ -5953,7 +5270,6 @@ def _apply_insert_straddle_gate(
     right_finger_cfg: SceneEntityCfg | None,
     half_length_m: float,
     pcb_half_thickness_m: float,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_sigma_m: float = 0.010,
 ) -> torch.Tensor:
@@ -5968,7 +5284,6 @@ def _apply_insert_straddle_gate(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         width_sigma_m=width_sigma_m,
     )
@@ -5987,7 +5302,6 @@ def pcb_leading_edge_push_axis_approach_progress_gated(
     left_finger_cfg: SceneEntityCfg | None = None,
     right_finger_cfg: SceneEntityCfg | None = None,
     pcb_half_thickness_m: float = 0.00075,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_sigma_m: float = 0.025,
 ) -> torch.Tensor:
@@ -6007,7 +5321,6 @@ def pcb_leading_edge_push_axis_approach_progress_gated(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         width_sigma_m=width_sigma_m,
     )
@@ -6027,7 +5340,6 @@ def pcb_push_axis_progress_reward_gated(
     left_finger_cfg: SceneEntityCfg | None = None,
     right_finger_cfg: SceneEntityCfg | None = None,
     pcb_half_thickness_m: float = 0.00075,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_sigma_m: float = 0.025,
 ) -> torch.Tensor:
@@ -6055,7 +5367,6 @@ def pcb_push_axis_progress_reward_gated(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         width_sigma_m=width_sigma_m,
     )
@@ -6077,7 +5388,6 @@ def pcb_rail_parallel_approach_progress_straddle_gated(
     right_finger_cfg: SceneEntityCfg | None = None,
     half_length_m: float = 0.12,
     pcb_half_thickness_m: float = 0.00075,
-    tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_sigma_m: float = 0.025,
 ) -> torch.Tensor:
@@ -6103,7 +5413,6 @@ def pcb_rail_parallel_approach_progress_straddle_gated(
         right_finger_cfg,
         half_length_m,
         pcb_half_thickness_m,
-        tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         width_sigma_m=width_sigma_m,
     )
@@ -6409,73 +5718,3 @@ def gripper_mid_gated_push_axis_velocity_reward(
     return torch.where(pcb_pure & ee_pure & moving, reward, torch.zeros_like(reward))
 
 
-def pcb_insertion_sdf_reward(
-    env: ManagerBasedRLEnv,
-    pcb_cfg: SceneEntityCfg,
-    half_length_m: float,
-    slot_center_xyz_env: tuple[float, float, float],
-    slot_half_dims_xyz: tuple[float, float, float],
-    slot_mouth_y_env: float,
-    align_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0),
-    pos_sigma_m: float = 0.15,
-    align_coef: float = 0.20,
-    depth_coef: float = 0.60,
-) -> torch.Tensor:
-    """SDF-inspired dense reward for PCB-slot insertion (IndustReal §3.2).
-
-    Three components combined into one reward in ``[0, 1]``:
-
-    1. **Proximity** — ``exp(-dist / sigma)`` from PCB leading-edge to slot
-       center.  ``sigma`` must be set to ~½ the approach distance so the
-       gradient is non-zero well before contact.
-
-    2. **Alignment** — ``|cos θ|`` between the PCB long axis and the insertion
-       direction. Incentivises keeping the board parallel to +Y.
-
-    3. **Depth** — Linear fraction of penetration past the slot mouth,
-       normalised by ``slot_depth = 2 × slot_half_dims_xyz[1]`` (not by
-       ``half_length_m``). Ramps 0→1 over the actual slot depth.
-
-    Parameters
-    ----------
-    slot_mouth_y_env:
-        Env-local Y of the slot entrance plane.  Leading edge must cross this
-        before depth is non-zero.
-    pos_sigma_m:
-        Gaussian width for proximity.  Should be ~½ the distance from the PCB
-        start position to the slot center so the gradient reaches the start.
-    align_coef, depth_coef:
-        Component weights summing to ≤ 1 (remainder goes to proximity).
-    """
-    pcb = env.scene[pcb_cfg.name]
-    device = env.device
-    dtype = pcb.data.root_pos_w.dtype
-
-    # ── Leading edge position (env-local) ─────────────────────────────────────
-    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m)
-    lead_env = lead_w - env.scene.env_origins[:, :3]
-
-    slot_ctr = torch.tensor(slot_center_xyz_env, device=device, dtype=dtype)
-    slot_half = torch.tensor(slot_half_dims_xyz, device=device, dtype=dtype)
-
-    # ── 1. Proximity: Gaussian on distance to slot center ────────────────────
-    dist = torch.norm(lead_env - slot_ctr.unsqueeze(0), dim=-1)
-    prox = torch.exp(-dist / (float(pos_sigma_m) + 1e-9))
-
-    # ── 2. Alignment: PCB long axis ∥ insertion axis ─────────────────────────
-    x_w = pcb_body_axis_x_world(env, pcb_cfg)
-    a = torch.tensor(align_axis_world, device=device, dtype=dtype)
-    a = a / torch.norm(a).clamp_min(1e-9)
-    align = torch.abs(torch.sum(x_w * a.unsqueeze(0).expand_as(x_w), dim=-1))
-
-    # ── 3. Depth: penetration past slot mouth, normalised by slot depth ───────
-    slot_depth_m = 2.0 * float(slot_half[1])   # actual slot depth in metres
-    lead_y = lead_env[:, 1]
-    depth_frac = torch.clamp(
-        (lead_y - float(slot_mouth_y_env)) / (slot_depth_m + 1e-9),
-        min=0.0, max=1.0,
-    )
-
-    prox_coef = 1.0 - float(align_coef) - float(depth_coef)
-    reward = prox_coef * prox + float(align_coef) * align + float(depth_coef) * depth_frac
-    return reward.clamp(0.0, 1.0)
