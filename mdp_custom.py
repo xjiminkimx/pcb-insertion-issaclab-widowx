@@ -2493,6 +2493,91 @@ def straddle_trailing_face_approach_reward(
     return rew
 
 
+def straddle_trailing_face_overshoot_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    overshoot_std_m: float,
+    target_along_m: float = 0.0,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Shaping in ``[0, 1]`` that decays when pads move past the trailing face (overshoot).
+
+    Signed along offset vs trailing-face centre (body +X / push axis): negative = behind the
+    face, ``target_along_m`` = desired stop (0 = on the face).  Returns
+    ``min_jaw (1 - tanh(relu(along - target) / overshoot_std))`` so credit falls once either
+    pad crosses the face toward the slot (+Y).  Pair with :func:`straddle_trailing_face_approach_reward`
+    or use :func:`straddle_trailing_face_bounded_approach_reward` for a single bell-shaped term.
+    """
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    sig = float(overshoot_std_m) + 1e-9
+    tgt = float(target_along_m)
+
+    def _overshoot_factor(tip: torch.Tensor) -> torch.Tensor:
+        along = torch.sum((tip - center) * x_w, dim=-1)
+        overshoot_err = torch.clamp(along - tgt, min=0.0)
+        return 1.0 - torch.tanh(overshoot_err / sig)
+
+    return torch.minimum(_overshoot_factor(left), _overshoot_factor(right))
+
+
+def straddle_trailing_face_bounded_approach_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    approach_std_m: float,
+    overshoot_std_m: float,
+    target_along_m: float = 0.0,
+    height_gate_std_m: float | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Bell-shaped trailing-face approach: rises from behind, peaks at ``target_along_m``, decays past."""
+    center = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m)
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    along_l = torch.sum((left - center) * x_w, dim=-1)
+    along_r = torch.sum((right - center) * x_w, dim=-1)
+    left_rew = _jaw_along_deep_single_reward(along_l, target_along_m, approach_std_m, overshoot_std_m)
+    right_rew = _jaw_along_deep_single_reward(along_r, target_along_m, approach_std_m, overshoot_std_m)
+    rew = torch.minimum(left_rew, right_rew)
+    if height_gate_std_m is not None:
+        height_gate = gripper_midpoint_pcb_center_height(
+            env,
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            half_length_m,
+            float(height_gate_std_m),
+            wrist_body_cfg,
+        )
+        rew = rew * height_gate
+    return rew
+
+
 def straddle_finger_target_success(
     env: ManagerBasedRLEnv,
     std: float,
@@ -3886,6 +3971,172 @@ def slide_success_bonus_reward(
 
 
 
+
+
+def _pcb_yaw_xy_signed_sin_cos(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Signed yaw ``sin`` and ``|cos|`` in XY between PCB body +X and ``axis_world``."""
+    x_w = pcb_body_axis_x_world(env, pcb_cfg)
+    a = torch.tensor(axis_world, device=x_w.device, dtype=x_w.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    x_xy = x_w.clone()
+    x_xy[:, 2] = 0.0
+    x_xy = x_xy / torch.norm(x_xy, dim=-1, keepdim=True).clamp_min(1e-6)
+    a_xy = a.clone()
+    a_xy[2] = 0.0
+    a_xy = a_xy / torch.norm(a_xy).clamp_min(1e-9)
+    cos_align = torch.abs(torch.sum(x_xy * a_xy.unsqueeze(0), dim=-1)).clamp(0.0, 1.0)
+    sin_yaw = a_xy[0] * x_xy[:, 1] - a_xy[1] * x_xy[:, 0]
+    return sin_yaw, cos_align
+
+
+def slide_pcb_yaw_xy_alignment_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """Reward PCB long-axis alignment with the slide (+Y) direction in the horizontal plane."""
+    _, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    return cos_align
+
+
+def slide_pcb_yaw_sin_obs(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    scale: float = 0.15,
+) -> torch.Tensor:
+    """Obs: signed yaw error ``sin(θ)`` between PCB long axis and push axis (XY), scaled."""
+    sin_yaw, _ = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    return (sin_yaw / (float(scale) + 1e-9)).unsqueeze(-1)
+
+
+def slide_finger_push_axis_delta_obs(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    scale_m: float = 0.010,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Obs: left-minus-right finger projection on the push axis (env frame), scaled."""
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    origins = env.scene.env_origins[:, :3]
+    a = torch.tensor(axis_world, device=left.device, dtype=left.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    push_l = torch.sum((left - origins) * a.unsqueeze(0), dim=-1)
+    push_r = torch.sum((right - origins) * a.unsqueeze(0), dim=-1)
+    return ((push_l - push_r) / (float(scale_m) + 1e-9)).unsqueeze(-1)
+
+
+def slide_finger_push_axis_y_sync_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    yaw_good_cos: float = 0.995,
+    sync_std_m: float = 0.004,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Reward matched finger push-axis depth when yaw is good (symmetric +Y slide).
+
+    When PCB yaw is off, shaping is disabled so the policy may advance one jaw ahead of the
+    other for corrective pushing.
+    """
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    origins = env.scene.env_origins[:, :3]
+    a = torch.tensor(axis_world, device=left.device, dtype=left.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    push_l = torch.sum((left - origins) * a.unsqueeze(0), dim=-1)
+    push_r = torch.sum((right - origins) * a.unsqueeze(0), dim=-1)
+    sync = torch.exp(-torch.abs(push_l - push_r) / (float(sync_std_m) + 1e-9))
+    _, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    gate = (cos_align >= float(yaw_good_cos)).to(dtype=sync.dtype)
+    return sync * gate
+
+
+def slide_yaw_corrective_asymmetric_push_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    yaw_bad_cos: float = 0.970,
+    asym_std_m: float = 0.006,
+    asym_gain_m: float = 0.015,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """When yaw is off, reward finger push-axis differential that opposes the yaw error.
+
+    ``asym = proj_left - proj_right`` along the push axis; desired ``asym ≈ -gain * sin(yaw)``.
+    """
+    sin_yaw, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    origins = env.scene.env_origins[:, :3]
+    a = torch.tensor(axis_world, device=left.device, dtype=left.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    push_l = torch.sum((left - origins) * a.unsqueeze(0), dim=-1)
+    push_r = torch.sum((right - origins) * a.unsqueeze(0), dim=-1)
+    asym = push_l - push_r
+    desired = -float(asym_gain_m) * sin_yaw
+    quality = torch.exp(-torch.abs(asym - desired) / (float(asym_std_m) + 1e-9))
+    active = cos_align < float(yaw_bad_cos)
+    return torch.where(active, quality, torch.ones_like(quality))
+
+
+def slide_gripper_span_yaw_recovery_shaping(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    nominal_span_m: float = 0.040,
+    max_open_mult: float = 1.35,
+    span_sigma_m: float = 0.006,
+    yaw_bad_cos: float = 0.970,
+) -> torch.Tensor:
+    """Nominal 40 mm span when yaw is good; allow wider opening when yaw is bad to re-seat the board."""
+    robot = env.scene[gripper_joint_cfg.name]
+    gq = robot.data.joint_pos[:, gripper_joint_cfg.joint_ids[0]].clamp(min=0.0)
+    span = _gripper_jaw_span_from_joint(gq)
+    _, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    nominal = float(nominal_span_m)
+    yaw_ok = cos_align >= float(yaw_bad_cos)
+    ok_rew = torch.exp(-torch.abs(span - nominal) / (float(span_sigma_m) + 1e-9))
+    max_open = nominal * float(max_open_mult)
+    open_frac = torch.clamp((span - nominal) / (max_open - nominal + 1e-9), 0.0, 1.0)
+    bad_rew = open_frac * cos_align
+    return torch.where(yaw_ok, ok_rew, bad_rew.clamp(0.0, 1.0))
 
 
 def gripper_gap_excess_penalty(

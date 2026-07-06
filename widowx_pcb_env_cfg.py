@@ -4,7 +4,8 @@ from __future__ import annotations
 
 Two-phase task design (policy chaining):
   Phase 1 (Straddle): open symmetric width-axis straddle on trailing short-edge centre (no pinch).
-  Phase 2 (Slide): slide with gripper open along guide rails to the slot mouth.
+  Phase 2 (Slide): open-straddle push along +Y to magazine back; yaw correction via asymmetric
+  finger push and gripper opening (7 DoF: arm + carriage).
 
 Registered variants (see ``__init__.py``):
   - ``Isaac-WidowX-PCB-Straddle-v0`` — phase 1
@@ -48,6 +49,8 @@ from .mdp_custom import (
     slide_leading_edge_travel_milestone_bonus,
     gripper_wrist_carriage_target_pitch_shaping,
     straddle_trailing_face_approach_reward,
+    straddle_trailing_face_overshoot_shaping,
+    straddle_trailing_face_bounded_approach_reward,
     straddle_tip_mid_thickness_shaping,
     straddle_finger_trailing_width_proximity,
     reset_pcb_on_guide_rails_randomized,
@@ -61,6 +64,15 @@ from .mdp_custom import (
     reset_robot_joints_to_values_randomized,
     pcb_extreme_drift_from_gripper,
     slide_success,
+    slide_pcb_yaw_xy_alignment_shaping,
+    slide_pcb_yaw_sin_obs,
+    slide_finger_push_axis_delta_obs,
+    slide_finger_push_axis_y_sync_shaping,
+    slide_yaw_corrective_asymmetric_push_shaping,
+    slide_gripper_span_yaw_recovery_shaping,
+    gripper_jaw_rail_vertical_shaping,
+    gripper_wrist_carriage_push_axis_shaping,
+    RelativeJointPositionActionWithPosLimitsCfg,
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
@@ -283,6 +295,24 @@ _SLIDE_MILESTONE_MAX_LEAD_X_DRIFT_M = 0.008
 _SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M = 0.008
 # Slide +Y progress: no credit while PCB lifts / skids off-axis (anti crawl-and-lift).
 _SLIDE_PUSH_MAX_OFF_AXIS_SPEED_M_S = 0.020
+# Straddle hold + yaw correction during slide (open gripper, ±20 mm width targets).
+_SLIDE_STRADDLE_HOLD_STD_M = 0.030
+_SLIDE_FINGER_Y_SYNC_STD_M = 0.004
+_SLIDE_YAW_GOOD_COS = 0.995
+_SLIDE_YAW_BAD_COS = 0.970
+_SLIDE_YAW_ASYM_STD_M = 0.006
+_SLIDE_YAW_ASYM_GAIN_M = 0.015
+_SLIDE_GRIPPER_NOMINAL_SPAN_M = 0.040
+_SLIDE_GRIPPER_MAX_OPEN_MULT = 1.35
+_SLIDE_GRIPPER_SPAN_SIGMA_M = 0.006
+_SLIDE_GRIPPER_JOINT_MIN = 0.012   # ~24 mm span
+_SLIDE_GRIPPER_JOINT_MAX = 0.027   # ~54 mm span
+_SLIDE_GRIPPER_ACTION_SCALE = 0.0015
+_SLIDE_GOAL_LEAD_XYZ_ENV = (
+    _SLIDE_MOUTH_LEAD_X_ENV,
+    _SLIDE_SUCCESS_LEAD_Y_ENV,
+    _PCB_CENTER_Z_ENV,
+)
 # Straddle failure terminations — slightly looser than the old 0.10 / 0.40 while ``pcb_tilt_penalty`` shapes approach.
 _STRADDLE_MAX_TILT_PENALTY = 0.11
 _STRADDLE_MAX_LONG_AXIS_ABS_Z = 0.50
@@ -322,6 +352,9 @@ _STRADDLE_SUCCESS_STD_M = 0.02
 _STRADDLE_WIDTH_GAP_SIGMA_M = _STRADDLE_SUCCESS_STD_M
 # Far-field along (+Y) approach to trailing face (per-jaw, one-sided).
 _STRADDLE_ALONG_APPROACH_STD_M = 0.050
+# Overshoot decay past trailing face — pads into PCB / over top lose credit (~8 mm scale).
+_STRADDLE_OVERSHOOT_STD_M = 0.008
+_STRADDLE_OVERSHOOT_TARGET_ALONG_M = 0.0
 # Mid-thickness height: pull pads off the PCB top face toward the trailing-edge centre plane.
 _STRADDLE_MID_THICKNESS_STD_M = 0.012
 _STRADDLE_JAW_SPAN_SIGMA_M = 0.004
@@ -335,7 +368,7 @@ _STRADDLE_MIDPOINT_JAW_OFFSET_M = 0.0
 _STRADDLE_WRIST_TARGET_PITCH_DEG = 20.0
 _STRADDLE_WRIST_PITCH_SIGMA_DEG = 5.0
 # Success: mean per-jaw ``1 - tanh(dist/std)`` must reach this closedness (in [0, 1]).
-_STRADDLE_SUCCESS_CLOSEDNESS_THRESHOLD = 0.5
+_STRADDLE_SUCCESS_CLOSEDNESS_THRESHOLD = 0.4
 
 # Shared geometry kwargs for straddle checks and phase transitions.
 _STRADDLE_CHECK_KWARGS = {
@@ -493,33 +526,44 @@ def _straddle_jaw_along_approach_params(**extra) -> dict:
     return base
 
 
+def _straddle_overshoot_decay_params(**extra) -> dict:
+    """Kwargs for straddle_trailing_face_overshoot_shaping — decay past trailing face."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "half_length_m": _HALF_LENGTH_M,
+        "overshoot_std_m": _STRADDLE_OVERSHOOT_STD_M,
+        "target_along_m": _STRADDLE_OVERSHOOT_TARGET_ALONG_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _straddle_bounded_approach_params(**extra) -> dict:
+    """Kwargs for bell-shaped trailing-face approach (behind + overshoot decay)."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "half_length_m": _HALF_LENGTH_M,
+        "approach_std_m": _STRADDLE_ALONG_APPROACH_STD_M,
+        "overshoot_std_m": _STRADDLE_OVERSHOOT_STD_M,
+        "target_along_m": _STRADDLE_OVERSHOOT_TARGET_ALONG_M,
+        "height_gate_std_m": _ALONG_HEIGHT_GATE_STD_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
 def _straddle_mid_thickness_params(**extra) -> dict:
     """Kwargs for straddle_tip_mid_thickness_shaping — pads at edge mid-height, not PCB top."""
     return _straddle_finger_geometry_params(std=_STRADDLE_MID_THICKNESS_STD_M, **extra)
 
-
-# def _straddle_jaw_along_deep_params(**extra) -> dict:
-#     """Kwargs for jaw_along_deep_approach_reward — gated on pre-deep span + gap quality."""
-#     base = {
-#         "pcb_cfg": _PCB_ENT,
-#         "left_finger_cfg": _LEFT_FINGER,
-#         "right_finger_cfg": _RIGHT_FINGER,
-#         "gripper_joint_cfg": _GRIPPER_JOINT,
-#         "half_length_m": _HALF_LENGTH_M,
-#         "target_along_m": 0.010,
-#         "std": 0.003,
-#         "overshoot_std_m": 0.005,
-#         "height_gate_std_m": _ALONG_HEIGHT_GATE_STD_M,
-#         "pcb_half_thickness_m": PCB_Z * 0.5,
-#         "predeep_jaw_span_m": _STRADDLE_JAW_SPAN_M,
-#         "predeep_gap_left_m": _STRADDLE_GAP_LEFT_M,
-#         "predeep_gap_right_m": _STRADDLE_GAP_RIGHT_M,
-#         "predeep_span_sigma_m": _STRADDLE_JAW_SPAN_SIGMA_M,
-#         "predeep_gap_sigma_m": _STRADDLE_WIDTH_GAP_SIGMA_M,
-#         **_gripper_kinematics_kwargs(),
-#     }
-#     base.update(extra)
-#     return base
 
 def _slide_extreme_drift_params(**extra) -> dict:
     """Kwargs for slide-phase extreme PCB drift / escape termination.
@@ -585,6 +629,96 @@ def _slide_success_params(**extra) -> dict:
         "max_gripper_gap_m": _SLIDE_MAX_GRIPPER_GAP_M,
         "require_gripper_closed": False,
         "axis_world": PUSH_AXIS_WORLD,
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_straddle_hold_params(**extra) -> dict:
+    """Kwargs for trailing-edge ±20 mm straddle hold during slide."""
+    base = {
+        "std": _SLIDE_STRADDLE_HOLD_STD_M,
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "half_length_m": _HALF_LENGTH_M,
+        "finger_offset_m": _STRADDLE_FINGER_OFFSET_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_finger_sync_params(**extra) -> dict:
+    """Kwargs for symmetric finger push-axis depth when yaw is aligned."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "axis_world": PUSH_AXIS_WORLD,
+        "yaw_good_cos": _SLIDE_YAW_GOOD_COS,
+        "sync_std_m": _SLIDE_FINGER_Y_SYNC_STD_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_yaw_corrective_params(**extra) -> dict:
+    """Kwargs for asymmetric finger push when PCB yaw exceeds tolerance."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "axis_world": PUSH_AXIS_WORLD,
+        "yaw_bad_cos": _SLIDE_YAW_BAD_COS,
+        "asym_std_m": _SLIDE_YAW_ASYM_STD_M,
+        "asym_gain_m": _SLIDE_YAW_ASYM_GAIN_M,
+        **_gripper_kinematics_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_gripper_span_params(**extra) -> dict:
+    """Kwargs for nominal vs yaw-recovery gripper span shaping."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "axis_world": PUSH_AXIS_WORLD,
+        "nominal_span_m": _SLIDE_GRIPPER_NOMINAL_SPAN_M,
+        "max_open_mult": _SLIDE_GRIPPER_MAX_OPEN_MULT,
+        "span_sigma_m": _SLIDE_GRIPPER_SPAN_SIGMA_M,
+        "yaw_bad_cos": _SLIDE_YAW_BAD_COS,
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_jaw_orient_params(**extra) -> dict:
+    """Kwargs for jaw rail vertical during slide."""
+    base = {
+        **_straddle_entity_params(),
+        "gate_dist_m": 0.12,
+        "min_finger_sep_m": _MIN_STRADDLE_SEP_M,
+        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_wrist_align_params(**extra) -> dict:
+    """Kwargs for wrist→carriage push-axis alignment during slide."""
+    base = {
+        **_straddle_entity_params(),
+        "gate_dist_m": 0.12,
+        "min_finger_sep_m": _MIN_STRADDLE_SEP_M,
+        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
+        "push_axis_world": PUSH_AXIS_WORLD,
+        "yaw_only": True,
     }
     base.update(extra)
     return base
@@ -712,13 +846,21 @@ class ActionsCfgStraddle:
 
 @configclass
 class ActionsCfgSlide:
-    """Slide phase: arm only (6 DoF); gripper PD-held **open** via ``hold_gripper_open`` event."""
+    """Slide phase: 6 arm DoF + gripper carriage (relative position) for yaw recovery."""
 
     arm_action = mdp.JointEffortActionCfg(
         asset_name="robot",
         joint_names=["joint_[0-5]"],
         scale=_ARM_EFFORT_SCALE,
         preserve_order=True,
+    )
+    gripper_action = RelativeJointPositionActionWithPosLimitsCfg(
+        asset_name="robot",
+        joint_names=["left_carriage_joint"],
+        scale=_SLIDE_GRIPPER_ACTION_SCALE,
+        joint_pos_limits={
+            "left_carriage_joint": (_SLIDE_GRIPPER_JOINT_MIN, _SLIDE_GRIPPER_JOINT_MAX),
+        },
     )
 
 
@@ -824,7 +966,7 @@ class ObservationsCfgSlide:
             func=pcb_to_target_error_obs,
             params={
                 "pcb_cfg": _PCB_ENT,
-                "target_xyz_env": _SLIDE_APPROACH_LEAD_XYZ_ENV,
+                "target_xyz_env": _SLIDE_GOAL_LEAD_XYZ_ENV,
                 "scale_xyz_m": (0.05, 0.25, 0.05),
                 "half_length_m": _HALF_LENGTH_M,
             },
@@ -836,6 +978,20 @@ class ObservationsCfgSlide:
                 "align_axis_world": PUSH_AXIS_WORLD,
             },
         )
+        pcb_yaw_sin = ObservationTermCfg(
+            func=slide_pcb_yaw_sin_obs,
+            params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+        )
+        finger_push_axis_delta = ObservationTermCfg(
+            func=slide_finger_push_axis_delta_obs,
+            params={
+                "left_finger_cfg": _LEFT_FINGER,
+                "right_finger_cfg": _RIGHT_FINGER,
+                "gripper_joint_cfg": _GRIPPER_JOINT,
+                "axis_world": PUSH_AXIS_WORLD,
+                **_gripper_kinematics_kwargs(),
+            },
+        )
 
     policy: PolicyCfg = PolicyCfg()
 
@@ -844,17 +1000,24 @@ class ObservationsCfgSlide:
 class RewardsStraddlePhaseCfg():
     """Straddle phase reward stack — open symmetric width-axis trailing-edge straddle (no pinch).
 
-    1. APPROACH  — trailing-face advance + mid-thickness height + width proximity + lateral gap.
+    1. APPROACH  — bounded trailing-face advance + overshoot decay + mid-thickness + width proximity.
     2. SUCCESS   — finger-target closedness ≥ 0.5 (tight σ).
     """
 
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.001)
 
-    # Pads advance to trailing short-edge face (not grasp ±thickness targets).
-    trailing_face_approach = RewardTermCfg(
-        func=straddle_trailing_face_approach_reward,
-        params=_straddle_jaw_along_approach_params(),
-        weight=120.0,
+    # Bell-shaped along: rises from behind trailing face, peaks on face, decays when past (overshoot).
+    trailing_face_bounded_approach = RewardTermCfg(
+        func=straddle_trailing_face_bounded_approach_reward,
+        params=_straddle_bounded_approach_params(),
+        weight=140.0,
+    )
+
+    # Standalone overshoot decay (1 at/before face → 0 when deep past); reinforces bounded term above.
+    along_overshoot_decay = RewardTermCfg(
+        func=straddle_trailing_face_overshoot_shaping,
+        params=_straddle_overshoot_decay_params(),
+        weight=80.0,
     )
 
     # Pull pads to PCB mid-thickness (edge height) — not the top face.
@@ -911,7 +1074,7 @@ class RewardsStraddlePhaseCfg():
 
 @configclass
 class RewardsSlidePhaseCfg:
-    """Phase 2 slide rewards: +Y progress with **open-gripper** symmetric width straddle."""
+    """Phase 2 slide: +Y push to magazine back with straddle hold, yaw correction, gripper span."""
 
     leading_edge_push_progress = RewardTermCfg(
         func=pcb_leading_edge_push_axis_approach_progress_gated,
@@ -932,15 +1095,55 @@ class RewardsSlidePhaseCfg:
         },
         weight=50.0,
     )
-    mouth_approach_proximity = RewardTermCfg(
+    goal_lead_proximity = RewardTermCfg(
         func=pcb_leading_edge_insertion_proximity_reward,
         params={
             "pcb_cfg": _PCB_ENT,
             "half_length_m": _HALF_LENGTH_M,
-            "target_lead_xyz_env": _SLIDE_APPROACH_LEAD_XYZ_ENV,
-            "sigma_m": 0.10,
+            "target_lead_xyz_env": _SLIDE_GOAL_LEAD_XYZ_ENV,
+            "sigma_m": 0.12,
         },
-        weight=18.0,
+        weight=22.0,
+    )
+    straddle_width_hold = RewardTermCfg(
+        func=straddle_finger_trailing_width_proximity,
+        params=_slide_straddle_hold_params(),
+        weight=70.0,
+    )
+    straddle_lateral_gap = RewardTermCfg(
+        func=straddle_lateral_gap_shaping,
+        params=_straddle_lateral_gap_params(),
+        weight=22.0,
+    )
+    finger_push_axis_sync = RewardTermCfg(
+        func=slide_finger_push_axis_y_sync_shaping,
+        params=_slide_finger_sync_params(),
+        weight=40.0,
+    )
+    pcb_yaw_alignment = RewardTermCfg(
+        func=slide_pcb_yaw_xy_alignment_shaping,
+        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+        weight=35.0,
+    )
+    yaw_corrective_push = RewardTermCfg(
+        func=slide_yaw_corrective_asymmetric_push_shaping,
+        params=_slide_yaw_corrective_params(),
+        weight=45.0,
+    )
+    gripper_span_yaw_recovery = RewardTermCfg(
+        func=slide_gripper_span_yaw_recovery_shaping,
+        params=_slide_gripper_span_params(),
+        weight=30.0,
+    )
+    jaw_rail_vertical = RewardTermCfg(
+        func=gripper_jaw_rail_vertical_shaping,
+        params=_slide_jaw_orient_params(),
+        weight=12.0,
+    )
+    wrist_push_alignment = RewardTermCfg(
+        func=gripper_wrist_carriage_push_axis_shaping,
+        params=_slide_wrist_align_params(),
+        weight=10.0,
     )
     slide_axis_backward_velocity = RewardTermCfg(
         func=pcb_slide_axis_sustained_backward_velocity_penalty,
@@ -966,11 +1169,11 @@ class RewardsSlidePhaseCfg:
         params={
             "pcb_cfg": _PCB_ENT,
             "axis_world": PUSH_AXIS_WORLD,
-            "flat_coef": 0.55,
-            "long_horizontal_coef": 0.45,
-            "long_align_coef": 0.0,
+            "flat_coef": 0.45,
+            "long_horizontal_coef": 0.35,
+            "long_align_coef": 0.20,
         },
-        weight=8.0,
+        weight=10.0,
     )
     pcb_tilt_penalty = RewardTermCfg(
         func=pcb_thickness_axis_tilt_penalty,
@@ -1086,9 +1289,8 @@ class CurriculumStraddleDebugCfg:
 
 @configclass
 class EventCfgSlide:
-    """Phase 2 reset: straddle buffer robot pose + conveyor-flat PCB; gripper stays open."""
+    """Phase 2 reset: straddle buffer; policy controls gripper span for yaw recovery."""
 
-    # set_gripper_finger_friction = _gripper_friction_event()
     reset_robot_from_straddle = EventTermCfg(
         func=reset_from_straddle_states,
         mode="reset",
@@ -1097,15 +1299,13 @@ class EventCfgSlide:
             "straddle_states_path": _STRADDLE_STATES_PATH,
             "velocity_scale": 0.0,
             "gripper_joint_name": "left_carriage_joint",
-            "gripper_open_target_m": _STRADDLE_OPEN_WIDTH_M,
-            "gripper_hold_open": True,
+            "gripper_hold_open": False,
             "pcb_z_filter_env": _STRADDLE_BUFFER_Z_REFERENCE_ENV,
             "max_pcb_z_delta_m": _STRADDLE_BUFFER_MAX_Z_DELTA_M,
             "max_buffer_tilt_penalty": _SLIDE_BUFFER_MAX_TILT_PENALTY,
-            "apply_gripper_hold_on_reset": True,
+            "apply_gripper_hold_on_reset": False,
         },
     )
-    # Robot joints from buffer; PCB XY/Z from buffer; orientation → flat on conveyor (+Y long axis).
     reset_pcb_from_straddle = EventTermCfg(
         func=reset_pcb_from_straddle_states,
         mode="reset",
@@ -1115,21 +1315,9 @@ class EventCfgSlide:
             "half_length_m": _HALF_LENGTH_M,
             "velocity_scale": 0.0,
             "snap_z_to_rail": False,
-            "flatten_pcb_orientation": True,
+            "flatten_pcb_orientation": False,
             "flat_rot_wxyz": _PCB_INIT_ROT_WXYZ,
             "lift_robot_with_snap": False,
-        },
-    )
-    # Re-apply cached open PD target every step (set at reset from straddle buffer).
-    hold_gripper_every_step = EventTermCfg(
-        func=hold_gripper_open,
-        mode="interval",
-        is_global_time=True,
-        interval_range_s=(0.0, 0.0),
-        params={
-            **_straddle_hold_gripper_open_always_params(),
-            "match_sim_state": False,
-            "store_target": False,
         },
     )
 
@@ -1146,22 +1334,22 @@ class TerminationsSharedCfg:
 class TerminationsStraddleCfg(TerminationsSharedCfg):
     """Straddle-phase PCB safety failures and episode end on successful trailing-edge straddle."""
 
-    pcb_tilt_excessive = TerminationTermCfg(
-        func=pcb_tilt_beyond_limit,
-        params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": _STRADDLE_MAX_TILT_PENALTY},
-    )
-    pcb_long_axis_not_horizontal = TerminationTermCfg(
-        func=pcb_long_axis_vertical_component_exceeds,
-        params={"pcb_cfg": _PCB_ENT, "max_abs_z": _STRADDLE_MAX_LONG_AXIS_ABS_Z},
-    )
-    pcb_fallen_below_rail = TerminationTermCfg(
-        func=pcb_root_height_below_env_minimum,
-        params={"pcb_cfg": _PCB_ENT, "min_height_env": _PCB_TERMINATE_MIN_HEIGHT_ENV},
-    )
-    pcb_moving_backward = TerminationTermCfg(
-        func=pcb_moving_backward_termination,
-        params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 4},
-    )
+    # pcb_tilt_excessive = TerminationTermCfg(
+    #     func=pcb_tilt_beyond_limit,
+    #     params={"pcb_cfg": _PCB_ENT, "max_tilt_penalty": _STRADDLE_MAX_TILT_PENALTY},
+    # )
+    # pcb_long_axis_not_horizontal = TerminationTermCfg(
+    #     func=pcb_long_axis_vertical_component_exceeds,
+    #     params={"pcb_cfg": _PCB_ENT, "max_abs_z": _STRADDLE_MAX_LONG_AXIS_ABS_Z},
+    # )
+    # pcb_fallen_below_rail = TerminationTermCfg(
+    #     func=pcb_root_height_below_env_minimum,
+    #     params={"pcb_cfg": _PCB_ENT, "min_height_env": _PCB_TERMINATE_MIN_HEIGHT_ENV},
+    # )
+    # pcb_moving_backward = TerminationTermCfg(
+    #     func=pcb_moving_backward_termination,
+    #     params={"pcb_cfg": _PCB_ENT, "backward_vel_threshold": -0.03, "min_steps": 4},
+    # )
 
     straddle_success = TerminationTermCfg(
         func=straddle_finger_target_success,
@@ -1272,7 +1460,7 @@ CurriculumGraspDebugCfg = CurriculumStraddleDebugCfg
 
 @configclass
 class WidowXPcbSlideEnvCfg(_WidowXPcbEnvCfgBase):
-    """Phase 2: slide open-straddled PCB along guide rails to the slot mouth (+Y)."""
+    """Phase 2: open-straddle +Y slide to magazine back with yaw correction (7 DoF)."""
 
     observations: ObservationsCfgSlide = ObservationsCfgSlide()
     actions: ActionsCfgSlide = ActionsCfgSlide()

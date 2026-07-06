@@ -127,42 +127,11 @@ WidowXPcbStraddlePPOCfg = {
             "name": "widowx_pcb_straddle",
             "full_experiment_name": ".",
             "entropy_coef": 2e-2,
-            "max_epochs": 90,
+            "max_epochs": 40,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
 }
-
-# WidowXPcbGraspGripperTestPPOCfg = {
-#     **WidowXPcbPPOBaseCfg,
-#     "params": {
-#         **WidowXPcbPPOBaseCfg["params"],
-#         "env": {
-#             **WidowXPcbPPOBaseCfg["params"]["env"],
-#             # Single gripper joint — smaller per-step deltas than full-arm grasp.
-#             "clip_actions": 0.20,
-#         },
-#         "network": {
-#             **WidowXPcbPPOBaseCfg["params"]["network"],
-#             "space": {
-#                 **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
-#                 "continuous": {
-#                     **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
-#                     "sigma_init": {"name": "const_initializer", "val": -0.5},
-#                 },
-#             },
-#         },
-#         "config": {
-#             **WidowXPcbPPOBaseCfg["params"]["config"],
-#             "name": "widowx_pcb_grasp_gripper_test",
-#             "full_experiment_name": ".",
-#             "entropy_coef": 1e-2,
-#             "max_epochs": 400,
-#             "reward_shaper": {"scale_value": 0.2},
-#             "horizon_length": 64,
-#         },
-#     },
-# }
 
 # ---------------------------------------------------------------------------
 # Phase 2 — Slide (arm + gripper, 7 DoF): rail +Y push to slot mouth.
@@ -192,7 +161,7 @@ WidowXPcbSlidePPOCfg = {
             "reward_shaper": {"scale_value": 0.25},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 200,
+            "max_epochs": 100,
             "horizon_length": 256,
             "mini_epochs": 8,
         },
