@@ -102,8 +102,8 @@ WidowXPcbPPOBaseCfg = {
     }
 }
 
-# Phase 1 — Open asymmetric straddle (trailing-edge centre biased toward right finger).
-WidowXPcbStraddlePPOCfg = {
+# Push — open-jaw trailing-edge approach + +Y slide to slot.
+WidowXPcbPushPPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {
         **WidowXPcbPPOBaseCfg["params"],
@@ -124,18 +124,18 @@ WidowXPcbStraddlePPOCfg = {
         },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "widowx_pcb_straddle",
+            "name": "widowx_pcb_push",
             "full_experiment_name": ".",
             "entropy_coef": 2e-2,
-            "max_epochs": 40,
+            "max_epochs": 100,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
 }
 
-# ---------------------------------------------------------------------------
-# Phase 2 — Slide (arm + gripper, 7 DoF): rail +Y push to slot mouth.
-# ---------------------------------------------------------------------------
+# Deprecated alias (pre-push rename).
+WidowXPcbStraddlePPOCfg = WidowXPcbPushPPOCfg
+
 WidowXPcbSlidePPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {

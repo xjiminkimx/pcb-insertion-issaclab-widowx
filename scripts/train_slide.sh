@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Train Slide phase (policy chaining from Straddle).
+# Train Slide phase (policy chaining from Push).
 # Prerequisites:
-#   1. Train Straddle: bash scripts/train_straddle.sh --num_envs 2048 --headless
-#   2. Collect straddle terminal states (see scripts/collect_grasp_states.py)
+#   1. Train Push: bash scripts/train_push.sh --num_envs 2048 --headless
+#   2. Collect push terminal states (see scripts/collect_grasp_states.py)
 #   3. Run this script
 #
 # Max epochs: agents/rl_games_ppo_cfg.py → WidowXPcbSlidePPOCfg max_epochs
@@ -52,16 +52,20 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
   exit 1
 fi
 
-STRADDLE_STATES="${WORKSPACE_DIR}/data/straddle_terminal_states.npz"
+PUSH_STATES="${WORKSPACE_DIR}/data/push_terminal_states.npz"
+LEGACY_STRADDLE_STATES="${WORKSPACE_DIR}/data/straddle_terminal_states.npz"
 LEGACY_GRASP_STATES="${WORKSPACE_DIR}/data/grasp_terminal_states.npz"
-if [[ -f "${STRADDLE_STATES}" ]]; then
-  STATES_PATH="${STRADDLE_STATES}"
+if [[ -f "${PUSH_STATES}" ]]; then
+  STATES_PATH="${PUSH_STATES}"
+elif [[ -f "${LEGACY_STRADDLE_STATES}" ]]; then
+  echo "[WARN] Using legacy buffer: ${LEGACY_STRADDLE_STATES} (re-collect with collect_push_states.py)" >&2
+  STATES_PATH="${LEGACY_STRADDLE_STATES}"
 elif [[ -f "${LEGACY_GRASP_STATES}" ]]; then
   echo "[WARN] Using legacy buffer: ${LEGACY_GRASP_STATES} (re-collect with collect_grasp_states.py)" >&2
   STATES_PATH="${LEGACY_GRASP_STATES}"
 else
-  echo "[ERROR] Straddle terminal-state buffer not found: ${STRADDLE_STATES}" >&2
-  echo "        Run: python scripts/collect_grasp_states.py --checkpoint <straddle.pth>" >&2
+  echo "[ERROR] Push terminal-state buffer not found: ${PUSH_STATES}" >&2
+  echo "        Run: python scripts/collect_push_states.py --checkpoint <push.pth>" >&2
   exit 1
 fi
 
@@ -76,7 +80,7 @@ else
 fi
 
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_slide/"
-echo "[INFO] Straddle states: ${STATES_PATH}"
+echo "[INFO] Push states: ${STATES_PATH}"
 echo "[INFO] Python:         ${PYTHON}"
 
 "${PYTHON}" "${TRAIN_PY}" \

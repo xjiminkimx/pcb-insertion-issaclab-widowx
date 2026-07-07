@@ -374,7 +374,7 @@
         <child link="part_1_1" />
     </joint>
     <joint name="parallel_1" type="prismatic">
-        <origin xyz="0.28 0.01 -0.015" rpy="-2.67147e-16 1.56125e-17 -4.98408e-16" />
+        <origin xyz="0.28 0.01 -0.015" rpy="-2.67147e-16 2.54657e-15 -4.9792e-16" />
         <axis xyz="-1 -0 -0" />
         <parent link="part_1_4" />
         <child link="parallel_1_2" />
@@ -409,7 +409,7 @@
         <limit effort="1" velocity="1" lower="0" upper="0" />
     </joint>
     <joint name="parallel_13_loop_closure" type="prismatic">
-        <origin xyz="-0.0275624 4.44089e-16 0.031014" rpy="1.11022e-16 6.06367e-34 -1.09233e-17" />
+        <origin xyz="-0.0275624 -4.44089e-16 0.031014" rpy="9.36751e-17 1.73472e-18 -1.09233e-17" />
         <axis xyz="1 0 0" />
         <parent link="part_1_9" />
         <child link="parallel_13_loop_closure_2" />
@@ -456,7 +456,7 @@
         <child link="part_1_3" />
     </joint>
     <joint name="parallel_2" type="prismatic">
-        <origin xyz="0.130062 -0.0015 -0.000513963" rpy="-3.85456e-15 -8.1532e-16 -1.21702e-16" />
+        <origin xyz="0.130062 -0.0015 -0.000513963" rpy="-3.85803e-15 1.60549e-15 -1.20455e-16" />
         <axis xyz="1 0 0" />
         <parent link="part_1_13" />
         <child link="parallel_2_2" />
@@ -483,7 +483,7 @@
         <child link="part_1_9" />
     </joint>
     <joint name="parallel_3" type="prismatic">
-        <origin xyz="-0.03 -0.235736 -2.22045e-16" rpy="-9.71445e-17 2.29851e-16 -3.84675e-16" />
+        <origin xyz="-0.03 -0.235736 0" rpy="1.94289e-16 9.36751e-17 -8.87447e-16" />
         <axis xyz="1 0 0" />
         <parent link="part_1_14" />
         <child link="parallel_3_2" />
@@ -538,7 +538,7 @@
         <child link="magazine" />
     </joint>
     <joint name="parallel_8" type="prismatic">
-        <origin xyz="0.132 -0.0515 0.119" rpy="2.98372e-16 1.12757e-17 5.5316e-16" />
+        <origin xyz="0.132 -0.0515 0.117" rpy="2.98372e-16 1.12757e-17 5.5316e-16" />
         <axis xyz="-0 -1 -0" />
         <parent link="magazine" />
         <child link="parallel_8_2" />
@@ -565,7 +565,7 @@
         <child link="part_1_4" />
     </joint>
     <joint name="planar_12_loop_closure" type="prismatic">
-        <origin xyz="-0.150062 -0.276986 0.025014" rpy="-3.83374e-15 1.3098e-14 -2.1233e-15" />
+        <origin xyz="-0.150062 -0.276986 0.025014" rpy="-3.83374e-15 1.06772e-14 -2.12447e-15" />
         <axis xyz="0 1 0" />
         <parent link="part_1_9" />
         <child link="planar_12_loop_closure_1" />
@@ -585,7 +585,7 @@
         <child link="chip__2__loop_closure" />
     </joint>
     <joint name="planar_13_loop_closure" type="prismatic">
-        <origin xyz="6.24427e-05 0.004 -0.023514" rpy="3.71925e-15 -1.28708e-14 1.73302e-15" />
+        <origin xyz="6.24427e-05 0.004 -0.023514" rpy="4.02109e-15 -1.05844e-14 1.23401e-15" />
         <axis xyz="1 0 0" />
         <parent link="part_1_11" />
         <child link="planar_13_loop_closure_1" />
@@ -605,7 +605,7 @@
         <child link="part_1__10__loop_closure" />
     </joint>
     <joint name="planar_14" type="prismatic">
-        <origin xyz="0.282 0.0385 0.127" rpy="2.94903e-16 -1.36176e-16 -4.96754e-16" />
+        <origin xyz="0.282 0.0385 0.125" rpy="-3.46945e-18 5.11528e-31 4.06576e-19" />
         <axis xyz="1 0 0" />
         <parent link="magazine" />
         <child link="planar_14_1" />
@@ -625,7 +625,7 @@
         <child link="part_1_11" />
     </joint>
     <joint name="planar_15" type="prismatic">
-        <origin xyz="0.282 -0.0375 0.127" rpy="2.91434e-16 -1.38778e-16 -5.02772e-16" />
+        <origin xyz="0.282 -0.0375 0.125" rpy="-3.05684e-30 -2.60209e-18 5.96311e-18" />
         <axis xyz="1 0 0" />
         <parent link="magazine" />
         <child link="planar_15_1" />
@@ -665,7 +665,7 @@
         <child link="part_1_7" />
     </joint>
     <joint name="planar_20_loop_closure" type="prismatic">
-        <origin xyz="4.44089e-16 -0.076 4.44089e-16" rpy="-6.93889e-18 -3.46945e-18 -5.52943e-18" />
+        <origin xyz="4.44089e-16 -0.076 0" rpy="-5.91647e-31 -8.67362e-19 2.95445e-18" />
         <axis xyz="1 0 0" />
         <parent link="part_1_11" />
         <child link="planar_20_loop_closure_1" />
@@ -685,7 +685,7 @@
         <child link="part_1__8__loop_closure" />
     </joint>
     <joint name="planar_23" type="prismatic">
-        <origin xyz="-0.0230088 0.023144 2.22045e-15" rpy="3.83374e-15 -1.2869e-14 1.71965e-15" />
+        <origin xyz="-0.0230088 0.023144 1.11022e-15" rpy="4.1217e-15 -1.05835e-14 1.22404e-15" />
         <axis xyz="1 0 1.23909e-16" />
         <parent link="part_1_11" />
         <child link="planar_23_1" />
@@ -705,7 +705,7 @@
         <child link="part_1_6" />
     </joint>
     <joint name="planar_24_loop_closure" type="prismatic">
-        <origin xyz="-0.0230088 -0.023144 0" rpy="1.00614e-16 1.61329e-16 2.10308e-15" />
+        <origin xyz="-0.0230088 -0.023144 0" rpy="3.95517e-16 2.60209e-17 1.59334e-15" />
         <axis xyz="1 0 1.23909e-16" />
         <parent link="part_1_14" />
         <child link="planar_24_loop_closure_1" />
@@ -745,7 +745,7 @@
         <child link="part_1_10" />
     </joint>
     <joint name="planar_3_loop_closure" type="prismatic">
-        <origin xyz="0 -0.042 2.22045e-16" rpy="-3.46945e-17 2.34188e-17 1.46367e-17" />
+        <origin xyz="0 -0.042 0" rpy="-3.81639e-17 2.51535e-17 1.11673e-17" />
         <axis xyz="1 0 0" />
         <parent link="part_1_8" />
         <child link="planar_3_loop_closure_1" />
@@ -765,7 +765,7 @@
         <child link="part_1__4__loop_closure" />
     </joint>
     <joint name="planar_5" type="prismatic">
-        <origin xyz="0.152 0.044 0.104" rpy="7.87564e-15 -1.21899e-14 1.35626e-15" />
+        <origin xyz="0.152 0.044 0.102" rpy="7.87564e-15 -1.21899e-14 1.35626e-15" />
         <axis xyz="-1 -0 -0" />
         <parent link="magazine" />
         <child link="planar_5_1" />
@@ -785,7 +785,7 @@
         <child link="part_1_13" />
     </joint>
     <joint name="planar_6" type="prismatic">
-        <origin xyz="0.13 8.88178e-16 -0.023" rpy="-7.91728e-15 1.4589e-15 6.53503e-17" />
+        <origin xyz="0.13 6.66134e-16 -0.023" rpy="-7.61544e-15 1.32359e-15 -4.27962e-16" />
         <axis xyz="-1 -0 -0" />
         <parent link="part_1_11" />
         <child link="planar_6_1" />
@@ -805,21 +805,21 @@
         <child link="part_1" />
     </joint>
     <joint name="slider_1" type="prismatic">
-        <origin xyz="-2.22045e-16 -0.0435 2.22045e-16" rpy="-7.62931e-15 1.23165e-14 -5.57714e-16" />
+        <origin xyz="2.22045e-16 -0.0435 2.22045e-16" rpy="-7.62931e-15 1.23165e-14 -5.57714e-16" />
         <axis xyz="-0 1 -0" />
         <parent link="part_1_13" />
         <child link="part_1_5" />
         <limit effort="1" velocity="1" lower="-10000" upper="10000" />
     </joint>
     <joint name="slider_1_1" type="prismatic">
-        <origin xyz="0.26 -0.0435 -3.33067e-15" rpy="-7.83054e-15 1.21942e-14 -1.30839e-15" />
+        <origin xyz="0.26 -0.0435 -3.77476e-15" rpy="-7.83054e-15 1.47226e-14 -1.30798e-15" />
         <axis xyz="-0 1 -0" />
         <parent link="part_1_13" />
         <child link="part_1_8" />
         <limit effort="1" velocity="1" lower="-10000" upper="10000" />
     </joint>
     <joint name="slider_1_loop_closure" type="prismatic">
-        <origin xyz="0 0.034 2.22045e-16" rpy="-7.67095e-15 1.32099e-15 -4.84178e-16" />
+        <origin xyz="8.88178e-16 0.034 3.77476e-15" rpy="-7.67789e-15 -1.20823e-15 -4.88135e-16" />
         <axis xyz="0 -1 0" />
         <parent link="part_1_8" />
         <child link="part_1__3__loop_closure" />
