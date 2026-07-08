@@ -3,12 +3,14 @@
 Convert env_v6 URDF (assembly_6) to an IsaacSim-compatible USDA kinematic fixture.
 
 Material + physics settings:
-  SteelMaterial   — magazine body            mu_s 0.50  contactOffset 0.001  restOffset 0.0001
+  SteelMaterial   — magazine body            mu_s 0.50  contactOffset 0.0001  restOffset 0.0001
   RailMaterial    — guide-rail bars (Part_1_7.stl)  mu_s 0.10
   BeltMaterial    — side conveyor belts (Part_1_2.stl)  mu_s 0.65
   StandMaterial   — stand + frame            mu_s 0.50
 
-All collision approximations: convexDecomposition (full fidelity on Magazine slot).
+Collision approximations:
+  Magazine / guide rails / side belts — Triangle Mesh (``none``) for accurate flats/slot.
+  Stand / frame                       — convexDecomposition (decorative contact only).
 Short axle rods (Part_1_3.stl) and chip/PCB link excluded — chip spawned separately.
 
 Recommended Physics Scene settings in env cfg:
@@ -227,7 +229,7 @@ MATERIAL_TEMPLATE = """\
         }}
 """
 
-# Standard mesh template for all non-magazine parts
+# Stand / frame — convex decomposition is fine (not a precision support surface).
 MESH_TEMPLATE = """\
         def Mesh "{name}" (
             prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI",
@@ -241,13 +243,14 @@ MESH_TEMPLATE = """\
             rel material:binding         = <{root}/Looks/{mat}>
             rel material:binding:physics = <{root}/Looks/{mat}>
             uniform token physics:approximation = "convexDecomposition"
-            float physxCollision:contactOffset  = 0.0005
-            float physxCollision:restOffset     = 0.0002
+            float physxCollision:contactOffset  = 0.0001
+            float physxCollision:restOffset     = 0.0001
         }}
 """
 
-# Magazine mesh template: fine contact offsets to resolve 5-7 mm slot precisely
-MESH_TEMPLATE_MAGAZINE = """\
+# Magazine / rails / belts — Triangle Mesh (``none``) so flat support faces and the
+# magazine slot match the visual STL (kinematic fixture; safe with dynamic PCB cuboid).
+MESH_TEMPLATE_TRIANGLE = """\
         def Mesh "{name}" (
             prepend apiSchemas = ["PhysicsCollisionAPI", "PhysicsMeshCollisionAPI",
                                   "PhysxCollisionAPI", "MaterialBindingAPI"]
@@ -259,8 +262,8 @@ MESH_TEMPLATE_MAGAZINE = """\
             point3f[] points         = [{points}]
             rel material:binding         = <{root}/Looks/{mat}>
             rel material:binding:physics = <{root}/Looks/{mat}>
-            uniform token physics:approximation = "convexDecomposition"
-            float physxCollision:contactOffset  = 0.001
+            uniform token physics:approximation = "none"
+            float physxCollision:contactOffset  = 0.0001
             float physxCollision:restOffset     = 0.0001
         }}
 """
@@ -292,6 +295,14 @@ def belt_links(links: dict) -> set[str]:
         name for name, info in links.items()
         if mesh_basename(info.get("mesh")) == BELT_MESH
     }
+
+
+def uses_triangle_mesh(link_name: str, mesh_ref: str | None) -> bool:
+    """True for magazine, guide rails, and side belts (precision contact surfaces)."""
+    if link_name in MAGAZINE_LINKS:
+        return True
+    base = mesh_basename(mesh_ref)
+    return base in (BELT_MESH, RAIL_MESH)
 
 
 def mat_for(link_name: str, mesh_ref: str | None = None) -> str:
@@ -352,8 +363,10 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
             continue
 
         is_mag = link_name in MAGAZINE_LINKS
+        use_tri = uses_triangle_mesh(link_name, info["mesh"])
         mat = mat_for(link_name, info["mesh"])
-        print(f"  {link_name}: {os.path.basename(stl_path)}  [{mat}]{'  [fine contact]' if is_mag else ''}")
+        approx_tag = "triangleMesh" if use_tri else "convexDecomp"
+        print(f"  {link_name}: {os.path.basename(stl_path)}  [{mat}]  [{approx_tag}]")
 
         triangles = read_stl_binary(stl_path)
         if not triangles:
@@ -365,10 +378,9 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
         T_world  = compose_transforms(T_link, T_visual)
 
         tris = transform_triangles(triangles, T_world)
-        # Magazine: preserve all triangles for fine slot detail (58k tris → convexDecomp handles it).
-        # Other parts: subsample to keep USD compact.
-        if is_mag:
-            print(f"    preserving all {len(tris)} triangles (fine slot geometry)")
+        # Precision surfaces keep full STL; stand/frame may subsample for USD size.
+        if use_tri:
+            print(f"    preserving all {len(tris)} triangles (triangle-mesh collider)")
         else:
             tris = subsample_triangles(tris, max_tris=10000)
 
@@ -378,7 +390,7 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
             mag_points.extend(points)
 
         n_tris = len(indices) // 3
-        tmpl = MESH_TEMPLATE_MAGAZINE if is_mag else MESH_TEMPLATE
+        tmpl = MESH_TEMPLATE_TRIANGLE if use_tri else MESH_TEMPLATE
 
         mesh_blocks.append(tmpl.format(
             name=link_name,
