@@ -263,7 +263,7 @@ _PUSH_JAW_GATE_MIN = 0.3
 # Terminal-state buffers (Sequential Dexterity chaining).
 _PUSH_STATES_PATH = os.path.join(ASSET_DIR, "data", "push_terminal_states.npz")
 # Slide success: leading short-edge centre at magazine back (+Y); mouth for approach shaping.
-_SLIDE_MOUTH_Y_MARGIN_M = 0.008
+_SLIDE_MOUTH_Y_MARGIN_M = 0.244 + 0.03
 _SLIDE_MOUTH_LEAD_Y_ENV = _MAG_Y_NEAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M
 _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.020
 # Success / milestone terminus: leading edge near magazine back wall (slide +Y direction).
@@ -288,8 +288,8 @@ _SLIDE_APPROACH_LEAD_XYZ_ENV = (
 # One-shot travel milestones (fraction of episode-start → success leading-edge +Y).
 _SLIDE_TRAVEL_MILESTONE_FRACTIONS = (0.25, 0.5, 0.75, 0.875, 0.95)
 # Milestone credit: lead X ±spawn drift; lead Z near belt-top centre height.
-_SLIDE_MILESTONE_MAX_LEAD_X_DRIFT_M = 0.008
-_SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M = 0.008
+_SLIDE_MILESTONE_MAX_LEAD_X_DRIFT_M = 0.02
+_SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M = 0.02
 # Slide +Y progress: no credit while PCB lifts / skids off-axis (anti crawl-and-lift).
 _SLIDE_PUSH_MAX_OFF_AXIS_SPEED_M_S = 0.020
 # Straddle hold + yaw correction during slide (open gripper, ±20 mm width targets).
@@ -482,106 +482,9 @@ def _push_success_params(**extra) -> dict:
     )
 
 
-def _push_wrist_pitch_params(**extra) -> dict:
-    """Kwargs for wrist→jaw target pitch (~20°) about slide axis for camera clearance."""
-    base = {
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "push_axis_world": PUSH_AXIS_WORLD,
-        "target_pitch_deg": _PUSH_WRIST_TARGET_PITCH_DEG,
-        "pitch_sigma_deg": _PUSH_WRIST_PITCH_SIGMA_DEG,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _push_jaw_along_approach_params(**extra) -> dict:
-    """Kwargs for straddle_trailing_face_approach_reward — pads advance to trailing face centre."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "half_length_m": _HALF_LENGTH_M,
-        "std": _PUSH_ALONG_APPROACH_STD_M,
-        "height_gate_std_m": _ALONG_HEIGHT_GATE_STD_M,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _push_overshoot_decay_params(**extra) -> dict:
-    """Kwargs for straddle_trailing_face_overshoot_shaping — decay past trailing face."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "half_length_m": _HALF_LENGTH_M,
-        "overshoot_std_m": _PUSH_OVERSHOOT_STD_M,
-        "target_along_m": _PUSH_OVERSHOOT_TARGET_ALONG_M,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _push_bounded_approach_params(**extra) -> dict:
-    """Kwargs for bell-shaped trailing-face approach (behind + overshoot decay)."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "half_length_m": _HALF_LENGTH_M,
-        "approach_std_m": _PUSH_ALONG_APPROACH_STD_M,
-        "overshoot_std_m": _PUSH_OVERSHOOT_STD_M,
-        "target_along_m": _PUSH_OVERSHOOT_TARGET_ALONG_M,
-        "height_gate_std_m": _ALONG_HEIGHT_GATE_STD_M,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
 def _push_mid_thickness_params(**extra) -> dict:
     """Kwargs for straddle_tip_mid_thickness_shaping — pads at edge mid-height, not PCB top."""
     return _push_finger_geometry_params(std=_PUSH_MID_THICKNESS_STD_M, **extra)
-
-
-def _slide_extreme_drift_params(**extra) -> dict:
-    """Kwargs for slide-phase extreme PCB drift / escape termination.
-
-  ``pcb_detached`` already catches moderate slip (straddle / edge / finger loss).
-  This term should fire only on **clear escape** — not on normal +Y push wobble.
-  Perpendicular-drift and velocity checks were disabled after they caused ~99% false
-  termination while ``pcb_detached`` stayed below 1%.
-    """
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "half_length_m": _HALF_LENGTH_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        # Nominal jaw-mid ↔ PCB-centre ≈ half_length_m (120 mm); +70 mm ⇒ clear escape.
-        "max_extra_sep_m": 0.070,
-        # Looser than ``pcb_detached`` — only table-slide / jaw-release scale gaps.
-        "max_finger_dist_m": 0.100,
-        "max_edge_dist_m": 0.120,
-        # Disable false-positive checks (lateral arm motion, contact velocity spikes).
-        "check_perp_drift": False,
-        "check_flying": False,
-        # Keep a generous vertical jaw↔PCB gap for push tilt; ``pcb_fallen_below_rail`` covers drops.
-        "check_vertical_sep": True,
-        "max_vertical_sep_m": 0.070,
-        "min_episode_steps": 40,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
 
 
 def _slide_push_progress_params(**extra) -> dict:
@@ -1062,21 +965,21 @@ class RewardsPushCfg():
     tip_mid_thickness = RewardTermCfg(
         func=straddle_tip_mid_thickness_shaping,
         params=_push_mid_thickness_params(),
-        weight=180.0,
+        weight=80.0,
     )
 
     # Per-jaw ±20 mm targets on trailing face at mid-height (proximity σ = 35 mm).
     finger_proximity = RewardTermCfg(
         func=straddle_finger_trailing_width_proximity,
         params=_push_finger_proximity_params(),
-        weight=250.0,
+        weight=150.0,
     )
 
     # Explicit symmetric jaw-axis gap shaping (±20 mm at 40 mm span).
     lateral_gap = RewardTermCfg(
         func=straddle_lateral_gap_shaping,
         params=_push_lateral_gap_params(),
-        weight=30.0,
+        weight=10.0,
     )
 
     # straddle_success_bonus = RewardTermCfg(
@@ -1101,7 +1004,7 @@ class RewardsPushCfg():
     )
     push_axis_velocity = RewardTermCfg(
         func=pcb_push_axis_velocity_reward_gated,
-        params=_push_velocity_params(min_push_speed_m_s=0.002),
+        params=_push_velocity_params(min_push_speed_m_s=0.01),
         weight=150.0,
     )
     slide_travel_milestone = RewardTermCfg(
@@ -1116,7 +1019,7 @@ class RewardsPushCfg():
             "belt_center_z_env": _SLIDE_BELT_CENTER_Z_ENV,
             "max_lead_z_drift_m": _SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M,
         },
-        weight=50.0,
+        weight=100.0,
     )
     goal_lead_proximity = RewardTermCfg(
         func=pcb_leading_edge_insertion_proximity_reward,
