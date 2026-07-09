@@ -33,26 +33,14 @@ from .mdp_custom import (
     pcb_leading_edge_insertion_proximity_reward,
     pcb_leading_edge_push_axis_approach_progress_gated,
     pcb_push_axis_velocity_reward_gated,
-    pcb_horizontal_velocity_perpendicular_to_axis_penalty,
     action_rate_l2,
-    pcb_push_axis_displacement_penalty,
-    pcb_x_lane_boundary_exponential_penalty,
     pcb_thickness_axis_tilt_penalty,
-    pcb_xy_plane_parallel_shaping,
-    straddle_success_bonus_reward,
-    straddle_finger_target_success,
     straddle_lateral_gap_shaping,
     slide_success_bonus_reward,
     slide_leading_edge_travel_milestone_bonus,
-    gripper_wrist_carriage_target_pitch_shaping,
-    straddle_trailing_face_approach_reward,
-    straddle_trailing_face_overshoot_shaping,
-    straddle_trailing_face_bounded_approach_reward,
     straddle_tip_mid_thickness_shaping,
     straddle_finger_trailing_width_proximity,
     reset_pcb_on_guide_rails_randomized,
-    reset_from_straddle_states,
-    reset_pcb_from_straddle_states,
     hold_gripper_open,
     pcb_slide_axis_sustained_backward_velocity_penalty,
     pcb_leading_edge_z_lift_penalty,
@@ -83,7 +71,7 @@ from .mdp_custom import (
 
 # Conversion: mm to meters
 PCB_X = 240.0 * 0.001
-PCB_Y = 76.5 * 0.001
+PCB_Y = 78.5 * 0.001
 PCB_Z = 0.001
 PCB_MASS_KG = 0.05
 _PCB_HALF_WIDTH_M = PCB_Y * 0.5
@@ -121,7 +109,7 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
 # Base beside the conveyor; +90° CCW yaw about world +Z (``_ROBOT_BASE_ROT_WXYZ``).
-_ROBOT_BASE_POS = (0.05, -0.38, 0.07)
+_ROBOT_BASE_POS = (0.06, -0.36, 0.08)
 # +90° CCW about world +Z (w, x, y, z).
 _ROBOT_BASE_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
 
@@ -132,8 +120,8 @@ _PUSH_OPEN_WIDTH_M = _PUSH_JAW_SPAN_M / _GRIPPER_JOINT_TO_SPAN_M
 
 _ROBOT_HOME_JOINT_POS = {
     "joint_0": 0.0,    # base yaw — nearly 0 (PCB is almost directly in +X from base)
-    "joint_1": 0.0,    # shoulder pitch down
-    "joint_2": 0.0,    # elbow bend
+    "joint_1": 0.3,    # shoulder pitch down
+    "joint_2": 0.1,    # elbow bend
     "joint_3": 0.0,    # wrist pitch
     "joint_4": 0.0,
     "joint_5": 0.0,    # wrist yaw — face toward conveyor (+Y approach)
@@ -164,7 +152,7 @@ _GRIPPER_TIP_OFFSET_M = 0.060
 # ---------------------------------------------------------------------------
 _CONVEYOR_CENTER_X_ENV = 0.056     # chip / conveyor centre X in env frame
 # PCB lane X for straddle / slide (not magazine bbox centre X ≈ 0.277).
-_CONVEYOR_SURFACE_Z = 0.150        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
+_CONVEYOR_SURFACE_Z = 0.147        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
 # Push spawn height (+50 mm above belt clears guide-rail meshes; lower than +70 mm → less knock-off).
 _PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5
 # Rail contact: PCB centre when the bottom sits on guide rails (~78 mm above belt top).
@@ -208,7 +196,7 @@ _PCB_FRONT_EDGE_GAP_M = 0.020      # front edge (toward +Y) this far before slot
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
     _CONVEYOR_CENTER_X_ENV,
-    0.04 - _PCB_FRONT_EDGE_GAP_M,
+    0.09 - _PCB_FRONT_EDGE_GAP_M,
     _PCB_CENTER_Z_ENV,
 )
 
@@ -228,7 +216,7 @@ _PCB_TERMINATE_MIN_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.025
 # ---------------------------------------------------------------------------
 # _MAG_CENTER_X_ENV = 0.277      # magazine bbox centre X (env-local); lane X is _CONVEYOR_CENTER_X_ENV
 # _MAG_CENTER_Y_ENV = 0.350      # magazine geometric centre Y (env-local)
-_MAG_Y_NEAR_FACE_ENV = 0.198   # slot entry plane toward conveyor — leading edge enters here (Sim-measured)
+_MAG_Y_NEAR_FACE_ENV = 0.207   # slot entry plane toward conveyor — leading edge enters here (Sim-measured)
 _MAG_Y_FAR_FACE_ENV = 0.472    # magazine back wall — PCB leading edge seats just before here
 
 # Leading-edge targets at far / near magazine faces (lane X, not magazine bbox centre X).
@@ -244,11 +232,11 @@ _SLIDE_LEAD_EDGE_MAX_PENALTY_EXCESS_M = 0.02
 # joint_1/joint_2 raised (10→20, 8→15) to give policy headroom to counteract gravity sag.
 _ARM_EFFORT_SCALE = {
     "joint_0": 10.0,   # base rotation
-    "joint_1": 20.0,   # shoulder pitch (supports arm + PCB weight) — raised for gravity headroom
-    "joint_2": 10.0,   # elbow — raised for gravity headroom
-    "joint_3": 15.0,   # wrist pitch
+    "joint_1": 10.0,   # shoulder pitch (supports arm + PCB weight) — raised for gravity headroom
+    "joint_2": 20.0,   # elbow — raised for gravity headroom
+    "joint_3": 20.0,   # wrist pitch
     "joint_4": 10.0,   # wrist roll
-    "joint_5": 20.0,   # end-effector tilt
+    "joint_5": 10.0,   # end-effector tilt
 }
 # Gripper carriage: prismatic joint [N].  Raised for stronger closing torque once straddle opens.
 _GRIPPER_EFFORT_SCALE = 10.0
@@ -263,12 +251,11 @@ _PUSH_JAW_GATE_MIN = 0.3
 # Terminal-state buffers (Sequential Dexterity chaining).
 _PUSH_STATES_PATH = os.path.join(ASSET_DIR, "data", "push_terminal_states.npz")
 # Slide success: leading short-edge centre at magazine back (+Y); mouth for approach shaping.
-_SLIDE_MOUTH_Y_MARGIN_M = 0.244 + 0.03
+_SLIDE_MOUTH_Y_MARGIN_M = 0.015
 _SLIDE_MOUTH_LEAD_Y_ENV = _MAG_Y_NEAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M
-_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.020
+_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.015
 # Success / milestone terminus: leading edge near magazine back wall (slide +Y direction).
-_SLIDE_SUCCESS_LEAD_Y_ENV = _MAG_Y_FAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M
-_SLIDE_MIN_LEAD_Y_SUCCESS_ENV = _SLIDE_SUCCESS_LEAD_Y_ENV - _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M
+_SLIDE_SUCCESS_LEAD_Y_ENV = _MAG_Y_FAR_FACE_ENV - _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M
 _SLIDE_MOUTH_LEAD_X_ENV = _CONVEYOR_CENTER_X_ENV
 _SLIDE_BELT_CENTER_Z_ENV = _RAIL_CENTER_Z_ENV  # milestones / rail Z shaping only
 _SLIDE_SUCCESS_TARGET_LEAD_XY_ENV = (
@@ -339,11 +326,11 @@ _MIN_STRADDLE_SEP_M = 0.030
 _ALONG_HEIGHT_GATE_STD_M = 0.06
 
 # Straddle finger targets along trailing edge (±offset from centre).
-_PUSH_GAP_LEFT_M = 0.020
-_PUSH_GAP_RIGHT_M = 0.020
-_PUSH_FINGER_OFFSET_M = 0.020
+_PUSH_GAP_LEFT_M = 0.015
+_PUSH_GAP_RIGHT_M = 0.015
+_PUSH_FINGER_OFFSET_M = 0.015
 # Approach shaping (finger_proximity): wide σ so gradient is active from ~10–15 cm behind edge.
-_PUSH_PROXIMITY_STD_M = 0.035
+_PUSH_PROXIMITY_STD_M = 0.03
 # Success / termination closedness: tight σ for ±20 mm placement at trailing edge.
 _PUSH_SUCCESS_STD_M = 0.02
 _PUSH_WIDTH_GAP_SIGMA_M = _PUSH_SUCCESS_STD_M
@@ -988,11 +975,11 @@ class RewardsPushCfg():
     # )
 
     # Continuous flatness shaping — discourages knock-over before hard tilt terminations fire.
-    pcb_tilt_penalty = RewardTermCfg(
-        func=pcb_thickness_axis_tilt_penalty,
-        params={"pcb_cfg": _PCB_ENT},
-        weight=-100.0,
-    )
+    # pcb_tilt_penalty = RewardTermCfg(
+    #     func=pcb_thickness_axis_tilt_penalty,
+    #     params={"pcb_cfg": _PCB_ENT},
+    #     weight=-100.0,
+    # )
 
     # ========================== Slide Rewards ==========================
 
@@ -1003,7 +990,7 @@ class RewardsPushCfg():
     )
     push_axis_velocity = RewardTermCfg(
         func=pcb_push_axis_velocity_reward_gated,
-        params=_push_velocity_params(min_push_speed_m_s=0.01),
+        params=_push_velocity_params(min_push_speed_m_s=0.005),
         weight=150.0,
     )
     slide_travel_milestone = RewardTermCfg(
@@ -1031,11 +1018,11 @@ class RewardsPushCfg():
         weight=100.0,
     )
 
-    # pcb_yaw_alignment = RewardTermCfg(
-    #     func=slide_pcb_yaw_xy_alignment_shaping,
-    #     params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-    #     weight=35.0,
-    # )
+    pcb_yaw_alignment = RewardTermCfg(
+        func=slide_pcb_yaw_xy_alignment_shaping,
+        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+        weight=60.0,
+    )
     # yaw_corrective_push = RewardTermCfg(
     #     func=slide_yaw_corrective_asymmetric_push_shaping,
     #     params=_slide_yaw_corrective_params(),
@@ -1068,6 +1055,8 @@ class EventCfgPush:
             "pos_offset_ranges": _PCB_POS_OFFSET_RANGES,
             "yaw_offset_range": _PCB_YAW_OFFSET_RANGE,
             "velocity_scale": 0.0,
+            "half_length_m": _HALF_LENGTH_M,
+            "slot_mouth_y_env": _MAG_Y_NEAR_FACE_ENV,
         },
     )
     reset_robot_home = EventTermCfg(
@@ -1206,4 +1195,4 @@ class WidowXPcbPushEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 5.0
+        self.episode_length_s = 8.0

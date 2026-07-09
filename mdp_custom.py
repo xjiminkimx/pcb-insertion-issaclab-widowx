@@ -1628,6 +1628,61 @@ _STRADDLE_LEAD_VY_SUM: torch.Tensor | None = None
 _STRADDLE_LEAD_VY_LAST: torch.Tensor | None = None
 _STRADDLE_BETWEEN_FINGERS_SUM: torch.Tensor | None = None
 _STRADDLE_BETWEEN_FINGERS_LAST: torch.Tensor | None = None
+_SLIDE_TRAVEL_FRAC_MAX: torch.Tensor | None = None
+_SLIDE_TRAVEL_FRAC_LAST: torch.Tensor | None = None
+_SLIDE_MILESTONE_POSE_OK_SUM: torch.Tensor | None = None
+_SLIDE_MILESTONE_BONUS_SUM: torch.Tensor | None = None
+_SLIDE_MILESTONE_DEBUG_STEPS: torch.Tensor | None = None
+
+
+def _slide_milestone_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
+    """Per-env buffers for slide travel-fraction / milestone TensorBoard scalars."""
+    global _SLIDE_TRAVEL_FRAC_MAX, _SLIDE_TRAVEL_FRAC_LAST
+    global _SLIDE_MILESTONE_POSE_OK_SUM, _SLIDE_MILESTONE_BONUS_SUM, _SLIDE_MILESTONE_DEBUG_STEPS
+    n = env.num_envs
+    if (
+        _SLIDE_TRAVEL_FRAC_MAX is None
+        or _SLIDE_TRAVEL_FRAC_MAX.shape[0] != n
+        or _SLIDE_TRAVEL_FRAC_MAX.device != env.device
+    ):
+        _SLIDE_TRAVEL_FRAC_MAX = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _SLIDE_TRAVEL_FRAC_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _SLIDE_MILESTONE_POSE_OK_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _SLIDE_MILESTONE_BONUS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _SLIDE_MILESTONE_DEBUG_STEPS = torch.zeros(n, device=env.device, dtype=torch.long)
+
+
+def _slide_milestone_debug_accumulate(
+    env: ManagerBasedEnv,
+    frac: torch.Tensor,
+    pose_ok: torch.Tensor,
+    bonus: torch.Tensor,
+) -> None:
+    """Accumulate travel fraction and milestone hits for episode-end curriculum logging."""
+    global _SLIDE_TRAVEL_FRAC_MAX, _SLIDE_TRAVEL_FRAC_LAST
+    global _SLIDE_MILESTONE_POSE_OK_SUM, _SLIDE_MILESTONE_BONUS_SUM, _SLIDE_MILESTONE_DEBUG_STEPS
+    _slide_milestone_debug_ensure_buffers(env)
+    frac_f = frac.detach().to(dtype=torch.float32)
+    pose_f = pose_ok.detach().to(dtype=torch.float32)
+    bonus_f = bonus.detach().to(dtype=torch.float32)
+    _SLIDE_TRAVEL_FRAC_MAX = torch.maximum(_SLIDE_TRAVEL_FRAC_MAX, frac_f)
+    _SLIDE_TRAVEL_FRAC_LAST = frac_f
+    _SLIDE_MILESTONE_POSE_OK_SUM += pose_f
+    _SLIDE_MILESTONE_BONUS_SUM += bonus_f
+    _SLIDE_MILESTONE_DEBUG_STEPS += 1
+
+
+def _slide_milestone_debug_clear(env_ids: torch.Tensor) -> None:
+    """Reset milestone debug accumulators for finished episodes."""
+    global _SLIDE_TRAVEL_FRAC_MAX, _SLIDE_TRAVEL_FRAC_LAST
+    global _SLIDE_MILESTONE_POSE_OK_SUM, _SLIDE_MILESTONE_BONUS_SUM, _SLIDE_MILESTONE_DEBUG_STEPS
+    if _SLIDE_TRAVEL_FRAC_MAX is None:
+        return
+    _SLIDE_TRAVEL_FRAC_MAX[env_ids] = 0.0
+    _SLIDE_TRAVEL_FRAC_LAST[env_ids] = 0.0
+    _SLIDE_MILESTONE_POSE_OK_SUM[env_ids] = 0.0
+    _SLIDE_MILESTONE_BONUS_SUM[env_ids] = 0.0
+    _SLIDE_MILESTONE_DEBUG_STEPS[env_ids] = 0
 
 
 def _push_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
@@ -2224,6 +2279,21 @@ def push_gripper_debug_curriculum(
     _STRADDLE_LEAD_VY_SUM[ids] = 0.0
     _STRADDLE_BETWEEN_FINGERS_SUM[ids] = 0.0
 
+    milestone_out: dict[str, float] = {}
+    _slide_milestone_debug_ensure_buffers(env)
+    m_steps = _SLIDE_MILESTONE_DEBUG_STEPS[ids].to(dtype=torch.float32).clamp(min=1.0)
+    milestone_out["travel_frac_ep_max"] = float(_SLIDE_TRAVEL_FRAC_MAX[ids].mean().item())
+    milestone_out["travel_frac_end"] = float(_SLIDE_TRAVEL_FRAC_LAST[ids].mean().item())
+    milestone_out["milestone_pose_ok_frac"] = float(
+        (_SLIDE_MILESTONE_POSE_OK_SUM[ids] / m_steps).mean().item()
+    )
+    milestone_out["milestone_bonus_ep"] = float(_SLIDE_MILESTONE_BONUS_SUM[ids].mean().item())
+    if hasattr(env, "_slide_milestone_tier_hits_ep"):
+        hits = env._slide_milestone_tier_hits_ep[ids].to(dtype=torch.float32)
+        for i in range(hits.shape[1]):
+            milestone_out[f"milestone_tier_{i}_hit_frac"] = float(hits[:, i].mean().item())
+    _slide_milestone_debug_clear(ids)
+
     return {
         # Proximity σ — same as ``finger_proximity`` reward (rises during approach).
         "closedness_mean": float(closedness_mean.item()),
@@ -2251,6 +2321,7 @@ def push_gripper_debug_curriculum(
         "lead_vy_live": float(lead_vy_live.item()),
         "between_fingers_q_mean": float(between_q_mean.item()),
         "between_fingers_q_live": float(between_q_live.item()),
+        **milestone_out,
     }
 
 
@@ -4132,6 +4203,33 @@ def _slide_lead_pose_ok(
     return x_ok & z_ok
 
 
+def _slide_leading_edge_travel_frac(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_y_env: float,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Leading-edge env pose, normalized +Y travel fraction ``[0, 1]``, and valid-travel mask."""
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    a = torch.tensor(axis_world, device=env.device, dtype=lead_env.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+
+    if hasattr(env, "_insert_start_lead_proj"):
+        start_proj = env._insert_start_lead_proj
+    else:
+        # Reset must call ``_store_insert_progress_baselines``; without it frac stays ~0.
+        start_proj = proj.detach()
+
+    total = float(target_lead_y_env) - start_proj
+    valid = total > 1e-6
+    total_safe = torch.where(valid, total, torch.ones_like(total))
+    frac = torch.where(valid, (proj - start_proj) / total_safe, torch.zeros_like(proj))
+    frac = frac.clamp(0.0, 1.0)
+    return lead_env, frac, valid
+
+
 def slide_leading_edge_travel_milestone_bonus(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -4146,28 +4244,16 @@ def slide_leading_edge_travel_milestone_bonus(
 ) -> torch.Tensor:
     """One-shot sparse bonus each time leading-edge +Y travel crosses a milestone fraction.
 
-    Progress is measured from ``env._insert_start_lead_proj`` (set at slide reset) to
+    Progress is measured from ``env._insert_start_lead_proj`` (set at PCB reset) to
     ``target_lead_y_env``.  Milestone credit requires leading-edge lane X and belt Z pose
     (flat push on the conveyor).  Returns the count of newly crossed tiers this step.
     """
-    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    lead_env, frac, _ = _slide_leading_edge_travel_frac(
+        env, pcb_cfg, half_length_m, target_lead_y_env, axis_world
+    )
     pose_ok = _slide_lead_pose_ok(
         env, lead_env, max_lead_x_drift_m, belt_center_z_env, max_lead_z_drift_m
     )
-    a = torch.tensor(axis_world, device=env.device, dtype=lead_env.dtype)
-    a = a / torch.norm(a).clamp_min(1e-9)
-    proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
-
-    if hasattr(env, "_insert_start_lead_proj"):
-        start_proj = env._insert_start_lead_proj
-    else:
-        start_proj = proj.detach()
-
-    total = float(target_lead_y_env) - start_proj
-    valid = total > 1e-6
-    total_safe = torch.where(valid, total, torch.ones_like(total))
-    frac = torch.where(valid, (proj - start_proj) / total_safe, torch.zeros_like(proj))
-    frac = frac.clamp(0.0, 1.0)
 
     tiers = tuple(milestone_fractions)
     n_tiers = len(tiers)
@@ -4182,12 +4268,24 @@ def slide_leading_edge_travel_milestone_bonus(
         paid = torch.zeros(env.num_envs, n_tiers, device=env.device, dtype=torch.bool)
         setattr(env, state_attr, paid)
 
+    if not hasattr(env, "_slide_milestone_tier_hits_ep"):
+        env._slide_milestone_tier_hits_ep = torch.zeros(
+            env.num_envs, n_tiers, device=env.device, dtype=torch.bool
+        )
+    tier_hits: torch.Tensor = env._slide_milestone_tier_hits_ep
+    if tier_hits.shape[0] != env.num_envs or tier_hits.shape[1] != n_tiers:
+        tier_hits = torch.zeros(env.num_envs, n_tiers, device=env.device, dtype=torch.bool)
+        env._slide_milestone_tier_hits_ep = tier_hits
+
     bonus = torch.zeros(env.num_envs, device=env.device, dtype=frac.dtype)
     for i, mf in enumerate(tiers):
         crossed = frac >= float(mf)
         newly = crossed & (~paid[:, i]) & pose_ok
         paid[:, i] = paid[:, i] | newly
+        tier_hits[:, i] = tier_hits[:, i] | newly
         bonus = bonus + newly.to(dtype=frac.dtype)
+
+    _slide_milestone_debug_accumulate(env, frac, pose_ok, bonus)
     return bonus
 
 
@@ -4255,6 +4353,43 @@ def slide_pcb_yaw_xy_alignment_shaping(
     """Reward PCB long-axis alignment with the slide (+Y) direction in the horizontal plane."""
     _, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
     return cos_align
+
+
+def pcb_yaw_xy_abs_rad(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """Absolute yaw (rad) of PCB long-axis vs ``axis_world`` in the horizontal plane."""
+    sin_yaw, cos_align = _pcb_yaw_xy_signed_sin_cos(env, pcb_cfg, axis_world)
+    return torch.atan2(torch.abs(sin_yaw), cos_align.clamp(0.0, 1.0))
+
+
+def pcb_yaw_abs_exceeds(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_abs_yaw_rad: float = 0.005,
+) -> torch.Tensor:
+    """Terminate when absolute PCB yaw error reaches ``max_abs_yaw_rad`` (default 5 mrad)."""
+    return pcb_yaw_xy_abs_rad(env, pcb_cfg, axis_world) >= float(max_abs_yaw_rad)
+
+
+def pcb_yaw_abs_exponential_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    soft_abs_yaw_rad: float = 0.0001,
+    exp_scale: float = 500.0,
+) -> torch.Tensor:
+    """Non-negative exponential yaw penalty; zero below ``soft_abs_yaw_rad``.
+
+    For ``|yaw| > soft``: ``expm1(exp_scale * (|yaw| - soft))``. Use a **negative** weight.
+    At default soft=1e-4 and scale=500, |yaw|=5e-3 → ≈10.6 before weight scaling.
+    """
+    abs_yaw = pcb_yaw_xy_abs_rad(env, pcb_cfg, axis_world)
+    excess = (abs_yaw - float(soft_abs_yaw_rad)).clamp(min=0.0)
+    return torch.expm1(float(exp_scale) * excess)
 
 
 def slide_pcb_yaw_sin_obs(
@@ -4706,6 +4841,8 @@ def _store_insert_progress_baselines(
 
     if hasattr(env, "_slide_travel_milestone_paid"):
         env._slide_travel_milestone_paid[env_ids] = False
+    if hasattr(env, "_slide_milestone_tier_hits_ep"):
+        env._slide_milestone_tier_hits_ep[env_ids] = False
 
     if hasattr(env, "_slide_success_sustain_count"):
         env._slide_success_sustain_count[env_ids] = 0
@@ -4748,11 +4885,14 @@ def reset_pcb_on_guide_rails_randomized(
     pos_offset_ranges: dict[str, tuple[float, float]] | None = None,
     yaw_offset_range: tuple[float, float] = (0.0, 0.0),
     velocity_scale: float = 0.0,
+    half_length_m: float | None = None,
+    slot_mouth_y_env: float = 0.198,
 ) -> None:
     """Place PCB root at nominal rail pose plus uniform XY offsets and world-Z yaw (domain rand).
 
     ``pos_offset_ranges`` keys ``"x"`` / ``"y"`` give per-env uniform offsets in env-local axes.
     ``yaw_offset_range`` is a uniform world +Z rotation (radians) applied on top of ``rot_wxyz``.
+    When ``half_length_m`` is set, caches leading-edge travel baselines for slide milestones.
     """
     pcb = env.scene[pcb_cfg.name]
     n = len(env_ids)
@@ -4787,6 +4927,11 @@ def reset_pcb_on_guide_rails_randomized(
 
     pcb.write_root_pose_to_sim(root_pose, env_ids=env_ids)
     pcb.write_root_velocity_to_sim(root_vel, env_ids=env_ids)
+    pcb.update(0.0)
+    if half_length_m is not None:
+        _store_insert_progress_baselines(
+            env, env_ids, pcb_cfg, float(half_length_m), float(slot_mouth_y_env)
+        )
 
 
 def pcb_moving_backward_termination(

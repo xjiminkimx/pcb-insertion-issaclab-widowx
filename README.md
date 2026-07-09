@@ -1,28 +1,23 @@
-# PCB on-rail task — WidowX (Isaac Lab)
+# WidowX PCB Push — Isaac Lab
 
-This package is an **Isaac Lab** manager-based RL task: a robot arm interacts with a **PCB** on a **magazine + conveyor** assembly (single aligned USD). Side guide-rail rods are omitted from the fixture USD. Training uses **rl-games** (PPO).
+Manager-based RL task for a **WidowX** arm that **open-jaw straddles** the PCB trailing short edge, then **pushes +Y** along the conveyor/guide rails toward the magazine slot.
 
-Three simulation variants are registered (policy chaining):
+Training uses **rl-games** (PPO). Checkpoints and TensorBoard logs are written under this package’s `logs/` when you use the workspace scripts.
 
-| Robot | Task ID | Phase |
-|--------|---------|--------|
-| **WidowX** (`usd_model/usd_robot/wxai/wxai_follower.usd`) | `Isaac-WidowX-PCB-Grasp-v0` | 1 — grasp trailing short-edge centre |
-| | `Isaac-WidowX-PCB-Slide-v0` | 2 — slide on guide rails to slot **mouth** |
-| | `Isaac-WidowX-PCB-Insert-v0` | 3 — insert through mouth into magazine (SDF reward) |
+| Robot | Task ID | Description |
+|--------|---------|-------------|
+| WidowX (`usd_model/usd_robot/wxai/wxai_follower.usd`) | **`Isaac-WidowX-PCB-Push-v0`** | Open-jaw approach + +Y push / slide to magazine |
+| | `Isaac-WidowX-PCB-Straddle-v0` | Deprecated alias of Push |
 
-Robot runtime assets live under `usd_model/usd_robot/`; fixtures under `usd_model/usd_env/`.
+**Pipeline (single phase):**
 
-**High-level pipeline:**
+1. Reset PCB on guide rails (domain-randomized XY / yaw).
+2. Gripper held open at **40 mm** span (`hold_gripper_open`).
+3. Policy approaches trailing edge (`finger_proximity` / mid-thickness / gap shaping).
+4. After push gate (closedness), credit +Y PCB motion (`push_axis_velocity`, progress, milestones).
+5. Episode ends on **`slide_success`** (leading edge near magazine terminus) or safety terminations.
 
-1. **Grasp** — open gripper, approach, pinch trailing edge (`grasp_success`).
-2. **Collect** → `data/grasp_terminal_states.npz`
-3. **Slide** — reset from grasp buffer; +Y rail push until leading edge reaches slot mouth (`slide_success`). **No SDF insert reward.**
-4. **Collect** → `data/slide_terminal_states.npz`
-5. **Insert** — reset from slide buffer; SDF-shaped reward seats PCB in magazine (`insert_success`).
-
-Recommended order: **Grasp → collect → Slide → collect → Insert**.
-
-See [Policy chaining (Grasp → Slide → Insert)](#policy-chaining-grasp--slide--insert).
+Legacy Grasp → Slide → Insert chaining scripts/configs may still exist in the tree, but the **active registered env is Push**.
 
 ---
 
@@ -30,433 +25,268 @@ See [Policy chaining (Grasp → Slide → Insert)](#policy-chaining-grasp--slide
 
 | Path | Role |
 |------|------|
-| `__init__.py` | Registers grasp / slide / insert envs; rl-games log-std safety patch. |
-| `widowx_pcb_env_cfg.py` | Scene, per-phase rewards/events/terminations, magazine geometry. |
-| `usd_model/env_v6/` | URDF + `convert_to_usd.py` → `usd_env/pcb_insertion_env.usd` |
-| `mdp_custom.py` | Grasp/slide/insert MDP terms, terminal-state resets, `pcb_insertion_sdf_reward`. |
-| `scripts/collect_grasp_states.py` | Grasp → `data/grasp_terminal_states.npz` |
-| `scripts/collect_slide_states.py` | Slide → `data/slide_terminal_states.npz` |
-| `scripts/train_grasp.sh` / `train_slide.sh` / `train_insert.sh` | Training entry points (`logs/rl_games/`). |
-| `scripts/play_grasp.sh` / `play_slide.sh` / `play_insert.sh` | Play trained checkpoints. |
-| `scripts/record_insert_videos.py` | Record Insert rollout videos. |
-| `data/*.npz` | Terminal-state buffers for policy chaining (see `data/README.md`). |
-| `agents/` | `WidowXPcbGraspPPOCfg`, `WidowXPcbSlidePPOCfg`, `WidowXPcbInsertPPOCfg`. |
-
-A local `trossen_ai_isaac/` directory (if present) is intentionally **not** tracked: it is a separate clone with its own `.git`. Track it as a **submodule** or symlink if your workflow depends on it.
-
----
-
-## Branching model
-
-- **`main`** — release-oriented line; keep this branch in a working, reviewable state.
-- **`dev`** — day-to-day integration; merge or rebase into `main` when a change set is ready.
-
-Typical workflow:
-
-```bash
-git checkout dev
-# edit, commit
-git checkout main
-git merge dev   # or open a PR from dev → main
-```
-
-Both branches are created from the same initial commit when the repository is first set up.
+| `__init__.py` | Registers `Isaac-WidowX-PCB-Push-v0` (+ deprecated Straddle alias). |
+| `widowx_pcb_env_cfg.py` | Scene, Push rewards / events / terminations, geometry constants. |
+| `mdp_custom.py` | Geometry, push-gated rewards, debug curriculum, reset helpers. |
+| `usd_model/env_v6/` | `assembly_6.urdf` + `convert_to_usd.py` → **`pcb_insertion_env.usd`** (runtime fixture). |
+| `usd_model/usd_robot/wxai/` | WidowX follower USD. |
+| `scripts/train_push.sh` / `play_push.sh` | Primary train / play entry points. |
+| `scripts/train_straddle.sh` / `play_straddle.sh` | Wrappers → push scripts. |
+| `scripts/collect_push_states.py` | Optional terminal-state collection for downstream chaining. |
+| `agents/` | `WidowXPcbPushPPOCfg`, TensorBoard helper, workspace paths. |
+| `data/` | Terminal-state `.npz` buffers (see `data/README.md`). |
+| `logs/rl_games/widowx_pcb_push/` | Training summaries + `nn/*.pth` checkpoints. |
 
 ---
 
 ## Prerequisites
 
-- [Isaac Sim](https://developer.nvidia.com/isaac-sim) and **Isaac Lab** installed and on your `PYTHONPATH`, consistent with the parent `IsaacLab` repo layout.
-- Conda (or equivalent) env that can run Isaac Lab training scripts (example name: `isaac-sim`).
+- [Isaac Sim](https://developer.nvidia.com/isaac-sim) and **Isaac Lab** installed (same layout as the parent `IsaacLab` repo).
+- Conda (or equivalent) env that can run Isaac Lab RL scripts (example: `isaac-sim`).
+
+---
 
 ## Train (rl-games PPO)
 
-**Recommended:** use the workspace scripts so TensorBoard logs and checkpoints are saved under **`logs/` in this repo**.
-
-**Phase 1 — grasp only:**
+**Recommended:** run from this package so logs land under `logs/rl_games/widowx_pcb_push/`.
 
 ```bash
 conda activate isaac-sim   # or your env name
-cd /path/to/widowx_pcb   # this workspace
-bash scripts/train_grasp.sh --num_envs 4096 --headless
+cd /path/to/widowx_pcb
+
+# Triangle-mesh fixture colliders need larger GPU collision buffers.
+# Prefer 2048 envs if you see PhysX collisionStackSize overflow at 4096.
+bash scripts/train_push.sh --num_envs 2048 --headless
 ```
 
-**Phase 2 — slide** (requires `data/grasp_terminal_states.npz`):
+Deprecated alias:
 
 ```bash
-bash scripts/train_slide.sh --num_envs 4096 --headless
+bash scripts/train_straddle.sh --num_envs 2048 --headless
 ```
 
-**Phase 3 — insert** (requires `data/slide_terminal_states.npz`; see [Policy chaining](#policy-chaining-grasp--slide--insert)):
-
-```bash
-bash scripts/train_insert.sh --num_envs 4096 --headless
-```
-
-If you already trained from the Isaac Lab root, copy logs into the workspace once:
+If you previously trained under Isaac Lab root:
 
 ```bash
 bash scripts/sync_logs_from_isaaclab.sh
 ```
 
-Alternative (logs under `<IsaacLab>/logs/` instead of this workspace):
+Alternative (logs under `<IsaacLab>/logs/`):
 
 ```bash
 cd /path/to/IsaacLab
-python scripts/reinforcement_learning/rl_games/train.py --task Isaac-WidowX-PCB-Grasp-v0 --num_envs 4096 --headless
+python scripts/reinforcement_learning/rl_games/train.py \
+  --task Isaac-WidowX-PCB-Push-v0 --num_envs 2048 --headless
 ```
+
+PPO knobs: `agents/rl_games_ppo_cfg.py` → `WidowXPcbPushPPOCfg`  
+(`name: widowx_pcb_push`, `max_epochs: 150`, `entropy_coef: 1e-2`, …).
 
 ---
 
-## Policy chaining (Grasp → Slide → Insert)
+## Evaluate / play
 
-Three policies are trained and chained using **Sequential Dexterity** ([Chen et al., CoRL 2023](https://arxiv.org/abs/2309.00987)): each phase’s terminal state distribution becomes the next phase’s reset distribution.
+Checkpoints: `logs/rl_games/widowx_pcb_push/nn/`  
+Default best model: `widowx_pcb_push.pth`
 
-**Slide** and **Insert** are split because contact at the slot mouth differs from deep magazine insertion — slide learns open-rail +Y pushing and alignment; insert learns SDF-shaped seating inside the slot ([IndustReal](https://arxiv.org/abs/2305.17110)-style dense reward).
+**Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to **cwd**. Run from this package root.
 
-### End-to-end workflow
+```bash
+cd /path/to/widowx_pcb
+bash scripts/play_push.sh --num_envs 1
+```
+
+Specific checkpoint:
+
+```bash
+bash scripts/play_push.sh \
+  --num_envs 1 \
+  --checkpoint logs/rl_games/widowx_pcb_push/nn/last_widowx_pcb_push_ep_30_*.pth
+```
+
+Without `--checkpoint`, play loads the best `nn/widowx_pcb_push.pth`.  
+`--use_last_checkpoint` picks the latest epoch file.  
+Add `--real-time` for wall-clock playback.
+
+---
+
+## Task design (Push)
+
+### Actions
+
+- Arm: effort on `joint_[0-5]` (`ActionsCfgPush`).
+- Gripper: **not** policy-controlled; PD-held open every step (`hold_gripper_open` at 40 mm span).
+
+### Rewards (`RewardsPushCfg`)
+
+| Term | Role (approx.) |
+|------|----------------|
+| `finger_proximity` | Dense approach to ±20 mm trailing-edge finger targets (σ ≈ 35 mm) |
+| `tip_mid_thickness` | Pull pads to PCB mid-thickness (edge height) |
+| `lateral_gap` | Symmetric jaw–PCB width gaps |
+| `pcb_tilt_penalty` | Discourage knock-over |
+| `leading_edge_push_progress` | Gated +Y leading-edge progress |
+| `push_axis_velocity` | Gated +Y PCB velocity |
+| `slide_travel_milestone` | One-shot sparse bonuses at travel fractions |
+| `goal_lead_proximity` | Soft proximity to goal leading-edge pose |
+| `pcb_yaw_alignment` | Keep PCB yaw aligned with push axis |
+| `slide_success_bonus` | Large sparse bonus on success |
+| `action_rate_penalty` | Smooth actions |
+
+Push credit is gated on **finger-target closedness** (same family as straddle geometry), not the old `pcb_between_gripper_fingers` quality score.
+
+### Terminations (`TerminationsPushCfg`)
+
+- `slide_success` — leading edge in success box (see `_slide_success_params`)
+- `pcb_tilt_excessive`, `pcb_long_axis_not_horizontal`
+- `pcb_fallen_below_rail`, `pcb_moving_backward`
+- `time_out` (`episode_length_s = 8.0 s`)
+
+### Debug / TensorBoard curriculum
+
+`Curriculum/push_gripper_debug/*` (via `push_gripper_debug_curriculum`):
+
+- `closedness` / `closedness_tight` — episode-end batch means (proximity vs tight σ)
+- `closedness_peak`, `straddle_success_frac`
+- `push_gate_open_frac`, `lead_vy`, distances in mm
+
+---
+
+## Fixture USD (`env_v6`)
+
+Runtime asset loaded by the scene:
 
 ```text
-  Train Grasp ──▶ collect_grasp_states ──▶ Train Slide ──▶ collect_slide_states ──▶ Train Insert
-                  grasp_terminal_states              slide_terminal_states
+usd_model/env_v6/pcb_insertion_env.usd
 ```
 
-**Step 1 — Grasp**
+Regenerate after changing the converter:
 
 ```bash
-bash scripts/train_grasp.sh --num_envs 2048 --headless
+cd usd_model/env_v6 && python3 convert_to_usd.py
 ```
 
-**Step 2 — Collect grasp terminal states** (`grasp_success` only)
+### What is included / excluded
 
-```bash
-python scripts/collect_grasp_states.py \
-    --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth \
-    --num_envs 256 --num_states 2000 --headless
+| Included | Notes |
+|----------|--------|
+| Magazine | Triangle-mesh collider (`physics:approximation = none`) |
+| Guide rails (`Part_1_7`) | Horizontal PCB support — triangle mesh |
+| Side belts (`Part_1_2`) | Triangle mesh |
+| Stand / frame | `convexDecomposition` |
+
+| Excluded | Reason |
+|----------|--------|
+| Chip / PCB mesh | Spawned as a separate cuboid in the env |
+| Short axles (`Part_1_3`) | Decorative |
+| Raised side rail-guides (`Part_1_4`, `Part_1_6`) | Tall posts beside conveyor — removed so they do not block approach |
+
+Contact / rest offsets on fixture meshes default to **0.0001 m**.  
+PCB cuboid uses the same order of magnitude in `widowx_pcb_env_cfg.py`.
+
+### Support height vs “floating” look
+
+- Side **belt** top is lower than guide **rail** tops in the `env_v6` assembly — the PCB rests on the **rails**, not the belt surface.
+- A few mm gap above the belt in the viewport is normal when the board is seated on the rails (not only `rest_offset`).
+- Spawn height is driven by `_CONVEYOR_SURFACE_Z` → `_PCB_CENTER_Z_ENV` in `widowx_pcb_env_cfg.py`. Align that with **rail support**, not the belt visual alone.
+
+### PhysX GPU buffers
+
+Full triangle meshes × many envs can overflow `gpu_collision_stack_size` (contacts dropped → tunneling / floaty PCB). Push cfg sets:
+
+```text
+gpu_collision_stack_size = 2**29   # ~512 MB
 ```
 
-**Step 3 — Slide** (resets from `data/grasp_terminal_states.npz`)
+Prefer **`--num_envs 2048`** (or lower) if overflow returns at 4096.
 
-```bash
-bash scripts/train_slide.sh --num_envs 2048 --headless
-```
-
-Slide rewards (`RewardsSlidePhaseCfg`): straddle shaping, `jaw_rail_vertical` + `wrist_push_alignment`, `gripper_closing`, **one-shot** travel milestones (25/50/75% toward mouth), `slide_success_bonus`. Obs include `pinch_orientation_cos` (jaw rail ∥ +Z, wrist ∥ +Y). Episode ends on **`slide_success`** when leading-edge Y ≥ 0.210 m, **gripper closed**, and PCB speed below thresholds for **4 consecutive steps** (~128 ms); milestones target `_SLIDE_MOUTH_LEAD_Y_ENV` (= `_MAG_Y_NEAR_FACE_ENV` − 8 mm).
-
-**Step 4 — Collect slide terminal states** (`slide_success` only)
-
-```bash
-python scripts/collect_slide_states.py \
-    --checkpoint logs/rl_games/widowx_pcb_slide/nn/widowx_pcb_slide.pth \
-    --num_envs 256 --num_states 2000 --headless
-```
-
-**Step 5 — Insert** (resets from `data/slide_terminal_states.npz`)
-
-```bash
-bash scripts/train_insert.sh --num_envs 2048 --headless
-```
-
-### Terminal state format (both `.npz` files)
-
-| Key | Shape | Description |
-|-----|-------|-------------|
-| `joint_pos` | `(N, n_joints)` | Robot joints at phase success |
-| `pcb_pos_env` | `(N, 3)` | PCB root position (env-local, m) |
-| `pcb_quat` | `(N, 4)` | PCB orientation **(w, x, y, z)** |
-| `joint_names` | list | Joint names matching `joint_pos` columns |
-
-Reset helpers: `reset_from_grasp_states` + `reset_pcb_from_grasp_states` (same code path for slide buffer; path constants `_GRASP_STATES_PATH` / `_SLIDE_STATES_PATH`).
-
-### Insert-phase reward (SDF-inspired)
-
-`RewardsInsertPhaseCfg.sdf_insert` → `pcb_insertion_sdf_reward` (weight 80):
-
-| Component | Coef | Signal |
-|-----------|------|--------|
-| Proximity | 0.20 | Gaussian on leading-edge distance to slot centre |
-| Alignment | 0.20 | \|cos θ\| long axis vs +Y |
-| Depth | 0.60 | Leading-edge penetration past mouth (`_MAG_Y_NEAR_FACE_ENV`) |
-
-Also: straddle hold, seated leading-edge proximity, lane / lateral / Z-lift penalties.
-
-### Phase success criteria
-
-| Phase | Termination | Criterion |
-|-------|-------------|-----------|
-| Grasp | `grasp_success` | Edge-centre pinch + tight gripper |
-| Slide | `slide_success` | Leading edge Y ≥ threshold + **gripper closed** + **low PCB speed** (4 steps); `pcb_detached` guards straddle |
-| Insert | `insert_success` | PCB centre Y at magazine centre |
-
-### Tips
-
-- Collect **more states than parallel envs** (e.g. 2000+ for 2048 envs).
-- Re-collect buffers when upstream checkpoints or success criteria change.
-- Tune `_MAG_Y_NEAR_FACE_ENV`, `_SLOT_CENTER_XYZ_ENV` (lane X + magazine Y) in Isaac Sim after moving the fixture.
-
----
-
-## Evaluate / play a trained policy
-
-Checkpoints live under this workspace (when you train with `scripts/train_*.sh`):
-
-| Phase | Log folder | Default checkpoint |
-|-------|------------|-------------------|
-| Grasp | `logs/rl_games/widowx_pcb_grasp/` | `nn/widowx_pcb_grasp.pth` |
-| Slide | `logs/rl_games/widowx_pcb_slide/` | `nn/widowx_pcb_slide.pth` |
-| Insert | `logs/rl_games/widowx_pcb_insert/` | `nn/widowx_pcb_insert.pth` |
-
-**Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to the **current working directory**. Run from **`/path/to/widowx_pcb`** (this workspace), not from the Isaac Lab repo root — otherwise it will not find workspace checkpoints.
-
-### Grasp policy (recommended)
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/play_grasp.sh --num_envs 16
-```
-
-### Slide policy (recommended)
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/play_slide.sh --num_envs 16
-```
-
-### Insert policy (recommended)
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/play_insert.sh --num_envs 16
-```
-
-Without `--checkpoint`, `play.py` auto-loads the best model from `logs/rl_games/widowx_pcb_<phase>/nn/<phase>.pth`.
-Use `--use_last_checkpoint` for the most recent epoch file instead of the best one.
-Add `--real-time` to throttle stepping to wall clock during interactive play.
-
-### Load a specific checkpoint
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/play_grasp.sh \
-    --num_envs 16 \
-    --checkpoint logs/rl_games/widowx_pcb_grasp/nn/widowx_pcb_grasp.pth
-```
-
-Insert example:
-
-```bash
-bash scripts/play_insert.sh \
-    --num_envs 16 \
-    --checkpoint logs/rl_games/widowx_pcb_insert/nn/widowx_pcb_insert.pth
-```
-
-### Record a video of the rollout
-
-#### Insert policy (recommended — `record_insert_videos`)
-
-For Insert rollouts, use the workspace script instead of `play.py --video`. It loads the latest best checkpoint, uses a **playback camera** that frames the robot arm + PCB + slot (set in `WidowXPcbInsertEnvCfg.viewer`), and records headless with faster defaults (854×480, one frame every 4 sim steps, 30 fps output).
-
-**Prerequisites:** `conda activate isaac-sim` (or your Isaac Lab env). **Pause Insert training** while recording — a second Isaac Sim on the same GPU is very slow.
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/record_insert_videos.sh
-```
-
-Default output: `logs/rl_games/widowx_pcb_insert/videos/play/insert-episode-<HHMMSS>.mp4`
-
-**Custom output path** (e.g. workspace root):
-
-```bash
-bash scripts/record_insert_videos.sh --out insert-episode-latest.mp4
-```
-
-**Specific checkpoint:**
-
-```bash
-bash scripts/record_insert_videos.sh \
-    --checkpoint logs/rl_games/widowx_pcb_insert/nn/widowx_pcb_insert.pth \
-    --out insert-episode-latest.mp4
-```
-
-**Most recent epoch file** (not best):
-
-```bash
-bash scripts/record_insert_videos.sh --use_last_checkpoint
-```
-
-**Python equivalent:**
-
-```bash
-python scripts/record_insert_videos.py \
-    --headless \
-    --num_episodes 1 \
-    --checkpoint logs/rl_games/widowx_pcb_insert/nn/widowx_pcb_insert.pth \
-    --out insert-episode-latest.mp4
-```
-
-| Argument | Default | Meaning |
-|----------|---------|---------|
-| `--checkpoint` | `logs/.../nn/widowx_pcb_insert.pth` | Trained Insert `.pth` |
-| `--num_episodes` | `1` | Episodes to record |
-| `--out` | *(auto)* | Output `.mp4` path |
-| `--use_last_checkpoint` | off | Use latest `last_*.pth` instead of best |
-| `--video_fps` | `30` | Playback frame rate (readable speed) |
-| `--render_stride` | `4` | Capture every N env steps (higher = faster recording) |
-| `--video_width` / `--video_height` | `854` / `480` | Render resolution (lower = faster) |
-| `--seed` | `42` | Reset seed (change for a different rollout) |
-
-Faster capture (lower quality):
-
-```bash
-bash scripts/record_insert_videos.sh \
-    --render_stride 6 \
-    --video_width 640 \
-    --video_height 360
-```
-
-Episode length is up to 6 s (~750 env steps). The video ends when the episode terminates (detach, tilt, success, etc.) or hits the timeout.
-
-#### Grasp policy (`play.py --video`)
-
-```bash
-cd /path/to/widowx_pcb
-bash scripts/play_grasp.sh \
-    --num_envs 4 \
-    --headless \
-    --video \
-    --video_length 500
-```
-
-Videos are saved under `logs/rl_games/widowx_pcb_<phase>/videos/play/`.
-
-To fix an already-recorded fast video (sim-tagged 125 fps):
-
-```bash
-ffmpeg -y -i input.mp4 -vf "setpts=PTS*(125/30)" -r 30 -c:v libx264 -crf 18 -pix_fmt yuv420p output_realtime.mp4
-```
+**Do not** casually switch magazine to SDF without retuning `sdf_margin` / resolution: a narrow slot can behave “thicker” and eject the PCB.
 
 ---
 
 ## TensorBoard
-
-Training with rl-games **automatically** writes TensorBoard event files under each phase's `summaries/` folder. No extra CLI flags are required.
-
-PPO settings (experiment name, `max_epochs`, `horizon_length`, `use_diagnostics`, `reward_shaper`) live in [`agents/rl_games_ppo_cfg.py`](agents/rl_games_ppo_cfg.py): `WidowXPcbGraspPPOCfg`, `WidowXPcbSlidePPOCfg`, `WidowXPcbInsertPPOCfg`.
-
-When you use `scripts/train_grasp.sh` / `train_slide.sh` / `train_insert.sh`, logs are written under **this workspace**:
-
-| Phase | Task ID | Train script | Log folder | Checkpoint | `episode_length_s` | `max_epochs` |
-|-------|---------|--------------|------------|------------|--------------------|--------------|
-| 1 Grasp | `Isaac-WidowX-PCB-Grasp-v0` | `train_grasp.sh` | `logs/rl_games/widowx_pcb_grasp/` | `nn/widowx_pcb_grasp.pth` | 4 s | 500 |
-| 2 Slide | `Isaac-WidowX-PCB-Slide-v0` | `train_slide.sh` | `logs/rl_games/widowx_pcb_slide/` | `nn/widowx_pcb_slide.pth` | 8 s | 200 |
-| 3 Insert | `Isaac-WidowX-PCB-Insert-v0` | `train_insert.sh` | `logs/rl_games/widowx_pcb_insert/` | `nn/widowx_pcb_insert.pth` | 5 s | 200 |
-
-TensorBoard event files:
-
-```text
-logs/rl_games/widowx_pcb_grasp/summaries/events.out.tfevents.*
-logs/rl_games/widowx_pcb_slide/summaries/events.out.tfevents.*
-logs/rl_games/widowx_pcb_insert/summaries/events.out.tfevents.*
-```
-
-Checkpoints and optional play videos sit beside `summaries/` in the same phase folder (`nn/`, `videos/play/`).
-
-**Diagnostics:** Grasp uses `use_diagnostics: True` (full rl-games loss / KL scalars). Slide and Insert set `use_diagnostics: False` to avoid early `explained_variance` NaN spam in TensorBoard; policy / value / entropy tags still appear.
-
-### View logs
-
-**Option A — project helper** (defaults to workspace `logs/`, lists which phase folders exist):
 
 ```bash
 cd /path/to/widowx_pcb
 python agents/monitor_tensorboard.py --port 6006
 ```
 
-**Option B — Isaac Lab wrapper** (if logs are still under Isaac Lab root):
+Or:
 
 ```bash
-cd /path/to/IsaacLab
-./isaaclab.sh -p -m tensorboard.main --logdir=logs --port=6006
-```
-
-**Option C — TensorBoard directly** on this workspace:
-
-```bash
-cd /path/to/widowx_pcb
 tensorboard --logdir=logs --port=6006
 ```
 
-Open <http://127.0.0.1:6006>. In the run selector you should see all trained phases, e.g. `widowx_pcb_grasp`, `widowx_pcb_slide`, `widowx_pcb_insert` (under `rl_games/…/summaries`).
+Open <http://127.0.0.1:6006>. Primary run: `rl_games/widowx_pcb_push/summaries`.
 
-### What to watch (all phases)
+### Useful scalars
 
-rl-games training scalars (names vary slightly by version):
+| Tag / area | Meaning |
+|------------|---------|
+| Episodic reward | Overall learning progress |
+| `Episode_Reward/<term>` | Per-term Push rewards |
+| `Episode_Termination/slide_success` | Success rate |
+| `Curriculum/push_gripper_debug/closedness` | Approach quality (proximity σ) |
+| `Curriculum/push_gripper_debug/closedness_tight` | Same gate family as push unlock (tight σ) |
+| `Curriculum/push_gripper_debug/push_gate_open_frac` | Fraction of steps with push gate open |
+| `Curriculum/push_gripper_debug/lead_vy` | PCB +Y velocity snapshot |
 
-- Episodic reward / `rewards/episode_rewards` (or `episode_rewards`)
-- Policy / actor loss
-- Value / critic loss
-- Entropy
-- KL / `approx_kl` (Grasp only when `use_diagnostics: True`)
-
-Isaac Lab manager env extras (when logged per episode):
-
-- `Episode_Reward/<term>` — per reward term from `RewardsGraspPhaseCfg`, `RewardsSlidePhaseCfg`, or `RewardsInsertPhaseCfg`
-- `Episode_Termination/<term>` — success rate for `grasp_success`, `slide_success`, or `insert_success`
-
-### Phase-specific signals
-
-| Phase | Success termination | Reward terms worth watching |
-|-------|---------------------|-----------------------------|
-| Grasp | `grasp_success` | `grasp_success_bonus`, `pcb_between_fingers`, `gripper_closing`, `premature_close` |
-| Slide | `slide_success` | `slide_success_bonus`, `slide_travel_milestone`, `jaw_rail_vertical`, `wrist_push_alignment`, `gripper_closing`, `pcb_between_fingers` (no `sdf_insert`) |
-| Insert | `insert_success` | `sdf_insert`, `mouth_approach_proximity`, lane penalties (`pcb_x_lane_escape`, `pcb_lateral_velocity`) |
-
-If mean reward plateaus, compare per-term `Episode_Reward/*` curves against `action_rate_penalty` — a flat success termination while penalties dominate usually means the policy is idling or fighting contact at the slot mouth.
-
-### Logging frequency
-
-rl-games logs episode-level metrics when episodes **terminate**. With `horizon_length` 128 (Grasp) or 256 (Slide / Insert) and `episode_length_s` of 4–8 s, scalar updates may appear every ~10–60 epochs. That is expected rl-games behavior, not a missing-log bug.
-
-### Clean summaries only (keep checkpoints)
-
-Slide and Insert train scripts accept:
-
-```bash
-bash scripts/train_slide.sh --clean-logs    # deletes summaries/ only
-bash scripts/train_insert.sh --clean-logs
-```
-
-Use `--clean-all` on those scripts to wipe the entire phase log folder (`summaries/`, `nn/`, videos). For Grasp, remove `logs/rl_games/widowx_pcb_grasp/summaries/` manually or re-run with a fresh log dir.
+Sparse terms (e.g. `slide_travel_milestone`) average over envs and are scaled by `dt` / episode length in Isaac Lab logging — they can look near-zero even when firing on a few envs.
 
 ---
 
-## Important task knobs
+## Geometry / env knobs (`widowx_pcb_env_cfg.py`)
 
-### Fixture pose vs USD
+| Constant | Role |
+|----------|------|
+| `_MAG_POS` / `_MAG_ROT_WXYZ` | Fixture placement (−90° Z maps root −X → world +Y push) |
+| `PUSH_AXIS_WORLD` | `(0, 1, 0)` |
+| `_CONVEYOR_SURFACE_Z` | Spawn / height reference (align with rail top in practice) |
+| `_PCB_INIT_POS` | PCB reset pose (lane X, Y before slot, Z on support) |
+| `_PUSH_OPEN_WIDTH_M` | Open span target (40 mm jaw span / carriage scale) |
+| `_PUSH_FINGER_OFFSET_M` | ±20 mm trailing-edge finger targets |
+| `_PUSH_SUCCESS_CLOSEDNESS_THRESHOLD` | Closedness level used with push gating |
+| `_SLIDE_SUCCESS_LEAD_Y_ENV` | Leading-edge success / milestone terminus along +Y |
+| `_SLIDE_TRAVEL_MILESTONE_FRACTIONS` | One-shot travel tiers |
 
-The runtime fixture is `usd_model/usd_env/pcb_insertion_env.usd`, generated from **env_v6** (`assembly_6.urdf`):
+Align magazine slot constants (`_MAG_Y_NEAR_FACE_ENV`, success XY) with Isaac Sim measurements after moving the fixture.
+
+---
+
+## Optional: collect push terminal states
+
+For Sequential Dexterity-style downstream phases (if enabled again later):
 
 ```bash
-cd usd_model/env_v6 && python3 convert_to_usd.py
+bash scripts/collect_push_states.sh \
+  --checkpoint logs/rl_games/widowx_pcb_push/nn/widowx_pcb_push.pth \
+  --num_envs 256 --num_states 2000 --headless
 ```
 
-Align `_MAG_POS` / `_MAG_ROT_WXYZ` in `widowx_pcb_env_cfg.py` with the loaded asset in world frame. If the **green PCB clips into the conveyor**, raise spawn Z (or `collision_props.contact_offset` / `rest_offset`) until the board sits on the belt top in the contact view.
+See `data/README.md` for `.npz` field layout.
 
-### Physics and collision
+---
 
-If the PCB intersects the fixture: tune CCD and contact offsets in the env config and collision meshes in USD.
+## Branching model
 
-### Reset pose and drop termination
+- **`main`** — release-oriented working line.
+- **`dev`** — day-to-day integration; merge into `main` when ready.
 
-Tune **`pcb_tilt_excessive`**, **`pcb_long_axis_not_horizontal`**, **`pcb_fallen_below_rail`**, **`pcb_dropped`**, and **`arm_idle`** (`_ARM_IDLE_MIN_STEPS`, `_ARM_IDLE_MAX_ABS_VEL_RAD_S`) if episodes reset too aggressively—or not enough when the PCB slips / the policy freezes.
+---
 
-### Grippers and observations
+## Troubleshooting
 
-- **WidowX:** fingertip bodies `gripper_left` / `gripper_right`, drive joint `left_carriage_joint`.
+| Symptom | Likely cause / fix |
+|---------|-------------------|
+| PhysX `collisionStackSize` overflow | Raise `gpu_collision_stack_size` further, or lower `--num_envs` (2048 recommended with triangle magazine). |
+| PCB looks above belt but on rails | Expected if seated on rails. Check rail contact / `_CONVEYOR_SURFACE_Z`, not belt visual. |
+| PCB sinks / tunnels | Contact drop from GPU overflow, or spawn Z too low vs rail collision. |
+| Push never starts (low `push_gate_open_frac`) | Closedness under gate threshold — watch `closedness_tight` / distances in TB. |
+| Idles at trailing edge | Approach rewards dominate push terms — rebalance weights / idle penalty / gate. |
+| Checkpoint not found in play | Run play from `widowx_pcb` cwd, not Isaac Lab root. |
 
-### If mean reward plateaus (policy idles near the edge)
+---
 
-1. In grasp/insert reward configs, balance approach / insertion terms vs **`action_rate_penalty`**.
-2. In PPO (`agents/rl_games_ppo_cfg.py`), raise **entropy** slightly or decay it more slowly if the policy collapses early.
-3. Log **per-term rewards** in TensorBoard if available, to see which term is flat.
+## License
+
+See `LICENSE` in this package.

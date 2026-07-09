@@ -165,6 +165,10 @@ def main() -> int:
     print("      - closedness_tight_mean            — tight 20 mm σ (success placement)")
     print("      - dist_l_mm_mean / dist_r_mm_mean   — pad→±20 mm target distance")
     print("      - push_gate_open_frac / push_gate_open_live")
+    print("      - travel_frac_ep_max / travel_frac_end     — slide +Y progress (0→1)")
+    print("      - milestone_bonus_ep                       — tiers hit per episode (0–5)")
+    print("      - milestone_tier_*_hit_frac                — per-tier hit rate")
+    print("      - milestone_pose_ok_frac                   — in-lane X/Z while sliding")
     print()
 
     cmd = [

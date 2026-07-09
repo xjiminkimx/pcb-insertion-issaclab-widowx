@@ -110,7 +110,7 @@ WidowXPcbPushPPOCfg = {
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
             # Softer per-step deltas reduce PCB knock-over late in training.
-            "clip_actions": 0.35,
+            "clip_actions": 0.30,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],

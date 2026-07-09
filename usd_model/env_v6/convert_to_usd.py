@@ -11,7 +11,8 @@ Material + physics settings:
 Collision approximations:
   Magazine / guide rails / side belts — Triangle Mesh (``none``) for accurate flats/slot.
   Stand / frame                       — convexDecomposition (decorative contact only).
-Short axle rods (Part_1_3.stl) and chip/PCB link excluded — chip spawned separately.
+Short axle rods (Part_1_3.stl), raised side rail-guides (Part_1_4 / Part_1_6),
+and chip/PCB link excluded — chip spawned separately.
 
 Recommended Physics Scene settings in env cfg:
   sim.dt = 1/480 or 1/240   (480 Hz or 240 Hz)
@@ -275,8 +276,10 @@ MESH_TEMPLATE_TRIANGLE = """\
 CHIP_LINKS = {"root", "chip"}
 MAGAZINE_LINKS = {"magazine"}
 SHORT_AXLE_MESH = "Part_1_3.stl"    # short axle rods — decorative, excluded
+# Tall vertical guides beside the conveyor (Z above rail top) — block PCB approach.
+SIDE_RAIL_GUIDE_MESHES = frozenset({"Part_1_4.stl", "Part_1_6.stl"})
 BELT_MESH = "Part_1_2.stl"          # side conveyor belts
-RAIL_MESH = "Part_1_7.stl"          # guide-rail bars
+RAIL_MESH = "Part_1_7.stl"          # guide-rail bars (horizontal PCB support)
 
 
 def export_links(links: dict) -> list[str]:
@@ -284,7 +287,8 @@ def export_links(links: dict) -> list[str]:
     for name, info in links.items():
         if not info.get("mesh") or name in CHIP_LINKS:
             continue
-        if mesh_basename(info["mesh"]) == SHORT_AXLE_MESH:
+        base = mesh_basename(info["mesh"])
+        if base == SHORT_AXLE_MESH or base in SIDE_RAIL_GUIDE_MESHES:
             continue
         out.append(name)
     return sorted(out)
