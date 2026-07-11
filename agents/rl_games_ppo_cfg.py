@@ -86,7 +86,7 @@ WidowXPcbPPOBaseCfg = {
             # At 2e-3 the policy was collapsing to a narrow grasp trajectory too early.
             # The adaptive LR will reduce the update magnitude when KL spikes, so a
             # higher entropy coef is safe — it just prevents premature convergence.
-            "entropy_coef": 2e-2,
+            "entropy_coef": 1e-2,
             "truncate_grads": True,
             "e_clip": 0.3,
             # Longer horizon gives the value function more context for delayed grasp/push rewards.
@@ -102,15 +102,15 @@ WidowXPcbPPOBaseCfg = {
     }
 }
 
-# Push — open-jaw trailing-edge approach + +Y slide to slot.
+# Push — open-jaw trailing-edge approach + +Y slide (18-dim VIC: 6×[Δq, K, ζ]).
 WidowXPcbPushPPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            # Softer per-step deltas reduce PCB knock-over late in training.
-            "clip_actions": 0.30,
+            # VIC: smaller Δq per step; stiffness/damping blocks use [-1, 1] → mapped ranges in env.
+            "clip_actions": 0.15,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -118,7 +118,8 @@ WidowXPcbPushPPOCfg = {
                 **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
                 "continuous": {
                     **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
-                    "sigma_init": {"name": "const_initializer", "val": -0.3},
+                    # Slightly wider init std for 18-dim impedance action space.
+                    "sigma_init": {"name": "const_initializer", "val": -0.8},
                 },
             },
         },
@@ -126,8 +127,8 @@ WidowXPcbPushPPOCfg = {
             **WidowXPcbPPOBaseCfg["params"]["config"],
             "name": "widowx_pcb_push",
             "full_experiment_name": ".",
-            "entropy_coef": 1e-2,
-            "max_epochs": 90,
+            "entropy_coef": 5e-3,
+            "max_epochs": 240,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
