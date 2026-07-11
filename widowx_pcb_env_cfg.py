@@ -191,7 +191,7 @@ _SIM_MIN_VEL_ITERATIONS = 2
 # ---------------------------------------------------------------------------
 # PCB — derived only from conveyor + slot (not from robot / gripper)
 # ---------------------------------------------------------------------------
-_PCB_FRONT_EDGE_GAP_M = 0.020      # front edge (toward +Y) this far before slot mouth
+_PCB_FRONT_EDGE_GAP_M = 0.030      # front edge (toward +Y) this far before slot mouth
 
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
@@ -990,7 +990,7 @@ class RewardsPushCfg():
     )
     push_axis_velocity = RewardTermCfg(
         func=pcb_push_axis_velocity_reward_gated,
-        params=_push_velocity_params(min_push_speed_m_s=0.005),
+        params=_push_velocity_params(min_push_speed_m_s=0.003),
         weight=150.0,
     )
     slide_travel_milestone = RewardTermCfg(
@@ -1005,7 +1005,7 @@ class RewardsPushCfg():
             "belt_center_z_env": _SLIDE_BELT_CENTER_Z_ENV,
             "max_lead_z_drift_m": _SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M,
         },
-        weight=100.0,
+        weight=300.0,
     )
     goal_lead_proximity = RewardTermCfg(
         func=pcb_leading_edge_insertion_proximity_reward,
@@ -1021,7 +1021,7 @@ class RewardsPushCfg():
     pcb_yaw_alignment = RewardTermCfg(
         func=slide_pcb_yaw_xy_alignment_shaping,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=60.0,
+        weight=100.0,
     )
     # yaw_corrective_push = RewardTermCfg(
     #     func=slide_yaw_corrective_asymmetric_push_shaping,

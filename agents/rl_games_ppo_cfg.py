@@ -127,7 +127,7 @@ WidowXPcbPushPPOCfg = {
             "name": "widowx_pcb_push",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
-            "max_epochs": 90,
+            "max_epochs": 300,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
