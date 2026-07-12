@@ -2527,7 +2527,7 @@ def _push_gripper_debug_accumulate_all(
         tip_offset_m=tip_offset_m,
     )
     push_step = pcb_leading_edge_push_axis_approach_progress(
-        env, pcb_cfg, half_length_m, axis_world, max_step_m
+        env, pcb_cfg, half_length_m, axis_world, max_step_m, update_prev=False
     )
     pure = _pcb_off_axis_speed(env, pcb_cfg) < float(max_off_axis_speed_m_s)
     push_progress = torch.where(pure, push_step, torch.zeros_like(push_step))
@@ -6771,11 +6771,15 @@ def pcb_leading_edge_push_axis_approach_progress(
     half_length_m: float,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     max_step_m: float = 0.005,
+    update_prev: bool = True,
 ) -> torch.Tensor:
     """Per-step +Y progress of the leading short-edge centre along the push axis.
 
     Credits ``clamp(proj_t - proj_{t-1}, 0, max_step) / max_step`` so the policy gets
     immediate signal for millimetre-scale rail slide (unlike cumulative state progress).
+
+    Set ``update_prev=False`` for read-only sampling (e.g. TensorBoard debug) so a prior
+    call in the same control step does not zero the reward term's delta.
     """
     global _INSERT_PREV_LEAD_PROJ
 
@@ -6787,15 +6791,18 @@ def pcb_leading_edge_push_axis_approach_progress(
     if (
         _INSERT_PREV_LEAD_PROJ is None
         or _INSERT_PREV_LEAD_PROJ.shape[0] != proj.shape[0]
-        or _INSERT_PREV_LEAD_PROJ.device != proj.device
+        or str(_INSERT_PREV_LEAD_PROJ.device) != str(proj.device)
     ):
-        _INSERT_PREV_LEAD_PROJ = proj.clone()
+        if update_prev:
+            _INSERT_PREV_LEAD_PROJ = proj.clone()
         return torch.zeros_like(proj)
 
     first_step = env.episode_length_buf == 1
-    _INSERT_PREV_LEAD_PROJ = torch.where(first_step, proj, _INSERT_PREV_LEAD_PROJ)
-    delta = (proj - _INSERT_PREV_LEAD_PROJ).clamp(min=0.0, max=float(max_step_m))
-    _INSERT_PREV_LEAD_PROJ = proj.clone()
+    prev = torch.where(first_step, proj, _INSERT_PREV_LEAD_PROJ)
+    delta = (proj - prev).clamp(min=0.0, max=float(max_step_m))
+    if update_prev:
+        _INSERT_PREV_LEAD_PROJ = torch.where(first_step, proj, _INSERT_PREV_LEAD_PROJ)
+        _INSERT_PREV_LEAD_PROJ = proj.clone()
     return delta / (float(max_step_m) + 1e-9)
 
 

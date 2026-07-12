@@ -135,7 +135,7 @@ _PCB_POS_OFFSET_RANGES = {
 _PCB_YAW_OFFSET_RANGE = (-0.002, 0.002)
 _GRIPPER_OPEN_WIDTH_M = _PUSH_OPEN_WIDTH_M
 # Distal offset from ``gripper_left``/``gripper_right`` body origin to contact pad tip (wrist→jaw).
-_GRIPPER_TIP_OFFSET_M = 0.0
+_GRIPPER_TIP_OFFSET_M = 0.06
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (prior Sim tuning; env_v6 USD at _MAG_POS above)
@@ -358,7 +358,7 @@ _PUSH_MIDPOINT_JAW_OFFSET_M = 0.0
 _PUSH_WRIST_TARGET_PITCH_DEG = 20.0
 _PUSH_WRIST_PITCH_SIGMA_DEG = 5.0
 # Success: mean per-jaw ``1 - tanh(dist/std)`` must reach this closedness (in [0, 1]).
-_PUSH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.1
+_PUSH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.4
 
 # Shared geometry kwargs for straddle checks and phase transitions.
 _PUSH_CHECK_KWARGS = {
@@ -1039,13 +1039,6 @@ class RewardsPushCfg():
 
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.02)
 
-    # Runs during reward compute (before reset) so curriculum buffers stay in sync with TB.
-    push_gripper_debug_monitor = RewardTermCfg(
-        func=push_gripper_debug_monitor_reward,
-        params=_push_debug_params(),
-        weight=1e-10,
-    )
-
     # # Far-field +Y approach to trailing face (both jaws must advance together).
     # trailing_face_approach = RewardTermCfg(
     #     func=straddle_trailing_face_bounded_approach_reward,
@@ -1146,6 +1139,14 @@ class RewardsPushCfg():
         func=slide_success_bonus_reward,
         params=_slide_success_params(),
         weight=10000.0,
+    )
+
+    # After all reward terms (especially ``leading_edge_push_progress``) so debug does not
+    # consume ``_INSERT_PREV_LEAD_PROJ`` before the gated progress reward runs.
+    push_gripper_debug_monitor = RewardTermCfg(
+        func=push_gripper_debug_monitor_reward,
+        params=_push_debug_params(),
+        weight=1e-10,
     )
 
 
