@@ -109,8 +109,8 @@ WidowXPcbPushPPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            # VIC: smaller Δq per step; stiffness/damping blocks use [-1, 1] → mapped ranges in env.
-            "clip_actions": 0.15,
+            # Task-space OSC: smaller Δxyz; orientation axes locked in env cfg.
+            "clip_actions": 0.20,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],

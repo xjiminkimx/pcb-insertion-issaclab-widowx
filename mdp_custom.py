@@ -30,7 +30,11 @@ _DEFAULT_PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # ---------------------------------------------------------
 from isaaclab.controllers.joint_impedance import JointImpedanceController, JointImpedanceControllerCfg  # noqa: E402
 from isaaclab.envs.mdp.actions import joint_actions  # noqa: E402
-from isaaclab.envs.mdp.actions.actions_cfg import RelativeJointPositionActionCfg  # noqa: E402
+from isaaclab.envs.mdp.actions.actions_cfg import (  # noqa: E402
+    OperationalSpaceControllerActionCfg,
+    RelativeJointPositionActionCfg,
+)
+from isaaclab.envs.mdp.actions.task_space_actions import OperationalSpaceControllerAction  # noqa: E402
 
 
 class JointVariableImpedanceAction(ActionTerm):
@@ -226,26 +230,47 @@ def get_joint_variable_impedance_action(
     return None
 
 
+def get_task_space_impedance_action(
+    env: ManagerBasedEnv,
+    action_name: str = "arm_action",
+) -> OperationalSpaceControllerAction | None:
+    """Return task-space OSC action term (``WidowXTaskSpaceImpedanceAction`` or base OSC)."""
+    if not hasattr(env, "action_manager"):
+        return None
+    term = env.action_manager.get_term(action_name)
+    if isinstance(term, OperationalSpaceControllerAction):
+        return term
+    return None
+
+
 def vic_arm_stiffness_normalized_obs(
     env: ManagerBasedRLEnv,
     action_name: str = "arm_action",
 ) -> torch.Tensor:
-    """Policy obs: per-joint stiffness K in [-1, 1] (shape ``[N, num_arm_joints]``)."""
-    term = get_joint_variable_impedance_action(env, action_name)
-    if term is None:
-        return torch.zeros(env.num_envs, 6, device=env.device, dtype=torch.float32)
-    return term.stiffness_normalized()
+    """Policy obs: stiffness command in [-1, 1] (6 joints or 6 task axes)."""
+    vic_term = get_joint_variable_impedance_action(env, action_name)
+    if vic_term is not None:
+        return vic_term.stiffness_normalized()
+    osc_term = get_task_space_impedance_action(env, action_name)
+    if osc_term is not None and osc_term._stiffness_idx is not None:
+        idx = osc_term._stiffness_idx
+        return osc_term.raw_actions[:, idx : idx + 6].clamp(-1.0, 1.0)
+    return torch.zeros(env.num_envs, 6, device=env.device, dtype=torch.float32)
 
 
 def vic_arm_damping_normalized_obs(
     env: ManagerBasedRLEnv,
     action_name: str = "arm_action",
 ) -> torch.Tensor:
-    """Policy obs: per-joint damping ratio ζ in [-1, 1] (shape ``[N, num_arm_joints]``)."""
-    term = get_joint_variable_impedance_action(env, action_name)
-    if term is None:
-        return torch.zeros(env.num_envs, 6, device=env.device, dtype=torch.float32)
-    return term.damping_normalized()
+    """Policy obs: damping ratio command in [-1, 1] (6 joints or 6 task axes)."""
+    vic_term = get_joint_variable_impedance_action(env, action_name)
+    if vic_term is not None:
+        return vic_term.damping_normalized()
+    osc_term = get_task_space_impedance_action(env, action_name)
+    if osc_term is not None and osc_term._damping_ratio_idx is not None:
+        idx = osc_term._damping_ratio_idx
+        return osc_term.raw_actions[:, idx : idx + 6].clamp(-1.0, 1.0)
+    return torch.zeros(env.num_envs, 6, device=env.device, dtype=torch.float32)
 
 
 def arm_joint_torque_normalized_obs(
@@ -298,6 +323,64 @@ class JointVariableImpedanceActionCfg(ActionTermCfg):
     default_stiffness: float = 60.0
     default_damping_ratio: float = 1.0
     gravity_compensation: bool = False
+
+
+class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
+    """Task-space OSC with RL-friendly [-1, 1] → physical mapping for stiffness and damping.
+
+    Isaac Lab's default :class:`OperationalSpaceControllerAction` clamps stiffness/damping
+    actions directly to physical limits.  This subclass linearly maps the policy blocks
+    from [-1, 1] to ``motion_stiffness_limits_task`` / ``motion_damping_ratio_limits_task``
+    (same convention as :class:`JointVariableImpedanceAction`).
+    """
+
+    def _preprocess_actions(self, actions: torch.Tensor) -> None:
+        self._raw_actions[:] = actions
+        self._processed_actions[:] = self._raw_actions
+        if self._pose_abs_idx is not None:
+            pose_a = self._raw_actions[:, self._pose_abs_idx : self._pose_abs_idx + 7].clamp(-1.0, 1.0)
+            self._processed_actions[:, self._pose_abs_idx : self._pose_abs_idx + 3] = (
+                pose_a[:, :3] * self._position_scale
+            )
+            self._processed_actions[:, self._pose_abs_idx + 3 : self._pose_abs_idx + 7] = (
+                pose_a[:, 3:7] * self._orientation_scale
+            )
+        if self._pose_rel_idx is not None:
+            pose_a = self._raw_actions[:, self._pose_rel_idx : self._pose_rel_idx + 6].clamp(-1.0, 1.0)
+            self._processed_actions[:, self._pose_rel_idx : self._pose_rel_idx + 3] = (
+                pose_a[:, :3] * self._position_scale
+            )
+            self._processed_actions[:, self._pose_rel_idx + 3 : self._pose_rel_idx + 6] = (
+                pose_a[:, 3:6] * self._orientation_scale
+            )
+        if self._wrench_abs_idx is not None:
+            self._processed_actions[:, self._wrench_abs_idx : self._wrench_abs_idx + 6] = (
+                self._raw_actions[:, self._wrench_abs_idx : self._wrench_abs_idx + 6].clamp(-1.0, 1.0)
+                * self._wrench_scale
+            )
+        if self._stiffness_idx is not None:
+            stiff_a = self._raw_actions[:, self._stiffness_idx : self._stiffness_idx + 6].clamp(-1.0, 1.0)
+            k_lo, k_hi = self.cfg.controller_cfg.motion_stiffness_limits_task
+            span = float(k_hi) - float(k_lo)
+            self._processed_actions[:, self._stiffness_idx : self._stiffness_idx + 6] = (
+                float(k_lo) + 0.5 * (stiff_a + 1.0) * span
+            )
+        if self._damping_ratio_idx is not None:
+            damp_a = self._raw_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6].clamp(
+                -1.0, 1.0
+            )
+            d_lo, d_hi = self.cfg.controller_cfg.motion_damping_ratio_limits_task
+            span = float(d_hi) - float(d_lo)
+            self._processed_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6] = (
+                float(d_lo) + 0.5 * (damp_a + 1.0) * span
+            )
+
+
+@configclass
+class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
+    """Push task-space action: ``pose_rel`` (6) + task stiffness (6) + damping ratio (6) → 18 dims."""
+
+    class_type: type[ActionTerm] = WidowXTaskSpaceImpedanceAction
 
 
 class RelativeJointPositionActionWithPosLimits(joint_actions.RelativeJointPositionAction):
@@ -1923,6 +2006,13 @@ def pcb_open_straddle_ready(
 
 
 # Per-env episode accumulators for push gripper debug logging.
+def _debug_buf_matches_env(buf: torch.Tensor | None, env: ManagerBasedEnv) -> bool:
+    """True when ``buf`` is sized for ``env`` and on the same device (str-safe)."""
+    if buf is None:
+        return False
+    return buf.shape[0] == env.num_envs and str(buf.device) == str(env.device)
+
+
 _STRADDLE_DEBUG_JOINT_SUM: torch.Tensor | None = None
 _STRADDLE_DEBUG_READY_SUM: torch.Tensor | None = None
 _STRADDLE_DEBUG_JAWS_PAST_SUM: torch.Tensor | None = None
@@ -1978,11 +2068,7 @@ def _slide_milestone_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
     global _SLIDE_TRAVEL_FRAC_MAX, _SLIDE_TRAVEL_FRAC_LAST
     global _SLIDE_MILESTONE_POSE_OK_SUM, _SLIDE_MILESTONE_BONUS_SUM, _SLIDE_MILESTONE_DEBUG_STEPS
     n = env.num_envs
-    if (
-        _SLIDE_TRAVEL_FRAC_MAX is None
-        or _SLIDE_TRAVEL_FRAC_MAX.shape[0] != n
-        or _SLIDE_TRAVEL_FRAC_MAX.device != env.device
-    ):
+    if not _debug_buf_matches_env(_SLIDE_TRAVEL_FRAC_MAX, env):
         _SLIDE_TRAVEL_FRAC_MAX = torch.zeros(n, device=env.device, dtype=torch.float32)
         _SLIDE_TRAVEL_FRAC_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
         _SLIDE_MILESTONE_POSE_OK_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
@@ -2056,11 +2142,7 @@ def _push_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
     global _STRADDLE_BETWEEN_FINGERS_SUM, _STRADDLE_BETWEEN_FINGERS_LAST
     global _VIC_STIFFNESS_SUM, _VIC_STIFFNESS_LAST, _VIC_DAMPING_SUM, _VIC_DAMPING_LAST
     n = env.num_envs
-    if (
-        _STRADDLE_DEBUG_JOINT_SUM is None
-        or _STRADDLE_DEBUG_JOINT_SUM.shape[0] != n
-        or _STRADDLE_DEBUG_JOINT_SUM.device != env.device
-    ):
+    if not _debug_buf_matches_env(_STRADDLE_DEBUG_JOINT_SUM, env):
         _STRADDLE_DEBUG_JOINT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_DEBUG_READY_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_DEBUG_JAWS_PAST_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
@@ -2464,6 +2546,18 @@ def _push_gripper_debug_accumulate_all(
             vic_term.stiffness_cmd.mean(dim=-1),
             vic_term.damping_ratio_cmd.mean(dim=-1),
         )
+    else:
+        osc_term = get_task_space_impedance_action(env, action_name="arm_action")
+        if osc_term is not None and osc_term._stiffness_idx is not None:
+            ks = osc_term._stiffness_idx
+            zs = osc_term._damping_ratio_idx
+            k = osc_term.processed_actions[:, ks : ks + 6].mean(dim=-1)
+            z = (
+                osc_term.processed_actions[:, zs : zs + 6].mean(dim=-1)
+                if zs is not None
+                else torch.zeros_like(k)
+            )
+            _vic_impedance_debug_accumulate(k, z)
     return {
         "gap_left": gap_left,
         "gap_right": gap_right,
@@ -2795,7 +2889,8 @@ def push_gripper_debug_curriculum(
     global _STRADDLE_LEAD_VY_SUM, _STRADDLE_LEAD_VY_LAST
     global _STRADDLE_BETWEEN_FINGERS_SUM, _STRADDLE_BETWEEN_FINGERS_LAST
     global _VIC_STIFFNESS_SUM, _VIC_STIFFNESS_LAST, _VIC_DAMPING_SUM, _VIC_DAMPING_LAST
-    _push_gripper_debug_ensure_buffers(env)
+    if _STRADDLE_DEBUG_STEP_COUNT is None:
+        _push_gripper_debug_ensure_buffers(env)
     if isinstance(env_ids, slice):
         ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     elif not isinstance(env_ids, torch.Tensor):
@@ -2805,35 +2900,39 @@ def push_gripper_debug_curriculum(
     if ids.numel() == 0:
         return {}
 
-    counts = _STRADDLE_DEBUG_STEP_COUNT[ids].to(dtype=torch.float32).clamp(min=1.0)
-    gap_left_mean = (_STRADDLE_GAP_LEFT_SUM[ids] / counts).mean()
-    gap_right_mean = (_STRADDLE_GAP_RIGHT_SUM[ids] / counts).mean()
-    gap_left_live = _STRADDLE_GAP_LEFT_LAST[ids].mean()
-    gap_right_live = _STRADDLE_GAP_RIGHT_LAST[ids].mean()
-    closedness_mean = (_STRADDLE_CLOSEDNESS_SUM[ids] / counts).mean()
-    closedness_live = _STRADDLE_CLOSEDNESS_LAST[ids].mean()
-    closedness_tight_mean = (_STRADDLE_CLOSEDNESS_TIGHT_SUM[ids] / counts).mean()
-    closedness_tight_live = _STRADDLE_CLOSEDNESS_TIGHT_LAST[ids].mean()
-    closedness_ep_max = _STRADDLE_CLOSEDNESS_EP_MAX[ids].mean()
-    dist_l_mm_mean = (_STRADDLE_DIST_L_SUM[ids] / counts).mean() * 1000.0
-    dist_r_mm_mean = (_STRADDLE_DIST_R_SUM[ids] / counts).mean() * 1000.0
-    dist_l_mm_live = _STRADDLE_DIST_L_LAST[ids].mean() * 1000.0
-    dist_r_mm_live = _STRADDLE_DIST_R_LAST[ids].mean() * 1000.0
-    success_frac = (_STRADDLE_ACHIEVED_STEP_COUNT[ids] / counts).mean()
-    push_progress_mean = (_STRADDLE_PUSH_PROGRESS_SUM[ids] / counts).mean()
-    push_progress_live = _STRADDLE_PUSH_PROGRESS_LAST[ids].mean()
-    push_gate_open_frac = (_STRADDLE_PUSH_GATE_OPEN_SUM[ids] / counts).mean()
-    push_gate_open_live = _STRADDLE_PUSH_GATE_OPEN_LAST[ids].mean()
-    lead_y_mean = (_STRADDLE_LEAD_Y_SUM[ids] / counts).mean()
-    lead_y_live = _STRADDLE_LEAD_Y_LAST[ids].mean()
-    lead_vy_mean = (_STRADDLE_LEAD_VY_SUM[ids] / counts).mean()
-    lead_vy_live = _STRADDLE_LEAD_VY_LAST[ids].mean()
-    between_q_mean = (_STRADDLE_BETWEEN_FINGERS_SUM[ids] / counts).mean()
-    between_q_live = _STRADDLE_BETWEEN_FINGERS_LAST[ids].mean()
-    vic_stiffness_mean = (_VIC_STIFFNESS_SUM[ids] / counts).mean()
-    vic_stiffness_live = _VIC_STIFFNESS_LAST[ids].mean()
-    vic_damping_mean = (_VIC_DAMPING_SUM[ids] / counts).mean()
-    vic_damping_live = _VIC_DAMPING_LAST[ids].mean()
+    counts = _STRADDLE_DEBUG_STEP_COUNT[ids].to(dtype=torch.float32)
+    valid = counts > 0
+    if not bool(valid.any()):
+        return {}
+    counts_safe = counts.clamp(min=1.0)
+    gap_left_mean = (_STRADDLE_GAP_LEFT_SUM[ids] / counts_safe)[valid].mean()
+    gap_right_mean = (_STRADDLE_GAP_RIGHT_SUM[ids] / counts_safe)[valid].mean()
+    gap_left_live = _STRADDLE_GAP_LEFT_LAST[ids][valid].mean()
+    gap_right_live = _STRADDLE_GAP_RIGHT_LAST[ids][valid].mean()
+    closedness_mean = (_STRADDLE_CLOSEDNESS_SUM[ids] / counts_safe)[valid].mean()
+    closedness_live = _STRADDLE_CLOSEDNESS_LAST[ids][valid].mean()
+    closedness_tight_mean = (_STRADDLE_CLOSEDNESS_TIGHT_SUM[ids] / counts_safe)[valid].mean()
+    closedness_tight_live = _STRADDLE_CLOSEDNESS_TIGHT_LAST[ids][valid].mean()
+    closedness_ep_max = _STRADDLE_CLOSEDNESS_EP_MAX[ids][valid].mean()
+    dist_l_mm_mean = (_STRADDLE_DIST_L_SUM[ids] / counts_safe)[valid].mean() * 1000.0
+    dist_r_mm_mean = (_STRADDLE_DIST_R_SUM[ids] / counts_safe)[valid].mean() * 1000.0
+    dist_l_mm_live = _STRADDLE_DIST_L_LAST[ids][valid].mean() * 1000.0
+    dist_r_mm_live = _STRADDLE_DIST_R_LAST[ids][valid].mean() * 1000.0
+    success_frac = (_STRADDLE_ACHIEVED_STEP_COUNT[ids].to(dtype=torch.float32) / counts_safe)[valid].mean()
+    push_progress_mean = (_STRADDLE_PUSH_PROGRESS_SUM[ids] / counts_safe)[valid].mean()
+    push_progress_live = _STRADDLE_PUSH_PROGRESS_LAST[ids][valid].mean()
+    push_gate_open_frac = (_STRADDLE_PUSH_GATE_OPEN_SUM[ids] / counts_safe)[valid].mean()
+    push_gate_open_live = _STRADDLE_PUSH_GATE_OPEN_LAST[ids][valid].mean()
+    lead_y_mean = (_STRADDLE_LEAD_Y_SUM[ids] / counts_safe)[valid].mean()
+    lead_y_live = _STRADDLE_LEAD_Y_LAST[ids][valid].mean()
+    lead_vy_mean = (_STRADDLE_LEAD_VY_SUM[ids] / counts_safe)[valid].mean()
+    lead_vy_live = _STRADDLE_LEAD_VY_LAST[ids][valid].mean()
+    between_q_mean = (_STRADDLE_BETWEEN_FINGERS_SUM[ids] / counts_safe)[valid].mean()
+    between_q_live = _STRADDLE_BETWEEN_FINGERS_LAST[ids][valid].mean()
+    vic_stiffness_mean = (_VIC_STIFFNESS_SUM[ids] / counts_safe)[valid].mean()
+    vic_stiffness_live = _VIC_STIFFNESS_LAST[ids][valid].mean()
+    vic_damping_mean = (_VIC_DAMPING_SUM[ids] / counts_safe)[valid].mean()
+    vic_damping_live = _VIC_DAMPING_LAST[ids][valid].mean()
 
     _STRADDLE_DEBUG_STEP_COUNT[ids] = 0
     _STRADDLE_GAP_LEFT_SUM[ids] = 0.0
@@ -2853,19 +2952,22 @@ def push_gripper_debug_curriculum(
     _VIC_DAMPING_SUM[ids] = 0.0
 
     milestone_out: dict[str, float] = {}
-    _slide_milestone_debug_ensure_buffers(env)
-    m_steps = _SLIDE_MILESTONE_DEBUG_STEPS[ids].to(dtype=torch.float32).clamp(min=1.0)
-    milestone_out["travel_frac_ep_max"] = float(_SLIDE_TRAVEL_FRAC_MAX[ids].mean().item())
-    milestone_out["travel_frac_end"] = float(_SLIDE_TRAVEL_FRAC_LAST[ids].mean().item())
-    milestone_out["milestone_pose_ok_frac"] = float(
-        (_SLIDE_MILESTONE_POSE_OK_SUM[ids] / m_steps).mean().item()
-    )
-    milestone_out["milestone_bonus_ep"] = float(_SLIDE_MILESTONE_BONUS_SUM[ids].mean().item())
-    if hasattr(env, "_slide_milestone_tier_hits_ep"):
-        hits = env._slide_milestone_tier_hits_ep[ids].to(dtype=torch.float32)
-        for i in range(hits.shape[1]):
-            milestone_out[f"milestone_tier_{i}_hit_frac"] = float(hits[:, i].mean().item())
-    _slide_milestone_debug_clear(ids)
+    if _SLIDE_TRAVEL_FRAC_MAX is not None:
+        m_steps = _SLIDE_MILESTONE_DEBUG_STEPS[ids].to(dtype=torch.float32)
+        m_valid = m_steps > 0
+        if bool(m_valid.any()):
+            m_steps_safe = m_steps.clamp(min=1.0)
+            milestone_out["travel_frac_ep_max"] = float(_SLIDE_TRAVEL_FRAC_MAX[ids][m_valid].mean().item())
+            milestone_out["travel_frac_end"] = float(_SLIDE_TRAVEL_FRAC_LAST[ids][m_valid].mean().item())
+            milestone_out["milestone_pose_ok_frac"] = float(
+                (_SLIDE_MILESTONE_POSE_OK_SUM[ids][m_valid] / m_steps_safe[m_valid]).mean().item()
+            )
+            milestone_out["milestone_bonus_ep"] = float(_SLIDE_MILESTONE_BONUS_SUM[ids][m_valid].mean().item())
+            if hasattr(env, "_slide_milestone_tier_hits_ep"):
+                hits = env._slide_milestone_tier_hits_ep[ids][m_valid].to(dtype=torch.float32)
+                for i in range(hits.shape[1]):
+                    milestone_out[f"milestone_tier_{i}_hit_frac"] = float(hits[:, i].mean().item())
+        _slide_milestone_debug_clear(ids)
 
     return {
         # Short aliases (README / dashboards) plus explicit *_mean / *_live keys.
