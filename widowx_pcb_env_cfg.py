@@ -59,6 +59,7 @@ from .mdp_custom import (
     pcb_long_axis_vertical_component_exceeds,
     gripper_mid_thickness_offset_obs,
     gripper_trailing_edge_error_obs,
+    straddle_finger_target_closedness_obs,
     gripper_pinch_orientation_cos_obs,
     pcb_moving_backward_termination,
     push_gripper_debug_step,
@@ -186,7 +187,7 @@ _PCB_FRONT_EDGE_GAP_M = 0.030      # front edge (toward +Y) this far before slot
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
     _CONVEYOR_CENTER_X_ENV,
-    0.10 - _PCB_FRONT_EDGE_GAP_M,
+    0.08 - _PCB_FRONT_EDGE_GAP_M,
     _PCB_CENTER_Z_ENV,
 )
 
@@ -225,8 +226,8 @@ _ARM_EFFORT_SCALE = {
     "joint_5": 10.0,
 }
 # Task-space OSC (Push): policy [Δxyz, Δrpy, K_task, ζ_task] → 18-dim action (pose_rel + variable impedance).
-_ARM_TASK_POSITION_SCALE = 0.05
-_ARM_TASK_ORIENTATION_SCALE = 0.05
+_ARM_TASK_POSITION_SCALE = 0.15
+_ARM_TASK_ORIENTATION_SCALE = 0.15
 # Push/straddle: translate EE only — lock task-space rotation (rx, ry, rz) to stop early spin.
 _ARM_TASK_MOTION_AXES = (1, 1, 1, 0, 0, 0)
 _ARM_TASK_STIFFNESS_LIMITS = (50.0, 400.0)
@@ -254,7 +255,7 @@ _PUSH_STATES_PATH = os.path.join(ASSET_DIR, "data", "push_terminal_states.npz")
 # Slide success: leading short-edge centre at magazine back (+Y); mouth for approach shaping.
 _SLIDE_MOUTH_Y_MARGIN_M = 0.015
 _SLIDE_MOUTH_LEAD_Y_ENV = _MAG_Y_NEAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M
-_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.015
+_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.025
 # Success / milestone terminus: leading edge near magazine back wall (slide +Y direction).
 _SLIDE_SUCCESS_LEAD_Y_ENV = _MAG_Y_FAR_FACE_ENV - _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M
 _SLIDE_MOUTH_LEAD_X_ENV = _CONVEYOR_CENTER_X_ENV
@@ -590,6 +591,8 @@ def _push_debug_params(**extra) -> dict:
     base = {
         **_push_gripper_debug_params(),
         **_push_monitor_params(),
+        **_slide_success_params(),
+        "slide_success_min_episode_steps": 0,
     }
     base.update(extra)
     return base
@@ -914,6 +917,11 @@ class ObservationsCfg:
                 ),
             },
         )
+        # Trailing-edge straddle closedness [0, 1] — same σ as finger_proximity / push gate.
+        straddle_closedness = ObservationTermCfg(
+            func=straddle_finger_target_closedness_obs,
+            params=_push_finger_proximity_params(),
+        )
         # Task-space OSC: commanded stiffness K and damping ratio ζ (normalized [-1, 1] per task axis).
         vic_stiffness = ObservationTermCfg(
             func=vic_arm_stiffness_normalized_obs,
@@ -1057,7 +1065,7 @@ class RewardsPushCfg():
     finger_proximity = RewardTermCfg(
         func=straddle_finger_trailing_width_proximity,
         params=_push_finger_proximity_params(),
-        weight=150.0,
+        weight=80.0,
     )
 
 
@@ -1090,7 +1098,7 @@ class RewardsPushCfg():
     )
     push_axis_velocity = RewardTermCfg(
         func=pcb_push_axis_velocity_reward_gated,
-        params=_push_velocity_params(min_push_speed_m_s=0.001),
+        params=_push_velocity_params(min_push_speed_m_s=0.003),
         weight=400.0,
     )
     slide_travel_milestone = RewardTermCfg(
@@ -1304,4 +1312,4 @@ class WidowXPcbPushEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 4.0
+        self.episode_length_s = 10.0

@@ -221,4 +221,5 @@ __marimo__/
 
 outputs/
 logs/
+.checkpoint_cache/
 usd_models/env*

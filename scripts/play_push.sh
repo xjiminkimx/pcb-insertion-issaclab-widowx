@@ -50,6 +50,43 @@ resolve_checkpoint() {
   echo "${ckpt}"
 }
 
+patch_push_checkpoint() {
+  python - "${1}" <<'PY'
+import sys
+from agents.checkpoint_compat import ensure_push_checkpoint_compatible
+
+print(ensure_push_checkpoint_compatible(sys.argv[1]))
+PY
+}
+
+patch_checkpoint_args() {
+  local -n args_ref=$1
+  local patched=()
+  local i=0
+  while [[ $i -lt ${#args_ref[@]} ]]; do
+    local arg="${args_ref[$i]}"
+    if [[ "${arg}" == "--checkpoint" ]]; then
+      patched+=("--checkpoint")
+      ((i++)) || true
+      local raw="${args_ref[$i]:-}"
+      if [[ -z "${raw}" ]]; then
+        echo "[ERROR] --checkpoint requires a path" >&2
+        exit 1
+      fi
+      local ckpt
+      ckpt="$(patch_push_checkpoint "${raw}")"
+      if [[ "${ckpt}" != "${raw}" ]]; then
+        echo "[INFO] Patched checkpoint for 44-dim obs: ${ckpt}" >&2
+      fi
+      patched+=("${ckpt}")
+    else
+      patched+=("${arg}")
+    fi
+    ((i++)) || true
+  done
+  args_ref=("${patched[@]}")
+}
+
 cd "${WORKSPACE_DIR}"
 
 PLAY_ARGS=("$@")
@@ -67,9 +104,12 @@ fi
 
 if [[ "${has_checkpoint}" == false ]]; then
   CKPT="$(resolve_checkpoint)"
+  CKPT="$(patch_push_checkpoint "${CKPT}")"
   echo "[INFO] Checkpoint: ${CKPT}"
-  exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Push-v0 "${PLAY_ARGS[@]}" --checkpoint "${CKPT}"
+  PLAY_ARGS=(--checkpoint "${CKPT}" "${PLAY_ARGS[@]}")
 else
-  echo "[INFO] Checkpoint dir: ${CKPT_DIR}/"
-  exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Push-v0 "${PLAY_ARGS[@]}"
+  patch_checkpoint_args PLAY_ARGS
 fi
+
+echo "[INFO] Checkpoint dir: ${CKPT_DIR}/"
+exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Push-v0 "${PLAY_ARGS[@]}"

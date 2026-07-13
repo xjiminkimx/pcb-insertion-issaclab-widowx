@@ -332,7 +332,30 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
     actions directly to physical limits.  This subclass linearly maps the policy blocks
     from [-1, 1] to ``motion_stiffness_limits_task`` / ``motion_damping_ratio_limits_task``
     (same convention as :class:`JointVariableImpedanceAction`).
+
+  Optional ``motion_stiffness_limits_per_axis`` on :class:`WidowXTaskSpaceImpedanceActionCfg`
+  sets per task-axis K clamps (translation vs rotation) on the underlying OSC.
     """
+
+    cfg: "WidowXTaskSpaceImpedanceActionCfg"
+
+    def __init__(self, cfg: "WidowXTaskSpaceImpedanceActionCfg", env: ManagerBasedEnv) -> None:
+        super().__init__(cfg, env)
+        per_axis = cfg.motion_stiffness_limits_per_axis
+        if per_axis is not None:
+            if len(per_axis) != 6:
+                raise ValueError("motion_stiffness_limits_per_axis must have 6 (lo, hi) pairs.")
+            lim = self._osc._motion_p_gains_limits
+            for i, pair in enumerate(per_axis):
+                lim[:, i, 0] = float(pair[0])
+                lim[:, i, 1] = float(pair[1])
+            lo = torch.tensor([float(p[0]) for p in per_axis], device=self.device, dtype=torch.float32)
+            hi = torch.tensor([float(p[1]) for p in per_axis], device=self.device, dtype=torch.float32)
+            self._stiffness_lo_per_axis = lo
+            self._stiffness_span_per_axis = hi - lo
+        else:
+            self._stiffness_lo_per_axis = None
+            self._stiffness_span_per_axis = None
 
     def _preprocess_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
@@ -360,11 +383,15 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
             )
         if self._stiffness_idx is not None:
             stiff_a = self._raw_actions[:, self._stiffness_idx : self._stiffness_idx + 6].clamp(-1.0, 1.0)
-            k_lo, k_hi = self.cfg.controller_cfg.motion_stiffness_limits_task
-            span = float(k_hi) - float(k_lo)
-            self._processed_actions[:, self._stiffness_idx : self._stiffness_idx + 6] = (
-                float(k_lo) + 0.5 * (stiff_a + 1.0) * span
-            )
+            if self._stiffness_lo_per_axis is not None:
+                k_cmd = self._stiffness_lo_per_axis + 0.5 * (stiff_a + 1.0) * self._stiffness_span_per_axis
+                self._processed_actions[:, self._stiffness_idx : self._stiffness_idx + 6] = k_cmd
+            else:
+                k_lo, k_hi = self.cfg.controller_cfg.motion_stiffness_limits_task
+                span = float(k_hi) - float(k_lo)
+                self._processed_actions[:, self._stiffness_idx : self._stiffness_idx + 6] = (
+                    float(k_lo) + 0.5 * (stiff_a + 1.0) * span
+                )
         if self._damping_ratio_idx is not None:
             damp_a = self._raw_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6].clamp(
                 -1.0, 1.0
@@ -381,6 +408,8 @@ class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
     """Push task-space action: ``pose_rel`` (6) + task stiffness (6) + damping ratio (6) → 18 dims."""
 
     class_type: type[ActionTerm] = WidowXTaskSpaceImpedanceAction
+    motion_stiffness_limits_per_axis: Sequence[tuple[float, float]] | None = None
+    """Optional per task-axis ``(K_min, K_max)``; patches OSC clamps (e.g. softer rotation)."""
 
 
 class RelativeJointPositionActionWithPosLimits(joint_actions.RelativeJointPositionAction):
@@ -2027,6 +2056,7 @@ _STRADDLE_DEBUG_LAST_Z_STRADDLED: torch.Tensor | None = None
 _STRADDLE_Z_LEFT_SUM: torch.Tensor | None = None
 _STRADDLE_Z_RIGHT_SUM: torch.Tensor | None = None
 _STRADDLE_ACHIEVED_STEP_COUNT: torch.Tensor | None = None
+_SLIDE_SUCCESS_STEP_COUNT: torch.Tensor | None = None
 _STRADDLE_Z_LEFT_LAST: torch.Tensor | None = None
 _STRADDLE_Z_RIGHT_LAST: torch.Tensor | None = None
 _STRADDLE_GAP_LEFT_SUM: torch.Tensor | None = None
@@ -2128,7 +2158,7 @@ def _push_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
     global _STRADDLE_DEBUG_JAWS_PAST_SUM, _STRADDLE_DEBUG_BETWEEN_JAWS_SUM, _STRADDLE_DEBUG_Z_STRADDLED_SUM
     global _STRADDLE_DEBUG_LAST_GQ, _STRADDLE_DEBUG_LAST_READY
     global _STRADDLE_DEBUG_LAST_JAWS_PAST, _STRADDLE_DEBUG_LAST_BETWEEN_JAWS, _STRADDLE_DEBUG_LAST_Z_STRADDLED
-    global _STRADDLE_Z_LEFT_SUM, _STRADDLE_Z_RIGHT_SUM, _STRADDLE_ACHIEVED_STEP_COUNT
+    global _STRADDLE_Z_LEFT_SUM, _STRADDLE_Z_RIGHT_SUM, _STRADDLE_ACHIEVED_STEP_COUNT, _SLIDE_SUCCESS_STEP_COUNT
     global _STRADDLE_Z_LEFT_LAST, _STRADDLE_Z_RIGHT_LAST
     global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
     global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
@@ -2157,6 +2187,7 @@ def _push_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
         _STRADDLE_Z_LEFT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_Z_RIGHT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_ACHIEVED_STEP_COUNT = torch.zeros(n, device=env.device, dtype=torch.long)
+        _SLIDE_SUCCESS_STEP_COUNT = torch.zeros(n, device=env.device, dtype=torch.long)
         _STRADDLE_Z_LEFT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_Z_RIGHT_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_GAP_LEFT_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
@@ -2327,6 +2358,12 @@ def _push_debug_accumulate_step(
     _STRADDLE_BETWEEN_FINGERS_LAST = between_f
 
 
+def _push_debug_accumulate_slide_success(slide_success: torch.Tensor) -> None:
+    """Accumulate per-step ``slide_success`` mask for episode ``success_frac`` in TensorBoard."""
+    global _SLIDE_SUCCESS_STEP_COUNT
+    _SLIDE_SUCCESS_STEP_COUNT += slide_success.detach().to(dtype=torch.long)
+
+
 def _push_gripper_debug_accumulate_straddle_metrics(
     z_left: torch.Tensor,
     z_right: torch.Tensor,
@@ -2442,6 +2479,11 @@ def _push_gripper_debug_accumulate_all(
     proximity_std_m: float = 0.035,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.457),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.015),
+    max_gripper_gap_m: float = 0.002,
+    require_gripper_closed: bool = False,
+    slide_success_min_episode_steps: int = 0,
 ) -> dict[str, torch.Tensor]:
     """Accumulate per-step push / straddle debug scalars (TensorBoard curriculum hooks)."""
     del asset_cfg, min_straddle_quality
@@ -2540,6 +2582,20 @@ def _push_gripper_debug_accumulate_all(
     lead_vy = torch.sum(pcb.data.root_lin_vel_w * a.unsqueeze(0), dim=-1)
     _push_debug_accumulate_step(push_progress, push_gate, lead_y_env, lead_vy, between_q)
 
+    slide_ok = _slide_success_in_range(
+        env,
+        pcb_cfg,
+        half_length_m,
+        target_lead_xy_env,
+        tolerance_xy_m,
+        slide_success_min_episode_steps,
+        axis_world,
+        gripper_joint_cfg,
+        max_gripper_gap_m,
+        require_gripper_closed,
+    )
+    _push_debug_accumulate_slide_success(slide_ok)
+
     vic_term = get_joint_variable_impedance_action(env, action_name="arm_action")
     if vic_term is not None:
         _vic_impedance_debug_accumulate(
@@ -2575,6 +2631,7 @@ def _push_gripper_debug_accumulate_all(
         "lead_y_env": lead_y_env,
         "lead_vy": lead_vy,
         "achieved": achieved,
+        "slide_success": slide_ok,
     }
 
 
@@ -2602,6 +2659,11 @@ def push_gripper_debug_monitor_reward(
     proximity_std_m: float = 0.035,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.457),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.015),
+    max_gripper_gap_m: float = 0.002,
+    require_gripper_closed: bool = False,
+    slide_success_min_episode_steps: int = 0,
 ) -> torch.Tensor:
     """Near-zero reward hook so debug accumulators run during ``reward_manager.compute`` (before reset)."""
     _push_gripper_debug_accumulate_all(
@@ -2628,6 +2690,11 @@ def push_gripper_debug_monitor_reward(
         proximity_std_m=proximity_std_m,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        target_lead_xy_env=target_lead_xy_env,
+        tolerance_xy_m=tolerance_xy_m,
+        max_gripper_gap_m=max_gripper_gap_m,
+        require_gripper_closed=require_gripper_closed,
+        slide_success_min_episode_steps=slide_success_min_episode_steps,
     )
     return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
@@ -2646,10 +2713,23 @@ def push_gripper_debug_accumulate(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     proximity_std_m: float = 0.035,
-    **kwargs,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_step_m: float = 0.005,
+    max_off_axis_speed_m_s: float = 0.020,
+    min_straddle_quality: float = 0.3,
+    proximity_sigma_m: float = 0.050,
+    pcb_half_thickness_m: float = 0.00075,
+    width_sigma_m: float = 0.025,
+    min_closedness_for_push: float = 0.0,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.457),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.015),
+    max_gripper_gap_m: float = 0.002,
+    require_gripper_closed: bool = False,
+    slide_success_min_episode_steps: int = 0,
 ) -> torch.Tensor:
     """Legacy alias — prefer :func:`push_gripper_debug_monitor_reward`."""
-    del kwargs
     return push_gripper_debug_monitor_reward(
         env,
         asset_cfg,
@@ -2664,7 +2744,21 @@ def push_gripper_debug_accumulate(
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
         proximity_std_m=proximity_std_m,
-        **kwargs,
+        axis_world=axis_world,
+        max_step_m=max_step_m,
+        max_off_axis_speed_m_s=max_off_axis_speed_m_s,
+        min_straddle_quality=min_straddle_quality,
+        proximity_sigma_m=proximity_sigma_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        width_sigma_m=width_sigma_m,
+        min_closedness_for_push=min_closedness_for_push,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        target_lead_xy_env=target_lead_xy_env,
+        tolerance_xy_m=tolerance_xy_m,
+        max_gripper_gap_m=max_gripper_gap_m,
+        require_gripper_closed=require_gripper_closed,
+        slide_success_min_episode_steps=slide_success_min_episode_steps,
     )
 
 
@@ -2697,6 +2791,11 @@ def push_gripper_debug_step(
     proximity_std_m: float = 0.035,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.457),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.015),
+    max_gripper_gap_m: float = 0.002,
+    require_gripper_closed: bool = False,
+    slide_success_min_episode_steps: int = 0,
 ) -> None:
     """Optional play console print; accumulation is handled by ``push_gripper_debug_monitor_reward``."""
     del env_ids
@@ -2725,6 +2824,11 @@ def push_gripper_debug_step(
             proximity_std_m=proximity_std_m,
             width_gap_target_left_m=width_gap_target_left_m,
             width_gap_target_right_m=width_gap_target_right_m,
+            target_lead_xy_env=target_lead_xy_env,
+            tolerance_xy_m=tolerance_xy_m,
+            max_gripper_gap_m=max_gripper_gap_m,
+            require_gripper_closed=require_gripper_closed,
+            slide_success_min_episode_steps=slide_success_min_episode_steps,
         )
     else:
         gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
@@ -2851,6 +2955,11 @@ def push_gripper_debug_curriculum(
     proximity_std_m: float = 0.035,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    target_lead_xy_env: tuple[float, float] = (0.056, 0.457),
+    tolerance_xy_m: tuple[float, float] = (0.003, 0.015),
+    max_gripper_gap_m: float = 0.002,
+    require_gripper_closed: bool = False,
+    slide_success_min_episode_steps: int = 0,
 ) -> dict[str, float]:
     """Log episode closedness / gap / push means to TensorBoard via ``Curriculum/push_gripper_debug/*``."""
     del (
@@ -2876,8 +2985,13 @@ def push_gripper_debug_curriculum(
         width_gap_target_left_m,
         width_gap_target_right_m,
         proximity_std_m,
+        target_lead_xy_env,
+        tolerance_xy_m,
+        max_gripper_gap_m,
+        require_gripper_closed,
+        slide_success_min_episode_steps,
     )
-    global _STRADDLE_DEBUG_STEP_COUNT, _STRADDLE_ACHIEVED_STEP_COUNT
+    global _STRADDLE_DEBUG_STEP_COUNT, _STRADDLE_ACHIEVED_STEP_COUNT, _SLIDE_SUCCESS_STEP_COUNT
     global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
     global _STRADDLE_GAP_LEFT_LAST, _STRADDLE_GAP_RIGHT_LAST
     global _STRADDLE_CLOSEDNESS_SUM, _STRADDLE_CLOSEDNESS_LAST
@@ -2918,7 +3032,10 @@ def push_gripper_debug_curriculum(
     dist_r_mm_mean = (_STRADDLE_DIST_R_SUM[ids] / counts_safe)[valid].mean() * 1000.0
     dist_l_mm_live = _STRADDLE_DIST_L_LAST[ids][valid].mean() * 1000.0
     dist_r_mm_live = _STRADDLE_DIST_R_LAST[ids][valid].mean() * 1000.0
-    success_frac = (_STRADDLE_ACHIEVED_STEP_COUNT[ids].to(dtype=torch.float32) / counts_safe)[valid].mean()
+    straddle_achieved_frac = (_STRADDLE_ACHIEVED_STEP_COUNT[ids].to(dtype=torch.float32) / counts_safe)[
+        valid
+    ].mean()
+    success_frac = (_SLIDE_SUCCESS_STEP_COUNT[ids].to(dtype=torch.float32) / counts_safe)[valid].mean()
     push_progress_mean = (_STRADDLE_PUSH_PROGRESS_SUM[ids] / counts_safe)[valid].mean()
     push_progress_live = _STRADDLE_PUSH_PROGRESS_LAST[ids][valid].mean()
     push_gate_open_frac = (_STRADDLE_PUSH_GATE_OPEN_SUM[ids] / counts_safe)[valid].mean()
@@ -2943,6 +3060,7 @@ def push_gripper_debug_curriculum(
     _STRADDLE_DIST_L_SUM[ids] = 0.0
     _STRADDLE_DIST_R_SUM[ids] = 0.0
     _STRADDLE_ACHIEVED_STEP_COUNT[ids] = 0
+    _SLIDE_SUCCESS_STEP_COUNT[ids] = 0
     _STRADDLE_PUSH_PROGRESS_SUM[ids] = 0.0
     _STRADDLE_PUSH_GATE_OPEN_SUM[ids] = 0.0
     _STRADDLE_LEAD_Y_SUM[ids] = 0.0
@@ -2986,6 +3104,7 @@ def push_gripper_debug_curriculum(
         "dist_l_mm_live": float(dist_l_mm_live.item()),
         "dist_r_mm_live": float(dist_r_mm_live.item()),
         "success_frac": float(success_frac.item()),
+        "straddle_achieved_frac": float(straddle_achieved_frac.item()),
         "gap_left_m_mean": float(gap_left_mean.item()),
         "gap_right_m_mean": float(gap_right_mean.item()),
         "gap_left_m_live": float(gap_left_live.item()),
@@ -4410,6 +4529,42 @@ def gripper_opening_normalized(
     q = robot.data.joint_pos[:, asset_cfg.joint_ids[0]]
     eff = gripper_joint_sign * q
     return torch.clamp(eff / open_width_m, 0.0, 1.0).unsqueeze(-1)
+
+
+def straddle_finger_target_closedness_obs(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """Policy obs: trailing-edge finger-target closedness in ``[0, 1]`` (shape ``[N, 1]``).
+
+    Same index as ``finger_proximity`` reward and push-gate closedness (``min(q_left, q_right)``).
+    On hardware, swap this term for a vision-derived estimate of the same scalar.
+    """
+    closedness = straddle_finger_target_closedness(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    return closedness.unsqueeze(-1)
 
 
 def pcb_lin_vel_y_toward_lead_target_y(
