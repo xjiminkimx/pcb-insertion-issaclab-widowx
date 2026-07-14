@@ -1,6 +1,6 @@
-"""Checkpoint compatibility helpers for WidowX PCB push policy play.
+"""Checkpoint compatibility helpers for WidowX PCB approach policy play.
 
-Legacy push checkpoints were trained with 43-dim policy observations.  The
+Legacy approach checkpoints were trained with 43-dim policy observations.  The
 ``straddle_closedness`` term (1 dim) was inserted after ``trailing_edge_error``
 (at flat index 27), giving 44 dims today.
 """
@@ -13,11 +13,11 @@ from typing import Any
 
 import torch
 
-# Policy observation flat layout (Push, Isaac-WidowX-PCB-Push-v0).
-PUSH_POLICY_OBS_DIM_CURRENT = 44
-PUSH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS = 43
+# Policy observation flat layout (Approach, Isaac-WidowX-PCB-Approach-v0).
+APPROACH_POLICY_OBS_DIM_CURRENT = 44
+APPROACH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS = 43
 # Sum of obs term dims before ``straddle_closedness`` in ObservationsCfg.policy.
-PUSH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX = 27
+APPROACH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX = 27
 
 _RMS_MEAN_KEY = "running_mean_std.running_mean"
 _RMS_VAR_KEY = "running_mean_std.running_var"
@@ -57,11 +57,11 @@ def _insert_obs_dim_actor_in(
     return torch.cat([weight[:, :insert_at], zero_col, weight[:, insert_at:]], dim=1)
 
 
-def expand_push_checkpoint_obs_dim(
+def expand_approach_checkpoint_obs_dim(
     checkpoint: dict[str, Any],
     *,
-    target_dim: int = PUSH_POLICY_OBS_DIM_CURRENT,
-    insert_at: int = PUSH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX,
+    target_dim: int = APPROACH_POLICY_OBS_DIM_CURRENT,
+    insert_at: int = APPROACH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX,
     new_obs_mean: float = 0.0,
     new_obs_var: float = 1.0,
 ) -> dict[str, Any]:
@@ -98,11 +98,11 @@ def _cache_path(source_path: str, target_dim: int, insert_at: int) -> str:
     return os.path.join(_CACHE_DIR, f"{base}_obs{target_dim}_{digest}.pth")
 
 
-def ensure_push_checkpoint_compatible(
+def ensure_approach_checkpoint_compatible(
     checkpoint_path: str,
     *,
-    target_dim: int = PUSH_POLICY_OBS_DIM_CURRENT,
-    insert_at: int = PUSH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX,
+    target_dim: int = APPROACH_POLICY_OBS_DIM_CURRENT,
+    insert_at: int = APPROACH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX,
 ) -> str:
     """Return ``checkpoint_path`` or a cached patched copy loadable by the current env."""
     checkpoint_path = os.path.abspath(checkpoint_path)
@@ -114,9 +114,9 @@ def ensure_push_checkpoint_compatible(
         return checkpoint_path
     if src_dim == target_dim:
         return checkpoint_path
-    if src_dim != PUSH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS:
+    if src_dim != APPROACH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS:
         raise ValueError(
-            f"Checkpoint obs dim {src_dim} is not compatible with current push env ({target_dim}). "
+            f"Checkpoint obs dim {src_dim} is not compatible with current approach env ({target_dim}). "
             "Only 43 -> 44 (straddle_closedness insert) is supported."
         )
 
@@ -126,10 +126,18 @@ def ensure_push_checkpoint_compatible(
         return cached
 
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-    patched = expand_push_checkpoint_obs_dim(
+    patched = expand_approach_checkpoint_obs_dim(
         ckpt,
         target_dim=target_dim,
         insert_at=insert_at,
     )
     torch.save(patched, cached)
     return cached
+
+
+# Deprecated aliases (pre-approach rename).
+PUSH_POLICY_OBS_DIM_CURRENT = APPROACH_POLICY_OBS_DIM_CURRENT
+PUSH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS = APPROACH_POLICY_OBS_DIM_BEFORE_STRADDLE_CLOSEDNESS
+PUSH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX = APPROACH_OBS_INSERT_STRADDLE_CLOSEDNESS_IDX
+expand_push_checkpoint_obs_dim = expand_approach_checkpoint_obs_dim
+ensure_push_checkpoint_compatible = ensure_approach_checkpoint_compatible

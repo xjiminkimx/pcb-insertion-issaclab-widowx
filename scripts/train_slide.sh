@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Train Slide phase (policy chaining from Push).
+# Train Slide phase (policy chaining from Approach).
 # Prerequisites:
-#   1. Train Push: bash scripts/train_push.sh --num_envs 2048 --headless
-#   2. Collect push terminal states (see scripts/collect_grasp_states.py)
+#   1. Train Approach: bash scripts/train_approach.sh --num_envs 2048 --headless
+#   2. Collect approach terminal states: bash scripts/collect_approach_states.sh
 #   3. Run this script
 #
 # Max epochs: agents/rl_games_ppo_cfg.py → WidowXPcbSlidePPOCfg max_epochs
@@ -52,20 +52,24 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
   exit 1
 fi
 
-PUSH_STATES="${WORKSPACE_DIR}/data/push_terminal_states.npz"
+APPROACH_STATES="${WORKSPACE_DIR}/data/approach_terminal_states.npz"
+LEGACY_PUSH_STATES="${WORKSPACE_DIR}/data/push_terminal_states.npz"
 LEGACY_STRADDLE_STATES="${WORKSPACE_DIR}/data/straddle_terminal_states.npz"
 LEGACY_GRASP_STATES="${WORKSPACE_DIR}/data/grasp_terminal_states.npz"
-if [[ -f "${PUSH_STATES}" ]]; then
-  STATES_PATH="${PUSH_STATES}"
+if [[ -f "${APPROACH_STATES}" ]]; then
+  STATES_PATH="${APPROACH_STATES}"
+elif [[ -f "${LEGACY_PUSH_STATES}" ]]; then
+  echo "[WARN] Using legacy buffer: ${LEGACY_PUSH_STATES} (re-collect with collect_approach_states.py)" >&2
+  STATES_PATH="${LEGACY_PUSH_STATES}"
 elif [[ -f "${LEGACY_STRADDLE_STATES}" ]]; then
-  echo "[WARN] Using legacy buffer: ${LEGACY_STRADDLE_STATES} (re-collect with collect_push_states.py)" >&2
+  echo "[WARN] Using legacy buffer: ${LEGACY_STRADDLE_STATES} (re-collect with collect_approach_states.py)" >&2
   STATES_PATH="${LEGACY_STRADDLE_STATES}"
 elif [[ -f "${LEGACY_GRASP_STATES}" ]]; then
-  echo "[WARN] Using legacy buffer: ${LEGACY_GRASP_STATES} (re-collect with collect_grasp_states.py)" >&2
+  echo "[WARN] Using legacy buffer: ${LEGACY_GRASP_STATES}" >&2
   STATES_PATH="${LEGACY_GRASP_STATES}"
 else
-  echo "[ERROR] Push terminal-state buffer not found: ${PUSH_STATES}" >&2
-  echo "        Run: python scripts/collect_push_states.py --checkpoint <push.pth>" >&2
+  echo "[ERROR] Approach terminal-state buffer not found: ${APPROACH_STATES}" >&2
+  echo "        Run: python scripts/collect_approach_states.py --checkpoint <approach.pth>" >&2
   exit 1
 fi
 
@@ -80,7 +84,7 @@ else
 fi
 
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_slide/"
-echo "[INFO] Push states: ${STATES_PATH}"
+echo "[INFO] Approach states: ${STATES_PATH}"
 echo "[INFO] Python:         ${PYTHON}"
 
 "${PYTHON}" "${TRAIN_PY}" \

@@ -11,29 +11,38 @@ _COMMON_KWARGS = {
 }
 
 gym.register(
-    id="Isaac-WidowX-PCB-Push-v0",
+    id="Isaac-WidowX-PCB-Approach-v0",
     entry_point=_COMMON_KWARGS["entry_point"],
     kwargs={
-        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbPushEnvCfg,
-        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbPushPPOCfg",
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbApproachEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbApproachPPOCfg",
     },
 )
 
-# Deprecated alias — use Isaac-WidowX-PCB-Push-v0.
+# Deprecated aliases — use Isaac-WidowX-PCB-Approach-v0.
+gym.register(
+    id="Isaac-WidowX-PCB-Push-v0",
+    entry_point=_COMMON_KWARGS["entry_point"],
+    kwargs={
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbApproachEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbApproachPPOCfg",
+    },
+)
+
 gym.register(
     id="Isaac-WidowX-PCB-Straddle-v0",
     entry_point=_COMMON_KWARGS["entry_point"],
     kwargs={
-        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbPushEnvCfg,
-        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbPushPPOCfg",
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbApproachEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbApproachPPOCfg",
     },
 )
 
-# gym.register(
-#     id="Isaac-WidowX-PCB-Slide-v0",
-#     entry_point=_COMMON_KWARGS["entry_point"],
-#     kwargs={
-#         "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbSlideEnvCfg,
-#         "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbSlidePPOCfg",
-#     },
-# )
+gym.register(
+    id="Isaac-WidowX-PCB-Slide-v0",
+    entry_point=_COMMON_KWARGS["entry_point"],
+    kwargs={
+        "env_cfg_entry_point": widowx_pcb_env_cfg.WidowXPcbSlideEnvCfg,
+        "rl_games_cfg_entry_point": f"{__name__}.agents.rl_games_ppo_cfg:WidowXPcbSlidePPOCfg",
+    },
+)

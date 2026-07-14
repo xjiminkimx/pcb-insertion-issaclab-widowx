@@ -2,7 +2,7 @@
 
 Observation helpers, push/slide shaping, regularization, rail reset, and drop detection.
 
-Push and slide are separate registered envs; each uses its own reward config with no in-episode phase gating.
+Approach and slide are separate registered envs; each uses its own reward config with no in-episode phase gating.
 """
 
 from __future__ import annotations
@@ -356,6 +356,128 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         else:
             self._stiffness_lo_per_axis = None
             self._stiffness_span_per_axis = None
+        self._task_push_axis_w: torch.Tensor | None = None
+        self._task_lateral_axis_w: torch.Tensor | None = None
+        self._task_vertical_axis_w: torch.Tensor | None = None
+        if getattr(cfg, "task_position_box_enabled", False):
+            self._task_push_axis_w = self._unit_axis_tensor(cfg.push_axis_world, self.device)
+            self._task_lateral_axis_w = self._unit_axis_tensor(cfg.lateral_axis_world, self.device)
+            self._task_vertical_axis_w = self._unit_axis_tensor(cfg.vertical_axis_world, self.device)
+
+    @staticmethod
+    def _unit_axis_tensor(axis: Sequence[float], device: torch.device | None = None) -> torch.Tensor:
+        a = torch.tensor(axis, dtype=torch.float32, device=device)
+        return a / torch.norm(a).clamp_min(1e-9)
+
+    def _clamp_pose_rel_to_reset_position_box(self) -> None:
+        """Clamp cumulative EE translation: lateral ±range, push long travel, vertical ±range."""
+        if self._pose_rel_idx is None or self._task_push_axis_w is None:
+            return
+        env = self._env
+        if not hasattr(env, "_slide_reset_ee_pos_w"):
+            return
+
+        self._compute_ee_pose()
+        p0_w = env._slide_reset_ee_pos_w
+        p_cur_w = self._ee_pose_w[:, :3]
+        idx = self._pose_rel_idx
+        delta_b = self._processed_actions[:, idx : idx + 3]
+        base_quat = self._asset.data.root_quat_w
+        delta_w = math_utils.quat_apply(base_quat, delta_b)
+
+        offset_w = p_cur_w + delta_w - p0_w
+        push = self._task_push_axis_w.unsqueeze(0)
+        lat = self._task_lateral_axis_w.unsqueeze(0)
+        vert = self._task_vertical_axis_w.unsqueeze(0)
+
+        s_push = torch.sum(offset_w * push, dim=-1, keepdim=True)
+        s_lat = torch.sum(offset_w * lat, dim=-1, keepdim=True)
+        s_vert = torch.sum(offset_w * vert, dim=-1, keepdim=True)
+
+        lat_lim = float(self.cfg.lateral_half_range_m)
+        vert_lim = float(self.cfg.vertical_half_range_m)
+        s_push = s_push.clamp(float(self.cfg.push_offset_min_m), float(self.cfg.push_offset_max_m))
+        s_lat = s_lat.clamp(-lat_lim, lat_lim)
+        s_vert = s_vert.clamp(-vert_lim, vert_lim)
+
+        offset_c = s_push * push + s_lat * lat + s_vert * vert
+        p_des_w = p0_w + offset_c
+        delta_w_new = p_des_w - p_cur_w
+        delta_b_new = math_utils.quat_apply(math_utils.quat_inv(base_quat), delta_w_new)
+        self._processed_actions[:, idx : idx + 3] = delta_b_new
+
+    def _arm_joint_reference(self) -> torch.Tensor | None:
+        """Buffer straddle joint targets stored at slide reset (``_slide_reset_joint_pos``)."""
+        env = self._env
+        if not hasattr(env, "_slide_reset_joint_pos"):
+            return None
+        ref_all = env._slide_reset_joint_pos
+        if isinstance(self._joint_ids, slice):
+            return ref_all[:, : self._num_DoF]
+        return ref_all[:, self._joint_ids]
+
+    def _map_stiffness_action(self, stiff_a: torch.Tensor) -> torch.Tensor:
+        floor = float(getattr(self.cfg, "stiffness_action_floor", 0.0) or 0.0)
+        if floor > 0.0:
+            stiff_a = floor + (1.0 - floor) * 0.5 * (stiff_a + 1.0)
+        return stiff_a
+
+    def _map_damping_action(self, damp_a: torch.Tensor) -> torch.Tensor:
+        floor = float(getattr(self.cfg, "damping_action_floor", 0.0) or 0.0)
+        if floor > 0.0:
+            damp_a = floor + (1.0 - floor) * 0.5 * (damp_a + 1.0)
+        return damp_a
+
+    def _joint_posture_hold_torques(self) -> torch.Tensor | None:
+        """Additive joint PD toward buffer straddle q (6-DoF arm — OSC nullspace unavailable)."""
+        if not getattr(self.cfg, "use_buffer_joint_posture_hold", False):
+            return None
+        q_ref = self._arm_joint_reference()
+        if q_ref is None:
+            return None
+        kp = float(self.cfg.joint_posture_hold_stiffness)
+        kd = float(self.cfg.joint_posture_hold_damping)
+        return kp * (q_ref - self._joint_pos) - kd * self._joint_vel
+
+    def _nullspace_joint_target(self) -> torch.Tensor | None:
+        """Per-env nullspace joint target (requires >6 arm joints in Isaac Lab OSC)."""
+        if getattr(self.cfg, "use_buffer_nullspace_target", False):
+            q_ref = self._arm_joint_reference()
+            if q_ref is not None:
+                return q_ref
+        return self._nullspace_joint_pos_target
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        super().process_actions(actions)
+
+    def apply_actions(self) -> None:
+        """OSC torques; optional additive joint PD holds buffer straddle joints on 6-DoF arms."""
+        self._compute_dynamic_quantities()
+        self._compute_ee_jacobian()
+        self._compute_ee_pose()
+        self._compute_ee_velocity()
+        self._compute_ee_force()
+        self._compute_joint_states()
+
+        ns_target = None
+        if self.cfg.controller_cfg.nullspace_control != "none":
+            ns_target = self._nullspace_joint_target()
+
+        self._joint_efforts[:] = self._osc.compute(
+            jacobian_b=self._jacobian_b,
+            current_ee_pose_b=self._ee_pose_b,
+            current_ee_vel_b=self._ee_vel_b,
+            current_ee_force_b=self._ee_force_b,
+            mass_matrix=self._mass_matrix,
+            gravity=self._gravity,
+            current_joint_pos=self._joint_pos,
+            current_joint_vel=self._joint_vel,
+            nullspace_joint_pos_target=ns_target,
+        )
+        tau_hold = self._joint_posture_hold_torques()
+        if tau_hold is not None:
+            self._joint_efforts[:] = self._joint_efforts + tau_hold
+        self._asset.set_joint_effort_target(self._joint_efforts, joint_ids=self._joint_ids)
 
     def _preprocess_actions(self, actions: torch.Tensor) -> None:
         self._raw_actions[:] = actions
@@ -382,7 +504,9 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
                 * self._wrench_scale
             )
         if self._stiffness_idx is not None:
-            stiff_a = self._raw_actions[:, self._stiffness_idx : self._stiffness_idx + 6].clamp(-1.0, 1.0)
+            stiff_a = self._map_stiffness_action(
+                self._raw_actions[:, self._stiffness_idx : self._stiffness_idx + 6].clamp(-1.0, 1.0)
+            )
             if self._stiffness_lo_per_axis is not None:
                 k_cmd = self._stiffness_lo_per_axis + 0.5 * (stiff_a + 1.0) * self._stiffness_span_per_axis
                 self._processed_actions[:, self._stiffness_idx : self._stiffness_idx + 6] = k_cmd
@@ -393,23 +517,59 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
                     float(k_lo) + 0.5 * (stiff_a + 1.0) * span
                 )
         if self._damping_ratio_idx is not None:
-            damp_a = self._raw_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6].clamp(
-                -1.0, 1.0
+            damp_a = self._map_damping_action(
+                self._raw_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6].clamp(-1.0, 1.0)
             )
             d_lo, d_hi = self.cfg.controller_cfg.motion_damping_ratio_limits_task
             span = float(d_hi) - float(d_lo)
             self._processed_actions[:, self._damping_ratio_idx : self._damping_ratio_idx + 6] = (
                 float(d_lo) + 0.5 * (damp_a + 1.0) * span
             )
+        if getattr(self.cfg, "task_position_box_enabled", False):
+            self._clamp_pose_rel_to_reset_position_box()
 
 
 @configclass
 class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
-    """Push task-space action: ``pose_rel`` (6) + task stiffness (6) + damping ratio (6) → 18 dims."""
+    """Approach task-space action: ``pose_rel`` (6) + task stiffness (6) + damping ratio (6) → 18 dims."""
 
     class_type: type[ActionTerm] = WidowXTaskSpaceImpedanceAction
     motion_stiffness_limits_per_axis: Sequence[tuple[float, float]] | None = None
     """Optional per task-axis ``(K_min, K_max)``; patches OSC clamps (e.g. softer rotation)."""
+    warmup_hold_steps: int = 0
+    use_buffer_nullspace_target: bool = False
+    """OSC nullspace target from buffer (requires >6 controlled joints — not WidowX arm)."""
+    use_buffer_joint_posture_hold: bool = False
+    """Additive joint PD toward ``_slide_reset_joint_pos`` (slide straddle hold on 6-DoF arm)."""
+    joint_posture_hold_stiffness: float = 120.0
+    joint_posture_hold_damping: float = 8.0
+    stiffness_action_floor: float = 0.0
+    """Remap policy K block from [-1,1] to [floor,1] before physical limits."""
+    damping_action_floor: float = 0.0
+    task_position_box_enabled: bool = False
+    """Clamp cumulative EE offset from ``_slide_reset_ee_pos_w`` (world frame)."""
+    push_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    lateral_axis_world: tuple[float, float, float] = (1.0, 0.0, 0.0)
+    vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
+    lateral_half_range_m: float = 0.01
+    vertical_half_range_m: float = 0.01
+    push_offset_min_m: float = -0.05
+    push_offset_max_m: float = 0.60
+
+
+def store_slide_reset_ee_pose_w(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    action_name: str = "arm_action",
+) -> None:
+    """Record OSC EE world position at slide reset for cumulative translation box."""
+    term = get_task_space_impedance_action(env, action_name)
+    if term is None:
+        return
+    term._compute_ee_pose()
+    if not hasattr(env, "_slide_reset_ee_pos_w"):
+        env._slide_reset_ee_pos_w = torch.zeros(env.num_envs, 3, device=env.device, dtype=torch.float32)
+    env._slide_reset_ee_pos_w[env_ids] = term._ee_pose_w[env_ids, :3].clone()
 
 
 class RelativeJointPositionActionWithPosLimits(joint_actions.RelativeJointPositionAction):
@@ -1640,7 +1800,7 @@ def straddle_asymmetric_achieved(
     width_sigma_m: float | None = None,
     jaw_thick_gate_std_m: float | None = None,
 ) -> torch.Tensor:
-    """Backward-compatible alias for :func:`straddle_finger_target_success`."""
+    """Backward-compatible alias for :func:`approach_finger_target_success`."""
     sig = float(
         std
         if std is not None
@@ -1665,7 +1825,7 @@ def straddle_asymmetric_achieved(
         width_sigma_m,
         jaw_thick_gate_std_m,
     )
-    return straddle_finger_target_success(
+    return approach_finger_target_success(
         env,
         sig,
         pcb_cfg,
@@ -1680,7 +1840,7 @@ def straddle_asymmetric_achieved(
     )
 
 
-def straddle_success_bonus_reward(
+def approach_success_bonus_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
     left_finger_cfg: SceneEntityCfg,
@@ -1692,7 +1852,9 @@ def straddle_success_bonus_reward(
     closedness_threshold: float = 0.5,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
-    state_attr: str = "_straddle_success_bonus_paid",
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    state_attr: str = "_approach_success_bonus_paid",
 ) -> torch.Tensor:
     """One-shot bonus (1.0) the first time finger-target closedness crosses ``closedness_threshold``."""
     if not hasattr(env, state_attr):
@@ -1704,7 +1866,7 @@ def straddle_success_bonus_reward(
 
     paid[env.episode_length_buf == 1] = False
 
-    achieved = straddle_finger_target_success(
+    achieved = approach_finger_target_success(
         env,
         std,
         pcb_cfg,
@@ -1716,6 +1878,8 @@ def straddle_success_bonus_reward(
         closedness_threshold=closedness_threshold,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
     )
     newly = achieved & (~paid)
     paid[:] = paid | achieved
@@ -2153,7 +2317,7 @@ def _vic_impedance_debug_accumulate(
     _VIC_DAMPING_LAST = z_f
 
 
-def _push_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
+def _approach_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
     global _STRADDLE_DEBUG_JOINT_SUM, _STRADDLE_DEBUG_READY_SUM, _STRADDLE_DEBUG_STEP_COUNT
     global _STRADDLE_DEBUG_JAWS_PAST_SUM, _STRADDLE_DEBUG_BETWEEN_JAWS_SUM, _STRADDLE_DEBUG_Z_STRADDLED_SUM
     global _STRADDLE_DEBUG_LAST_GQ, _STRADDLE_DEBUG_LAST_READY
@@ -2286,7 +2450,7 @@ def _read_straddle_z_debug_sample(*args, **kwargs) -> tuple[torch.Tensor, torch.
     return z_left, z_right, achieved
 
 
-def _push_gripper_debug_accumulate_step(
+def _approach_gripper_debug_accumulate_step(
     gap_left: torch.Tensor,
     gap_right: torch.Tensor,
     achieved: torch.Tensor,
@@ -2364,7 +2528,7 @@ def _push_debug_accumulate_slide_success(slide_success: torch.Tensor) -> None:
     _SLIDE_SUCCESS_STEP_COUNT += slide_success.detach().to(dtype=torch.long)
 
 
-def _push_gripper_debug_accumulate_straddle_metrics(
+def _approach_gripper_debug_accumulate_straddle_metrics(
     z_left: torch.Tensor,
     z_right: torch.Tensor,
     gap_left: torch.Tensor,
@@ -2392,14 +2556,14 @@ def _push_gripper_debug_accumulate_straddle_metrics(
     _STRADDLE_GAP_RIGHT_LAST = torch.where(mask, gap_right_f, _STRADDLE_GAP_RIGHT_LAST)
 
 
-def _push_gripper_debug_accumulate_straddle_z(
+def _approach_gripper_debug_accumulate_straddle_z(
     z_left: torch.Tensor,
     z_right: torch.Tensor,
     achieved: torch.Tensor,
 ) -> None:
     """Deprecated alias — gaps omitted."""
     zeros = torch.zeros_like(z_left)
-    _push_gripper_debug_accumulate_straddle_metrics(z_left, z_right, zeros, zeros, achieved)
+    _approach_gripper_debug_accumulate_straddle_metrics(z_left, z_right, zeros, zeros, achieved)
 
 
 def _read_straddle_gripper_debug_state(
@@ -2434,7 +2598,7 @@ def _read_straddle_gripper_debug_state(
     return gq, ready, parts
 
 
-def _push_gripper_debug_accumulate_tensors(
+def _approach_gripper_debug_accumulate_tensors(
     gq: torch.Tensor, ready: torch.Tensor, parts: dict[str, torch.Tensor]
 ) -> None:
     """Add one control-step sample to per-env episode accumulators."""
@@ -2455,7 +2619,7 @@ def _push_gripper_debug_accumulate_tensors(
     _STRADDLE_DEBUG_LAST_Z_STRADDLED = parts["z_straddled"].detach().bool()
 
 
-def _push_gripper_debug_accumulate_all(
+def _approach_gripper_debug_accumulate_all(
     env: ManagerBasedEnv,
     asset_cfg: SceneEntityCfg,
     pcb_cfg: SceneEntityCfg,
@@ -2487,7 +2651,7 @@ def _push_gripper_debug_accumulate_all(
 ) -> dict[str, torch.Tensor]:
     """Accumulate per-step push / straddle debug scalars (TensorBoard curriculum hooks)."""
     del asset_cfg, min_straddle_quality
-    _push_gripper_debug_ensure_buffers(env)
+    _approach_gripper_debug_ensure_buffers(env)
     gap_left, gap_right = _trailing_edge_jaw_opening_gaps(
         env,
         pcb_cfg,
@@ -2540,7 +2704,7 @@ def _push_gripper_debug_accumulate_all(
         width_gap_target_right_m=width_gap_target_right_m,
     )
     achieved = closedness_prox >= float(closedness_threshold)
-    _push_gripper_debug_accumulate_step(
+    _approach_gripper_debug_accumulate_step(
         gap_left,
         gap_right,
         achieved,
@@ -2635,7 +2799,7 @@ def _push_gripper_debug_accumulate_all(
     }
 
 
-def push_gripper_debug_monitor_reward(
+def approach_gripper_debug_monitor_reward(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     pcb_cfg: SceneEntityCfg,
@@ -2666,7 +2830,7 @@ def push_gripper_debug_monitor_reward(
     slide_success_min_episode_steps: int = 0,
 ) -> torch.Tensor:
     """Near-zero reward hook so debug accumulators run during ``reward_manager.compute`` (before reset)."""
-    _push_gripper_debug_accumulate_all(
+    _approach_gripper_debug_accumulate_all(
         env,
         asset_cfg,
         pcb_cfg,
@@ -2699,7 +2863,7 @@ def push_gripper_debug_monitor_reward(
     return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
 
 
-def push_gripper_debug_accumulate(
+def approach_gripper_debug_accumulate(
     env: ManagerBasedRLEnv,
     asset_cfg: SceneEntityCfg,
     pcb_cfg: SceneEntityCfg,
@@ -2729,8 +2893,8 @@ def push_gripper_debug_accumulate(
     require_gripper_closed: bool = False,
     slide_success_min_episode_steps: int = 0,
 ) -> torch.Tensor:
-    """Legacy alias — prefer :func:`push_gripper_debug_monitor_reward`."""
-    return push_gripper_debug_monitor_reward(
+    """Legacy alias — prefer :func:`approach_gripper_debug_monitor_reward`."""
+    return approach_gripper_debug_monitor_reward(
         env,
         asset_cfg,
         pcb_cfg,
@@ -2762,7 +2926,7 @@ def push_gripper_debug_accumulate(
     )
 
 
-def push_gripper_debug_step(
+def approach_gripper_debug_step(
     env: ManagerBasedEnv,
     env_ids: Sequence[int] | None,
     asset_cfg: SceneEntityCfg,
@@ -2797,10 +2961,10 @@ def push_gripper_debug_step(
     require_gripper_closed: bool = False,
     slide_success_min_episode_steps: int = 0,
 ) -> None:
-    """Optional play console print; accumulation is handled by ``push_gripper_debug_monitor_reward``."""
+    """Optional play console print; accumulation is handled by ``approach_gripper_debug_monitor_reward``."""
     del env_ids
     if accumulate:
-        metrics = _push_gripper_debug_accumulate_all(
+        metrics = _approach_gripper_debug_accumulate_all(
             env,
             asset_cfg,
             pcb_cfg,
@@ -2930,7 +3094,7 @@ def push_gripper_debug_step(
     )
 
 
-def push_gripper_debug_curriculum(
+def approach_gripper_debug_curriculum(
     env: ManagerBasedRLEnv,
     env_ids: Sequence[int],
     asset_cfg: SceneEntityCfg,
@@ -2961,7 +3125,7 @@ def push_gripper_debug_curriculum(
     require_gripper_closed: bool = False,
     slide_success_min_episode_steps: int = 0,
 ) -> dict[str, float]:
-    """Log episode closedness / gap / push means to TensorBoard via ``Curriculum/push_gripper_debug/*``."""
+    """Log episode closedness / gap / push means to TensorBoard via ``Curriculum/approach_gripper_debug/*``."""
     del (
         asset_cfg,
         pcb_cfg,
@@ -3004,7 +3168,7 @@ def push_gripper_debug_curriculum(
     global _STRADDLE_BETWEEN_FINGERS_SUM, _STRADDLE_BETWEEN_FINGERS_LAST
     global _VIC_STIFFNESS_SUM, _VIC_STIFFNESS_LAST, _VIC_DAMPING_SUM, _VIC_DAMPING_LAST
     if _STRADDLE_DEBUG_STEP_COUNT is None:
-        _push_gripper_debug_ensure_buffers(env)
+        _approach_gripper_debug_ensure_buffers(env)
     if isinstance(env_ids, slice):
         ids = torch.arange(env.num_envs, device=env.device, dtype=torch.long)
     elif not isinstance(env_ids, torch.Tensor):
@@ -3788,7 +3952,7 @@ def straddle_trailing_face_bounded_approach_reward(
     return rew
 
 
-def straddle_finger_target_success(
+def approach_finger_target_success(
     env: ManagerBasedRLEnv,
     std: float,
     pcb_cfg: SceneEntityCfg,
@@ -3800,6 +3964,8 @@ def straddle_finger_target_success(
     closedness_threshold: float = 0.5,
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
 ) -> torch.Tensor:
     """Episode success when :func:`straddle_finger_target_closedness` ≥ ``closedness_threshold``."""
     closedness = straddle_finger_target_closedness(
@@ -3813,6 +3979,8 @@ def straddle_finger_target_success(
         finger_offset_m=finger_offset_m,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
     )
     return closedness >= float(closedness_threshold)
 
@@ -6124,21 +6292,7 @@ _STRADDLE_STATE_BUFFER: dict | None = None
 _STRADDLE_BUFFER_PATH: str | None = None
 
 
-def _buffer_gripper_closed_mask(buf: dict, max_gripper_gap_m: float) -> torch.Tensor | None:
-    """True for buffer rows whose saved carriage joint indicates a closed pinch."""
-    names = buf["joint_names"]
-    if "left_carriage_joint" not in names:
-        return None
-    col = list(names).index("left_carriage_joint")
-    return buf["joint_pos"][:, col] < float(max_gripper_gap_m)
-
-
-def _compose_buffer_row_mask(buf: dict, path: str, max_gripper_gap_m: float = 0.001) -> torch.Tensor | None:
-    """Row mask for buffer sampling: closed gripper (insert can push without straddle)."""
-    return _buffer_gripper_closed_mask(buf, max_gripper_gap_m)
-
-
-def _load_straddle_state_buffer(path: str, max_gripper_gap_m: float = 0.001) -> dict:
+def _load_straddle_state_buffer(path: str) -> dict:
     """Load (or re-use cached) straddle terminal state .npz file."""
     global _STRADDLE_STATE_BUFFER, _STRADDLE_BUFFER_PATH
     if _STRADDLE_STATE_BUFFER is not None and _STRADDLE_BUFFER_PATH == path:
@@ -6153,15 +6307,6 @@ def _load_straddle_state_buffer(path: str, max_gripper_gap_m: float = 0.001) -> 
     if "is_straddled" in data:
         buffer["is_straddled"] = torch.from_numpy(data["is_straddled"].astype(bool))
     n = buffer["joint_pos"].shape[0]
-    buffer["row_mask"] = _compose_buffer_row_mask(buffer, path, max_gripper_gap_m)
-    if buffer["row_mask"] is not None:
-        n_ok = int(buffer["row_mask"].sum().item())
-        print(f"[StraddleStateBuffer] {n_ok}/{n} rows pass slide sampling mask")
-        if n_ok == 0:
-            raise RuntimeError(
-                f"No valid rows in straddle state buffer '{path}'. "
-                "Re-collect slide_terminal_states.npz with collect_slide_states.py."
-            )
     _STRADDLE_STATE_BUFFER = buffer
     _STRADDLE_BUFFER_PATH = path
     print(f"[StraddleStateBuffer] Loaded {n} terminal states from '{path}'")
@@ -6269,88 +6414,6 @@ def hold_gripper_open(
         joint_vel = robot.data.joint_vel[env_ids].clone()
         joint_vel[:, jid] = 0.0
         robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
-
-
-def _pcb_tilt_penalty_from_quat_batch(
-    quat_wxyz: torch.Tensor,
-    world_up: tuple[float, float, float] = (0.0, 0.0, 1.0),
-) -> torch.Tensor:
-    """Thickness-axis tilt penalty ``1 - |dot(z_body, up)|`` for buffer quaternions ``(N, 4)`` wxyz."""
-    device = quat_wxyz.device
-    dtype = quat_wxyz.dtype
-    up = torch.tensor(world_up, device=device, dtype=dtype)
-    up = up / torch.norm(up).clamp_min(1e-9)
-    local_z = torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
-    z_w = math_utils.quat_apply(
-        quat_wxyz,
-        local_z.unsqueeze(0).expand(quat_wxyz.shape[0], -1),
-    )
-    align = torch.abs(torch.sum(z_w * up.unsqueeze(0), dim=-1))
-    return 1.0 - torch.clamp(align, max=1.0)
-
-
-def _sample_straddle_buffer_indices(
-    pcb_pos_env: torch.Tensor,
-    n_samples: int,
-    pcb_z_reference: float,
-    max_z_delta_m: float,
-    pcb_quat: torch.Tensor | None = None,
-    max_tilt_penalty: float | None = None,
-    row_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Sample buffer rows near ``pcb_z_reference``; optionally reject high tilt / bad rows."""
-    z = pcb_pos_env[:, 2]
-    valid = torch.abs(z - float(pcb_z_reference)) <= float(max_z_delta_m)
-    if max_tilt_penalty is not None and pcb_quat is not None:
-        tilt = _pcb_tilt_penalty_from_quat_batch(pcb_quat)
-        valid = valid & (tilt <= float(max_tilt_penalty))
-    if row_mask is not None:
-        valid = valid & row_mask.bool()
-    valid_idx = torch.nonzero(valid, as_tuple=False).view(-1)
-    if valid_idx.numel() == 0:
-        if row_mask is not None:
-            fallback = torch.nonzero(row_mask.bool(), as_tuple=False).view(-1)
-            if fallback.numel() > 0:
-                pick = torch.randint(0, fallback.numel(), (n_samples,), device="cpu")
-                return fallback[pick]
-            raise RuntimeError(
-                "Straddle state buffer row_mask is empty — cannot sample a valid terminal state."
-            )
-        return torch.randint(0, pcb_pos_env.shape[0], (n_samples,), device="cpu")
-    pick = torch.randint(0, valid_idx.numel(), (n_samples,), device="cpu")
-    return valid_idx[pick]
-
-
-def _sample_buffer_row_indices(
-    buf: dict,
-    n_samples: int,
-    z_ref: float | None = None,
-    max_z_delta_m: float = 0.025,
-    pcb_quat: torch.Tensor | None = None,
-    max_tilt_penalty: float | None = None,
-    row_mask: torch.Tensor | None = None,
-) -> torch.Tensor:
-    """Sample buffer rows with optional Z / tilt / row-mask filters."""
-    n_buf = buf["pcb_pos_env"].shape[0]
-    if z_ref is not None:
-        return _sample_straddle_buffer_indices(
-            buf["pcb_pos_env"],
-            n_samples,
-            float(z_ref),
-            float(max_z_delta_m),
-            pcb_quat=pcb_quat,
-            max_tilt_penalty=max_tilt_penalty,
-            row_mask=row_mask,
-        )
-    if row_mask is not None:
-        valid_idx = torch.nonzero(row_mask.bool(), as_tuple=False).view(-1)
-        if valid_idx.numel() == 0:
-            raise RuntimeError(
-                "Straddle state buffer row_mask is empty — cannot sample a valid terminal state."
-            )
-        pick = torch.randint(0, valid_idx.numel(), (n_samples,), device="cpu")
-        return valid_idx[pick]
-    return torch.randint(0, n_buf, (n_samples,), device="cpu")
 
 
 def _gripper_midpoint_z_w(
@@ -6494,11 +6557,6 @@ def reset_from_straddle_states(
     gripper_closed_target_m: float = 0.00025,
     gripper_open_target_m: float | None = None,
     gripper_hold_open: bool = False,
-    pcb_z_filter_env: float | None = None,
-    max_pcb_z_delta_m: float = 0.025,
-    max_buffer_tilt_penalty: float | None = None,
-    rail_center_z_env: float | None = None,
-    max_rail_z_delta_m: float | None = None,
     apply_gripper_hold_on_reset: bool = True,
 ) -> None:
     """Reset **robot joints only** by sampling from the saved straddle terminal-state buffer.
@@ -6524,20 +6582,7 @@ def reset_from_straddle_states(
     device = env.device
     dtype = torch.float32
 
-    z_ref = pcb_z_filter_env if pcb_z_filter_env is not None else rail_center_z_env
-    z_delta = max_pcb_z_delta_m if max_rail_z_delta_m is None else max_rail_z_delta_m
-
-    row_mask = buf.get("row_mask")
-
-    idx = _sample_buffer_row_indices(
-        buf,
-        n_reset,
-        z_ref=z_ref,
-        max_z_delta_m=float(z_delta),
-        pcb_quat=buf["pcb_quat"] if max_buffer_tilt_penalty is not None else None,
-        max_tilt_penalty=max_buffer_tilt_penalty,
-        row_mask=row_mask,
-    )
+    idx = torch.randint(0, n_buf, (n_reset,), device="cpu")
     if not hasattr(env, "_straddle_buffer_idx"):
         env._straddle_buffer_idx = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
     env._straddle_buffer_idx[env_ids] = idx.to(device=env.device)
@@ -7542,3 +7587,10 @@ def gripper_mid_gated_push_axis_velocity_reward(
     return torch.where(pcb_pure & ee_pure & moving, reward, torch.zeros_like(reward))
 
 
+
+
+# Deprecated aliases (pre-approach rename).
+push_gripper_debug_monitor_reward = approach_gripper_debug_monitor_reward
+push_gripper_debug_accumulate = approach_gripper_debug_accumulate
+push_gripper_debug_step = approach_gripper_debug_step
+push_gripper_debug_curriculum = approach_gripper_debug_curriculum

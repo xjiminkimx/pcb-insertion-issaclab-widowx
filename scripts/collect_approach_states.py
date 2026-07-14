@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""Collect successful terminal states from the trained Slide-phase policy.
+"""Collect successful Approach-phase (straddle) terminal states for Slide training.
 
 Usage (from workspace root)::
 
-    python scripts/collect_slide_states.py \\
-        --checkpoint logs/rl_games/widowx_pcb_slide/nn/widowx_pcb_slide.pth \\
-        --num_envs 256 \\
-        --num_states 2000 \\
-        --out data/slide_terminal_states.npz \\
+    python scripts/collect_approach_states.py \\
+        --checkpoint logs/rl_games/widowx_pcb_approach/nn/widowx_pcb_approach.pth \\
+        --num_envs 4096 \\
+        --num_states 500 \\
+        --out data/approach_terminal_states.npz \\
         --headless
 """
 
@@ -29,16 +29,16 @@ if _ISAACLAB_ROOT not in sys.path:
 
 from isaaclab.app import AppLauncher  # noqa: E402
 
-parser = argparse.ArgumentParser(description="Collect slide terminal states.")
-parser.add_argument("--checkpoint", required=True, help="Path to trained Slide .pth checkpoint.")
-parser.add_argument("--num_envs", type=int, default=256, help="Number of parallel environments.")
+parser = argparse.ArgumentParser(description="Collect approach (straddle) terminal states.")
+parser.add_argument("--checkpoint", required=True, help="Path to trained Approach .pth checkpoint.")
+parser.add_argument("--num_envs", type=int, default=4096, help="Number of parallel environments.")
 parser.add_argument("--num_states", type=int, default=2000, help="Target number of states to collect.")
 parser.add_argument(
     "--out",
-    default=os.path.join(_WORKSPACE, "data", "slide_terminal_states.npz"),
+    default=os.path.join(_WORKSPACE, "data", "approach_terminal_states.npz"),
     help="Output .npz path.",
 )
-parser.add_argument("--max_steps", type=int, default=30_000, help="Safety cap on total env steps.")
+parser.add_argument("--max_steps", type=int, default=50_000, help="Safety cap on total env steps.")
 parser.add_argument("--gui", action="store_true", help="Show Isaac Sim viewport (default: headless).")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -60,11 +60,9 @@ from isaaclab_rl.rl_games import RlGamesGpuEnv, RlGamesVecEnvWrapper  # noqa: E4
 
 import isaaclab_tasks  # noqa: F401, E402
 from isaaclab_tasks.manager_based.widowx_pcb import widowx_pcb_env_cfg as cfg  # noqa: E402
-from isaaclab_tasks.manager_based.widowx_pcb.agents.rl_games_ppo_cfg import WidowXPcbSlidePPOCfg  # noqa: E402
+from isaaclab_tasks.manager_based.widowx_pcb.agents.rl_games_ppo_cfg import WidowXPcbApproachPPOCfg  # noqa: E402
 
-_PUSH_ACTION_DIM = 18
-_SLIDE_ACTION_DIM = 18
-_INSERT_ACTION_DIM = 6
+_APPROACH_ACTION_DIM = 18
 
 
 def _checkpoint_action_dim(checkpoint_path: str) -> int | None:
@@ -82,32 +80,24 @@ def _validate_checkpoint_for_phase(checkpoint_path: str, expected_dim: int, phas
         return
     if ckpt_dim == expected_dim:
         return
-    hint = ""
-    if ckpt_dim == _PUSH_ACTION_DIM and expected_dim == _SLIDE_ACTION_DIM:
-        hint = "Checkpoint looks valid for Slide VIC (18-dim)."
-    elif ckpt_dim == 7 and expected_dim == _SLIDE_ACTION_DIM:
-        hint = "This checkpoint uses the legacy 7-DoF Slide policy. Retrain Slide with 18-dim VIC."
-    elif ckpt_dim == 6 and expected_dim == _SLIDE_ACTION_DIM:
-        hint = "This is an Insert checkpoint (6 arm actions). Use a Slide checkpoint."
     raise ValueError(
         f"Checkpoint action dim {ckpt_dim} does not match {phase} env ({expected_dim}).\n"
-        f"  checkpoint: {checkpoint_path}\n"
-        f"  {hint}"
+        f"  checkpoint: {checkpoint_path}"
     )
 
 
 def _build_env_and_player(checkpoint_path: str, num_envs: int):
-    env_cfg = cfg.WidowXPcbSlideEnvCfg()
+    env_cfg = cfg.WidowXPcbApproachEnvCfg()
     env_cfg.scene.num_envs = num_envs
 
-    agent_cfg = copy.deepcopy(WidowXPcbSlidePPOCfg)
+    agent_cfg = copy.deepcopy(WidowXPcbApproachPPOCfg)
     rl_device = agent_cfg["params"]["config"]["device"]
     clip_obs = agent_cfg["params"]["env"].get("clip_observations", math.inf)
     clip_actions = agent_cfg["params"]["env"].get("clip_actions", math.inf)
     obs_groups = agent_cfg["params"]["env"].get("obs_groups")
     concate_obs_groups = agent_cfg["params"]["env"].get("concate_obs_groups", True)
 
-    env = gym.make("Isaac-WidowX-PCB-Slide-v0", cfg=env_cfg)
+    env = gym.make("Isaac-WidowX-PCB-Approach-v0", cfg=env_cfg)
     env = RlGamesVecEnvWrapper(env, rl_device, clip_obs, clip_actions, obs_groups, concate_obs_groups)
 
     vecenv.register(
@@ -119,7 +109,7 @@ def _build_env_and_player(checkpoint_path: str, num_envs: int):
     runner = Runner()
     runner.load(agent_cfg)
     player: BasePlayer = runner.create_player()
-    _validate_checkpoint_for_phase(checkpoint_path, _SLIDE_ACTION_DIM, "Slide")
+    _validate_checkpoint_for_phase(checkpoint_path, _APPROACH_ACTION_DIM, "Approach")
     player.restore(retrieve_file_path(checkpoint_path))
     player.reset()
 
@@ -166,7 +156,7 @@ def collect(args):
         if not dones.any():
             continue
 
-        success_mask = base_env.termination_manager.get_term("slide_success")
+        success_mask = base_env.termination_manager.get_term("approach_success")
         total_done += int(dones.sum())
         total_success += int(success_mask.sum())
 
@@ -191,7 +181,7 @@ def collect(args):
                 s[:, dones, :] = 0.0
 
     print(
-        f"\n[INFO] Collection done: {total_success} successes out of {total_done} terminal episodes "
+        f"\n[INFO] Collection done: {total_success} straddle successes out of {total_done} terminal episodes "
         f"({100.0 * total_success / max(total_done, 1):.1f}% success rate)"
     )
 
@@ -199,8 +189,8 @@ def collect(args):
 
     if not joint_pos_list:
         print(
-            "[WARN] No successful slide episodes collected. "
-            "Check the Slide checkpoint and that slide_success fires."
+            "[WARN] No successful straddle episodes collected. "
+            "Check the Approach checkpoint and that approach_success fires."
         )
         return
 
@@ -217,7 +207,6 @@ def collect(args):
             f"p95={np.percentile(gap, 95):.4f}"
         )
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     np.savez_compressed(
         args.out,
         joint_pos=joint_pos,

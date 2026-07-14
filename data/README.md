@@ -1,13 +1,9 @@
-# Terminal state buffers (*.npz)
+# Terminal-state buffers (Sequential Dexterity chaining)
 
 | File | Produced by | Consumed by |
 |------|-------------|-------------|
-| `push_terminal_states.npz` | `scripts/collect_grasp_states.py` (alias: `collect_push_states.py`) | Slide env reset (`EventCfgSlide`) |
-| `slide_terminal_states.npz` | `scripts/collect_slide_states.py` | Insert env reset (`EventCfgInsert`) |
+| `approach_terminal_states.npz` | `scripts/collect_approach_states.py` | Slide env reset (`EventCfgSlide`) |
+| `push_terminal_states.npz` | *(legacy alias path)* | Same as above if present |
+| `slide_terminal_states.npz` | `scripts/collect_slide_states.py` | Insert env reset (if enabled) |
 
-Legacy filenames `straddle_terminal_states.npz` and `grasp_terminal_states.npz` are still accepted by `train_slide.sh` if present.
-
-Each file stores `joint_pos`, `pcb_pos_env`, `pcb_quat`, and `joint_names` at successful task terminations.
-
-Slide reset: push buffer robot joints unchanged; gripper held open; PCB XY/Z from buffer;
-orientation flattened to ``_PCB_INIT_ROT_WXYZ`` (flat on conveyor). Tilted buffer rows are skipped.
+Slide reset: approach buffer robot joints unchanged; gripper held open; PCB XY/Z from buffer;

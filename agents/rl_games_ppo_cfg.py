@@ -102,8 +102,8 @@ WidowXPcbPPOBaseCfg = {
     }
 }
 
-# Push — open-jaw trailing-edge approach + +Y slide (18-dim VIC: 6×[Δq, K, ζ]).
-WidowXPcbPushPPOCfg = {
+# Approach — open-jaw trailing-edge straddle (18-dim VIC: 6×[Δq, K, ζ]).
+WidowXPcbApproachPPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {
         **WidowXPcbPPOBaseCfg["params"],
@@ -125,17 +125,18 @@ WidowXPcbPushPPOCfg = {
         },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "widowx_pcb_push",
+            "name": "widowx_pcb_approach",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
-            "max_epochs": 210,
+            "max_epochs": 60,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
 }
 
-# Deprecated alias (pre-push rename).
-WidowXPcbStraddlePPOCfg = WidowXPcbPushPPOCfg
+# Deprecated aliases (pre-approach rename).
+WidowXPcbPushPPOCfg = WidowXPcbApproachPPOCfg
+WidowXPcbStraddlePPOCfg = WidowXPcbApproachPPOCfg
 
 WidowXPcbSlidePPOCfg = {
     **WidowXPcbPPOBaseCfg,
@@ -143,7 +144,7 @@ WidowXPcbSlidePPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            "clip_actions": 0.12,
+            "clip_actions": 0.25,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -151,7 +152,7 @@ WidowXPcbSlidePPOCfg = {
                 **WidowXPcbPPOBaseCfg["params"]["network"]["space"],
                 "continuous": {
                     **WidowXPcbPPOBaseCfg["params"]["network"]["space"]["continuous"],
-                    "sigma_init": {"name": "const_initializer", "val": -1.2},
+                    "sigma_init": {"name": "const_initializer", "val": -0.8},
                 },
             },
         },

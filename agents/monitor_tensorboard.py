@@ -23,7 +23,8 @@ except ImportError:
 
 # Known rl-games experiment layout for this task (relative to --logdir/rl_games/).
 WIDOWX_RL_RUNS = (
-    ("Push", "widowx_pcb_push/summaries"),
+    ("Approach", "widowx_pcb_approach/summaries"),
+    ("Approach (legacy)", "widowx_pcb_push/summaries"),
     ("Grasp", "widowx_pcb_grasp/summaries"),
     ("Grasp gripper test", "widowx_pcb_grasp_gripper_test/summaries"),
     ("Slide", "widowx_pcb_slide/summaries"),
@@ -104,7 +105,7 @@ def _find_widowx_summary_dirs(logdir: str) -> list[tuple[str, str]]:
 def _print_cwd_hint() -> None:
     if not _is_widowx_package_cwd():
         return
-    print("[HINT] Train with scripts/train_push.sh / train_slide.sh / train_insert.sh")
+    print("[HINT] Train with scripts/train_approach.sh / train_slide.sh / train_insert.sh")
     print("       so logs land in ./logs/rl_games/ (this workspace).")
     print("       To copy existing Isaac Lab logs: bash scripts/sync_logs_from_isaaclab.sh")
     print()
@@ -154,12 +155,13 @@ def main() -> int:
     print("      - KL / approx_kl")
     print()
     print("[TIP] Run folders under logs/rl_games/:")
-    print("      - widowx_pcb_push (open-jaw approach + +Y slide)")
+    print("      - widowx_pcb_approach (phase 1 — trailing-edge straddle)")
+    print("      - widowx_pcb_push       (legacy log dir for approach)")
     print("      - widowx_pcb_grasp    (legacy grasp phase)")
     print("      - widowx_pcb_slide    (phase 2 — slide to slot mouth)")
     print("      - widowx_pcb_insert   (phase 3 — SDF insert)")
     print()
-    print("[TIP] Push monitoring (Episode/Curriculum/push_gripper_debug/*):")
+    print("[TIP] Approach monitoring (Episode/Curriculum/approach_gripper_debug/*):")
     print("      - closedness / closedness_mean / closedness_live  — proximity σ (finger_proximity)")
     print("      - closedness_peak / closedness_ep_max             — best env per episode")
     print("      - closedness_tight / closedness_tight_mean        — tight 20 mm σ")
