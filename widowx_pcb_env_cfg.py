@@ -120,7 +120,12 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # Robot — independent of PCB / slot geometry (tune in Isaac Sim)
 # ---------------------------------------------------------------------------
 # Base beside the conveyor; +90° CCW yaw about world +Z (``_ROBOT_BASE_ROT_WXYZ``).
-_ROBOT_BASE_POS = (0.045, -0.34, 0.05)
+# Base moved +Y 7 cm (-0.34 -> -0.27) toward the magazine so the whole slide/insert push
+# (gripper Y ≈ -0.07 → +0.207) sits inside the dexterous workspace: ~34% reach at the near end
+# and ~75% (was ~85%) at full insertion.  This restores OSC's +Y force authority near the slot,
+# where the arm was previously over-extended (radial push ≈ least-manipulable direction).
+# NOTE: moving the base invalidates the approach terminal states -> approach must be retrained.
+_ROBOT_BASE_POS = (0.045, -0.27, 0.05)
 # +90° CCW about world +Z (w, x, y, z).
 _ROBOT_BASE_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
 
@@ -285,16 +290,21 @@ _ARM_TASK_SLIDE_ORIENTATION_SCALE = 0.10
 _ARM_TASK_SLIDE_MOTION_AXES = (1, 1, 1, 1, 0, 1)
 _SLIDE_JOINT_POSTURE_HOLD_KP = 120.0
 _SLIDE_JOINT_POSTURE_HOLD_KD = 8.0
-# Rotation floor raised 60 -> 150: with gravity compensated and joint stiffness 0, a soft
-# orientation gain let the policy drive the wrist limp so the EE pitched down under the
-# gripper+PCB moment (the "처짐" / droop) instead of staying rigid to transmit the +Y push.
+# Selective (peg-in-hole style) impedance for insertion, per task axis (tx, ty, tz, rx, ry, rz)
+# in the BASE frame (base +X = world +Y push):
+#   tx  (push, world +Y)      STIFF   — always firm to drive the PCB into the slot
+#   ty  (lateral, world -X)   SOFT    — comply against slot side-walls so the board self-aligns
+#   tz  (vertical, world +Z)  MED-HI  — hold height (rails constrain); box also anchors it
+#   rx  (roll about push)     HI      — keep the board flat
+#   ry  (pitch)               FREE    — motion axis 0 (redundancy for the reach), value ignored
+#   rz  (yaw about vertical)  SOFT-MED— let the board rotate slightly to straighten in the slot
 _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
-    (250.0, 450.0),
-    (250.0, 450.0),
-    (250.0, 450.0),
+    (250.0, 500.0),
+    (30.0, 120.0),
+    (200.0, 450.0),
     (150.0, 300.0),
     (150.0, 300.0),
-    (150.0, 300.0),
+    (60.0, 180.0),
 )
 _SLIDE_EE_LATERAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.01
@@ -912,38 +922,57 @@ class ActionsCfgApproach:
 
 @configclass
 class ActionsCfgSlide:
-    """Slide: joint-space VIC (Δq, K, ζ per arm joint); no Jacobian → singularity-safe; gripper open.
+    """Slide/insert: task-space OSC with peg-in-hole selective compliance; gripper open.
 
-    Switched from task-space OSC to joint-space Variable Impedance Control.  OSC generated
-    the +Y push force through the transpose Jacobian, which loses authority in the push
-    direction as the arm nears its reach limit (the singularity that produced the droop /
-    backward-stretch failure).  Joint-space VIC commands torques directly per joint, so it
-    keeps full authority anywhere in the workspace while the variable K/ζ blocks preserve the
-    compliance the contact-rich slide needs.
+    Now that the base is repositioned so the insertion sits at ~75% reach (dexterous workspace),
+    OSC regains +Y force authority and we use Cartesian impedance the way insertion needs it:
+    STIFF along the push/insertion axis (tx = world +Y) to drive the board in, but SOFT laterally
+    (ty) and in yaw (rz) so the PCB self-aligns and slips past slot-wall jams instead of binding.
+    ``ry`` (pitch) is left uncontrolled for kinematic redundancy during the reach.  The cumulative
+    EE box anchors translation to the reset pose (±1 cm lateral/vertical, forward-only push), which
+    also suppresses the vertical droop that plagued the over-extended OSC config.
     """
 
-    arm_action = JointVariableImpedanceActionCfg(
+    arm_action = WidowXTaskSpaceImpedanceActionCfg(
         asset_name="robot",
         joint_names=["joint_[0-5]"],
-        preserve_order=True,
-        # p_abs + integrated setpoint: the target is latched to the reset posture and nudged by the
-        # policy deltas, so K(setpoint - q) actively holds the arm's height.  p_rel gave a zero
-        # stiffness term at Δq≈0 (error re-references the live pose each substep) -> the gripper
-        # drooped, held only by (arm-only) gravity comp.
-        command_type="p_abs",
-        impedance_mode="variable",
-        position_scale=_SLIDE_VIC_POSITION_SCALE,
-        stiffness_limits=_SLIDE_VIC_STIFFNESS_LIMITS,
-        damping_ratio_limits=_SLIDE_VIC_DAMPING_RATIO_LIMITS,
-        default_stiffness=_SLIDE_VIC_DEFAULT_STIFFNESS,
-        default_damping_ratio=_SLIDE_VIC_DEFAULT_DAMPING_RATIO,
-        # Cap integrated setpoint drift from the live pose to avoid wind-up when contact blocks
-        # the arm mid-push (still lets it build a few cm of push travel / force).
-        max_setpoint_deviation=_SLIDE_VIC_MAX_SETPOINT_DEV,
-        # Controller adds the mass-matrix gravity term directly in joint space (far more
-        # accurate than the OSC Jacobian estimate), so the arm holds posture without droop
-        # and K/ζ are free to shape the push compliance.
-        gravity_compensation=True,
+        body_name=_EE_OSC_BODY_NAME,
+        body_offset=WidowXTaskSpaceImpedanceActionCfg.OffsetCfg(
+            pos=(0.0, 0.0, _GRIPPER_TIP_OFFSET_M),
+            rot=(1.0, 0.0, 0.0, 0.0),
+        ),
+        position_scale=_ARM_TASK_SLIDE_POSITION_SCALE,
+        orientation_scale=_ARM_TASK_SLIDE_ORIENTATION_SCALE,
+        stiffness_scale=1.0,
+        damping_ratio_scale=1.0,
+        controller_cfg=OperationalSpaceControllerCfg(
+            target_types=["pose_rel"],
+            impedance_mode="variable",
+            motion_control_axes_task=_ARM_TASK_SLIDE_MOTION_AXES,
+            motion_stiffness_task=_ARM_TASK_DEFAULT_STIFFNESS,
+            motion_damping_ratio_task=_ARM_TASK_DEFAULT_DAMPING_RATIO,
+            motion_stiffness_limits_task=_ARM_TASK_STIFFNESS_LIMITS,
+            motion_damping_ratio_limits_task=_ARM_TASK_DAMPING_RATIO_LIMITS,
+            gravity_compensation=True,
+            inertial_dynamics_decoupling=False,
+            nullspace_control="none",
+        ),
+        # Per-axis stiffness caps enforce the selective compliance (soft ty/rz, stiff tx) regardless
+        # of what the policy commands in its K block.
+        motion_stiffness_limits_per_axis=_ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS,
+        # Keep a firm floor on the policy K/ζ so exploration can't drive the arm limp (droop).
+        stiffness_action_floor=0.5,
+        damping_action_floor=0.5,
+        # Cumulative EE box (world frame): anchors translation to the reset pose so the EE cannot
+        # droop vertically or drift backward; forward push travel up to _SLIDE_EE_PUSH_OFFSET_MAX_M.
+        task_position_box_enabled=True,
+        push_axis_world=PUSH_AXIS_WORLD,
+        lateral_axis_world=_LATERAL_AXIS_WORLD,
+        vertical_axis_world=(0.0, 0.0, 1.0),
+        lateral_half_range_m=_SLIDE_EE_LATERAL_HALF_RANGE_M,
+        vertical_half_range_m=_SLIDE_EE_VERTICAL_HALF_RANGE_M,
+        push_offset_min_m=_SLIDE_EE_PUSH_OFFSET_MIN_M,
+        push_offset_max_m=_SLIDE_EE_PUSH_OFFSET_MAX_M,
     )
 
 
