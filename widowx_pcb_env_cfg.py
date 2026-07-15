@@ -62,6 +62,7 @@ from .mdp_custom import (
     slide_finger_push_axis_delta_obs,
     store_slide_reset_ee_pose_w,
     WidowXTaskSpaceImpedanceActionCfg,
+    JointVariableImpedanceActionCfg,
     pcb_root_height_below_env_minimum,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
@@ -214,11 +215,40 @@ _MAG_Y_FAR_FACE_ENV = 0.472    # magazine back wall — PCB leading edge seats j
 # Leading-edge targets at far / near magazine faces (lane X, not magazine bbox centre X).
 _HALF_LENGTH_M = PCB_X * 0.5
 
-# Pure +Y slide gate: max PCB root off-axis speed sqrt(v_x² + v_z²) for state / velocity credit.
-_SLIDE_PUSH_APPROACH_MAX_STEP_M = 0.005
+# Per-control-step +Y travel that saturates the progress reward (reward = clamp(Δ,0,max)/max).
+# Lowered 0.005 -> 0.002: at 0.005 the reward only saturated at ~0.6 m/s, so a controlled ~0.05 m/s
+# slide earned <10% of the term.  0.002 saturates at ~0.25 m/s -> realistic slide speeds now get a
+# strong, well-graded push signal (weight 500).
+_SLIDE_PUSH_APPROACH_MAX_STEP_M = 0.002
 # Leading-edge Z lift above episode-start height before exponential penalty (slide phase).
 _SLIDE_LEAD_EDGE_MAX_LIFT_M = 0.004
 _SLIDE_LEAD_EDGE_MAX_PENALTY_EXCESS_M = 0.02
+
+# ---------------------------------------------------------------------------
+# Slide phase: joint-space Variable Impedance Control (VIC).
+# Replaces task-space OSC for the slide phase.  Torques are computed directly in
+# joint space (tau = K(q_des - q) - D q_dot + gravity_comp), so there is NO
+# Jacobian inverse -> no kinematic-singularity blow-up near the arm's reach limit
+# (the failure mode OSC hit while pushing +Y).  The variable K/zeta blocks keep
+# the compliance the task needs.  Action layout (6 arm joints, "variable"):
+#   [0:6]  Delta q  (rad, relative target = current q + Delta q), scaled below
+#   [6:12] joint stiffness K       (mapped from [-1,1] -> _SLIDE_VIC_STIFFNESS_LIMITS)
+#   [12:18] joint damping ratio zeta (mapped from [-1,1] -> _SLIDE_VIC_DAMPING_RATIO_LIMITS)
+# 18 dims total == the previous OSC "variable" action dim, so the PPO network and
+# clip_actions are unchanged.
+_SLIDE_VIC_POSITION_SCALE = 0.02
+# Min stiffness raised 40 -> 120: with gravity_compensation the arm floats, so a low K floor
+# made "go limp / fold" a nearly free action (collapse seen in play).  A 120 N·m/rad floor keeps
+# the arm firm enough that it can't droop into a collapsed posture; max (400) lets it push +Y.
+_SLIDE_VIC_STIFFNESS_LIMITS = (120.0, 400.0)
+# Overdamped-capable range prevents the droop/oscillation seen with low OSC damping.
+_SLIDE_VIC_DAMPING_RATIO_LIMITS = (0.8, 2.0)
+_SLIDE_VIC_DEFAULT_STIFFNESS = 120.0
+_SLIDE_VIC_DEFAULT_DAMPING_RATIO = 1.2
+# Max integrated-setpoint deviation from the live joint pose (rad).  Lowered 0.35 -> 0.15 so the
+# policy cannot walk the setpoint far from the reset straddle posture in a few steps (limits how
+# far an undertrained policy can drive the arm into a collapsed configuration).
+_SLIDE_VIC_MAX_SETPOINT_DEV = 0.01
 # Legacy effort scale (JointEffortActionCfg / ActionsCfgSlide). Approach uses VIC below.
 # _ARM_EFFORT_SCALE = {
 #     "joint_0": 4.0,
@@ -238,19 +268,33 @@ _ARM_TASK_DAMPING_RATIO_LIMITS = (0.6, 2.0)
 _ARM_TASK_DEFAULT_STIFFNESS = 150.0
 _ARM_TASK_DEFAULT_DAMPING_RATIO = 1.2
 # Task-space OSC (Slide): Z translation locked; lateral (short-edge / lane X) ±1 cm cumulative box.
-_ARM_TASK_SLIDE_POSITION_SCALE = 0.15
+# Position scale lowered 0.15 -> 0.05: the OSC target is set (clip_actions x scale) ahead of the
+# current EE, so at 0.15 the target sat up to ~7.5 cm ahead of the PCB -> K(250-450) x 0.075 ≈
+# 20-34 N contact spike that launched the light 0.1 kg board ("튕겨나감").  0.05 keeps the target
+# ~2-3 cm ahead -> gentle sustained push that maintains contact.
+_ARM_TASK_SLIDE_POSITION_SCALE = 0.01
 _ARM_TASK_SLIDE_ORIENTATION_SCALE = 0.10
-# Slide OSC: XY translate only (tz + rotation locked); joint PD holds buffer straddle joints.
-_ARM_TASK_SLIDE_MOTION_AXES = (1, 1, 1, 1, 1, 1)
+# Slide OSC axes = (tx, ty, tz, rx, ry, rz) in the BASE frame (base yaw +90°, so base +X = world +Y push).
+#   rx = roll about the push axis (+Y)   -> keep (board flatness / anti side-tilt)
+#   ry = pitch about the lateral axis    -> FREE (nose up/down droop axis; also the axis that must
+#                                            change as the arm reaches forward)
+#   rz = yaw about vertical (+Z)         -> keep (board anti-skew)
+# A 6-DOF arm with all 6 task axes locked has ZERO redundancy -> it cannot reconfigure to push and
+# stalls / nears a singularity as it extends.  Freeing pitch gives 1 nullspace DOF for the reach while
+# still controlling the yaw & roll needed to keep the PCB aligned during insertion.
+_ARM_TASK_SLIDE_MOTION_AXES = (1, 1, 1, 1, 0, 1)
 _SLIDE_JOINT_POSTURE_HOLD_KP = 120.0
 _SLIDE_JOINT_POSTURE_HOLD_KD = 8.0
+# Rotation floor raised 60 -> 150: with gravity compensated and joint stiffness 0, a soft
+# orientation gain let the policy drive the wrist limp so the EE pitched down under the
+# gripper+PCB moment (the "처짐" / droop) instead of staying rigid to transmit the +Y push.
 _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
-    (200.0, 400.0),
-    (200.0, 400.0),
-    (200.0, 400.0),
-    (60.0, 150.0),
-    (60.0, 150.0),
-    (60.0, 150.0),
+    (250.0, 450.0),
+    (250.0, 450.0),
+    (250.0, 450.0),
+    (150.0, 300.0),
+    (150.0, 300.0),
+    (150.0, 300.0),
 )
 _SLIDE_EE_LATERAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.01
@@ -702,129 +746,10 @@ def _slide_straddle_hold_params(**extra) -> dict:
     return base
 
 
-def _slide_finger_sync_params(**extra) -> dict:
-    """Kwargs for symmetric finger push-axis depth when yaw is aligned."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "axis_world": PUSH_AXIS_WORLD,
-        "yaw_good_cos": _SLIDE_YAW_GOOD_COS,
-        "sync_std_m": _SLIDE_FINGER_Y_SYNC_STD_M,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _slide_yaw_corrective_params(**extra) -> dict:
-    """Kwargs for asymmetric finger push when PCB yaw exceeds tolerance."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "axis_world": PUSH_AXIS_WORLD,
-        "yaw_bad_cos": _SLIDE_YAW_BAD_COS,
-        "asym_std_m": _SLIDE_YAW_ASYM_STD_M,
-        "asym_gain_m": _SLIDE_YAW_ASYM_GAIN_M,
-        **_gripper_kinematics_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _slide_gripper_span_params(**extra) -> dict:
-    """Kwargs for nominal vs yaw-recovery gripper span shaping."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "gripper_joint_cfg": _GRIPPER_JOINT,
-        "axis_world": PUSH_AXIS_WORLD,
-        "nominal_span_m": _SLIDE_GRIPPER_NOMINAL_SPAN_M,
-        "max_open_mult": _SLIDE_GRIPPER_MAX_OPEN_MULT,
-        "span_sigma_m": _SLIDE_GRIPPER_SPAN_SIGMA_M,
-        "yaw_bad_cos": _SLIDE_YAW_BAD_COS,
-    }
-    base.update(extra)
-    return base
-
-
-def _slide_jaw_orient_params(**extra) -> dict:
-    """Kwargs for jaw rail vertical during slide."""
-    base = {
-        **_approach_entity_params(),
-        "gate_dist_m": 0.12,
-        "min_finger_sep_m": _MIN_STRADDLE_SEP_M,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-    }
-    base.update(extra)
-    return base
-
-
-def _slide_wrist_align_params(**extra) -> dict:
-    """Kwargs for wrist→carriage push-axis alignment during slide."""
-    base = {
-        **_approach_entity_params(),
-        "gate_dist_m": 0.12,
-        "min_finger_sep_m": _MIN_STRADDLE_SEP_M,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        "push_axis_world": PUSH_AXIS_WORLD,
-        "yaw_only": True,
-    }
-    base.update(extra)
-    return base
-
 
 def _approach_termination_params(**extra) -> dict:
     """Entity + geometry kwargs shared by straddle-success termination and bonus."""
     return _approach_success_params(**extra)
-
-
-def _slide_detach_params(**extra) -> dict:
-    """Kwargs for slide-phase straddle-loss / detach termination (open gripper)."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "half_length_m": _HALF_LENGTH_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        "max_edge_along_m": 0.080,
-        "max_edge_in_plane_m": 0.060,
-        "max_finger_dist_m": 0.070,
-        "min_straddle_sep_m": _MIN_STRADDLE_SEP_M,
-        "min_height_env": _PCB_TERMINATE_MIN_HEIGHT_ENV,
-        "min_episode_steps": 16,
-        # ``pcb_detached_from_gripper`` takes wrist cfg only (no ``tip_offset_m``).
-        **_gripper_wrist_kwargs(),
-    }
-    base.update(extra)
-    return base
-
-
-def _slide_extreme_drift_params(**extra) -> dict:
-    """Kwargs for slide-phase extreme PCB escape termination."""
-    base = {
-        "pcb_cfg": _PCB_ENT,
-        "left_finger_cfg": _LEFT_FINGER,
-        "right_finger_cfg": _RIGHT_FINGER,
-        "half_length_m": _HALF_LENGTH_M,
-        "pcb_half_thickness_m": PCB_Z * 0.5,
-        "width_weight": _SHORT_EDGE_WIDTH_WEIGHT,
-        "max_extra_sep_m": 0.070,
-        "max_finger_dist_m": 0.100,
-        "max_edge_dist_m": 0.120,
-        "check_perp_drift": False,
-        "check_flying": False,
-        "check_vertical_sep": True,
-        "max_vertical_sep_m": 0.070,
-        "min_episode_steps": 40,
-        # ``pcb_extreme_drift_from_gripper`` takes wrist cfg only (no ``tip_offset_m``).
-        **_gripper_wrist_kwargs(),
-    }
-    base.update(extra)
-    return base
 
 
 def _gripper_friction_event() -> EventTermCfg:
@@ -887,7 +812,11 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             "wxai_arm": ImplicitActuatorCfg(
                 joint_names_expr=["joint_[0-5]"],
                 stiffness=0.0,
-                damping=1.0,   # low; primary damping from VIC ζ in the action term
+                # Restored 1.0 -> 5.0 (matches successful je_action branch).  With OSC gravity
+                # compensation the arm is in neutral equilibrium; joint-space damping is the only
+                # velocity-dependent restoring term, so too little (1.0) lets the compliant EE
+                # drift/sag ("아래로 처짐") between the 4 decimation substeps.
+                damping=5.0,
             ),
             # right_carriage_joint is a mimic joint in the USD (driven by left_carriage_joint).
             "wxai_gripper": ImplicitActuatorCfg(
@@ -983,44 +912,38 @@ class ActionsCfgApproach:
 
 @configclass
 class ActionsCfgSlide:
-    """Slide: 3-trans + 3-rot OSC; Z locked; lateral ±1 cm cumulative EE box; gripper open."""
+    """Slide: joint-space VIC (Δq, K, ζ per arm joint); no Jacobian → singularity-safe; gripper open.
 
-    arm_action = WidowXTaskSpaceImpedanceActionCfg(
+    Switched from task-space OSC to joint-space Variable Impedance Control.  OSC generated
+    the +Y push force through the transpose Jacobian, which loses authority in the push
+    direction as the arm nears its reach limit (the singularity that produced the droop /
+    backward-stretch failure).  Joint-space VIC commands torques directly per joint, so it
+    keeps full authority anywhere in the workspace while the variable K/ζ blocks preserve the
+    compliance the contact-rich slide needs.
+    """
+
+    arm_action = JointVariableImpedanceActionCfg(
         asset_name="robot",
         joint_names=["joint_[0-5]"],
-        body_name=_EE_OSC_BODY_NAME,
-        body_offset=WidowXTaskSpaceImpedanceActionCfg.OffsetCfg(
-            pos=(0.0, 0.0, _GRIPPER_TIP_OFFSET_M),
-            rot=(1.0, 0.0, 0.0, 0.0),
-        ),
-        position_scale=_ARM_TASK_SLIDE_POSITION_SCALE,
-        orientation_scale=_ARM_TASK_SLIDE_ORIENTATION_SCALE,
-        stiffness_scale=1.0,
-        damping_ratio_scale=1.0,
-        controller_cfg=OperationalSpaceControllerCfg(
-            target_types=["pose_rel"],
-            impedance_mode="variable",
-            motion_control_axes_task=_ARM_TASK_SLIDE_MOTION_AXES,
-            motion_stiffness_task=_ARM_TASK_DEFAULT_STIFFNESS,
-            motion_damping_ratio_task=_ARM_TASK_DEFAULT_DAMPING_RATIO,
-            motion_stiffness_limits_task=_ARM_TASK_STIFFNESS_LIMITS,
-            motion_damping_ratio_limits_task=_ARM_TASK_DAMPING_RATIO_LIMITS,
-            gravity_compensation=True,
-            inertial_dynamics_decoupling=False,
-            nullspace_control="none",
-        ),
-        # use_buffer_joint_posture_hold=False,
-        # joint_posture_hold_stiffness=_SLIDE_JOINT_POSTURE_HOLD_KP,
-        # joint_posture_hold_damping=_SLIDE_JOINT_POSTURE_HOLD_KD,
-        motion_stiffness_limits_per_axis=_ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS,
-        task_position_box_enabled=True,
-        push_axis_world=PUSH_AXIS_WORLD,
-        lateral_axis_world= _LATERAL_AXIS_WORLD,
-        vertical_axis_world=(0.0, 0.0, 1.0),
-        lateral_half_range_m=_SLIDE_EE_LATERAL_HALF_RANGE_M,
-        vertical_half_range_m=_SLIDE_EE_VERTICAL_HALF_RANGE_M,
-        # push_offset_min_m=_SLIDE_EE_PUSH_OFFSET_MIN_M,
-        # push_offset_max_m=_SLIDE_EE_PUSH_OFFSET_MAX_M,
+        preserve_order=True,
+        # p_abs + integrated setpoint: the target is latched to the reset posture and nudged by the
+        # policy deltas, so K(setpoint - q) actively holds the arm's height.  p_rel gave a zero
+        # stiffness term at Δq≈0 (error re-references the live pose each substep) -> the gripper
+        # drooped, held only by (arm-only) gravity comp.
+        command_type="p_abs",
+        impedance_mode="variable",
+        position_scale=_SLIDE_VIC_POSITION_SCALE,
+        stiffness_limits=_SLIDE_VIC_STIFFNESS_LIMITS,
+        damping_ratio_limits=_SLIDE_VIC_DAMPING_RATIO_LIMITS,
+        default_stiffness=_SLIDE_VIC_DEFAULT_STIFFNESS,
+        default_damping_ratio=_SLIDE_VIC_DEFAULT_DAMPING_RATIO,
+        # Cap integrated setpoint drift from the live pose to avoid wind-up when contact blocks
+        # the arm mid-push (still lets it build a few cm of push travel / force).
+        max_setpoint_deviation=_SLIDE_VIC_MAX_SETPOINT_DEV,
+        # Controller adds the mass-matrix gravity term directly in joint space (far more
+        # accurate than the OSC Jacobian estimate), so the arm holds posture without droop
+        # and K/ζ are free to shape the push compliance.
+        gravity_compensation=True,
     )
 
 
@@ -1260,8 +1183,17 @@ class RewardsApproachCfg():
 class RewardsSlideCfg:
     """Phase 2 (Slide): +Y push from straddle terminal states into the magazine slot."""
 
-    action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.002)
+    # action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.002)
 
+    # Per-step time penalty: previously holding the straddle pose farmed ~30-80/step of static
+    # state-reward with zero termination risk, so "freeze and survive" beat the risky push.
+    # This makes every non-terminal step cost a little, so positive return REQUIRES forward
+    # progress / success.  Raise toward -20/-25 if the policy still freezes (watch that it does
+    # NOT start dropping the PCB early to escape the penalty — if so, add a failure penalty).
+    # alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-12.0)
+
+    # Static straddle-quality shaping trimmed 10 -> 4: still points the grip at the trailing
+    # edge, but no longer a large guaranteed payout for standing still.
     straddle_hold = RewardTermCfg(
         func=straddle_finger_trailing_width_proximity,
         params=_slide_straddle_hold_params(),
@@ -1271,7 +1203,7 @@ class RewardsSlideCfg:
     lateral_gap = RewardTermCfg(
         func=straddle_lateral_gap_shaping,
         params=_approach_lateral_gap_params(),
-        weight=10.0,
+        weight=4.0,
     )
 
     # Ungated: credit any +Y leading-edge progress / push-axis speed (no closedness gate).
@@ -1299,6 +1231,10 @@ class RewardsSlideCfg:
         },
         weight=300.0,
     )
+    # Absolute distance-to-goal reward: pays every step just for BEING near the goal, so it was
+    # a large static farm.  The +Y gradient toward the goal is already covered by the delta-based
+    # leading_edge_push_progress (500) and the milestone bonuses, so this is cut 50 -> 10 and
+    # kept only as a mild terminal-approach shaping.
     goal_lead_proximity = RewardTermCfg(
         func=pcb_leading_edge_insertion_proximity_reward,
         params={
@@ -1307,12 +1243,12 @@ class RewardsSlideCfg:
             "target_lead_xyz_env": _SLIDE_GOAL_LEAD_XYZ_ENV,
             "sigma_m": 0.12,
         },
-        weight=50.0,
+        weight=10.0,
     )
     pcb_yaw_alignment = RewardTermCfg(
         func=slide_pcb_yaw_xy_alignment_shaping,
         params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=10.0,
+        weight=4.0,
     )
     
     slide_success_bonus = RewardTermCfg(
@@ -1513,7 +1449,7 @@ class TerminationsSlideCfg(TerminationsSharedCfg):
 class _WidowXPcbEnvCfgBase(ManagerBasedRLEnvCfg):
     """Shared scene, actions, observations, and simulation for all task variants."""
 
-    scene: WidowXPcbSceneCfg = WidowXPcbSceneCfg(num_envs=2048, env_spacing=1.5)
+    scene: WidowXPcbSceneCfg = WidowXPcbSceneCfg(num_envs=2048, env_spacing=1.0)
     observations: ObservationsCfg = ObservationsCfg()
     # actions: ActionsCfg = ActionsCfg()
     sim: sim_utils.SimulationCfg = sim_utils.SimulationCfg(
@@ -1542,7 +1478,7 @@ class _WidowXPcbEnvCfgBase(ManagerBasedRLEnvCfg):
             # and many parallel envs. Overflow drops contacts (PCB tunnels / floats).
             gpu_max_rigid_contact_count=2**23,
             gpu_max_rigid_patch_count=2**20,
-            gpu_collision_stack_size=2**29,  # ~512 MB; log asked for ~443 MB at 4096 envs
+            gpu_collision_stack_size=2**30,  # ~512 MB; log asked for ~443 MB at 4096 envs
         ),
     )
 

@@ -144,7 +144,10 @@ WidowXPcbSlidePPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            "clip_actions": 0.25,
+            # Raised 0.25 -> 0.5: at 0.25 the policy could reach only ~mid-range Δpose targets and
+            # stiffness, starving the +Y push authority.  With the stiffness floors added in the env
+            # cfg the arm stays firm, so a wider clip gives real forward-push headroom.
+            "clip_actions": 0.5,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -160,9 +163,9 @@ WidowXPcbSlidePPOCfg = {
             **WidowXPcbPPOBaseCfg["params"]["config"],
             "name": "widowx_pcb_slide",
             "full_experiment_name": ".",
-            "reward_shaper": {"scale_value": 0.25},
+            "reward_shaper": {"scale_value": 1.0},
             "use_diagnostics": False,
-            "entropy_coef": 1e-2,
+            "entropy_coef": 3e-2,
             "max_epochs": 100,
             "horizon_length": 256,
             "mini_epochs": 8,

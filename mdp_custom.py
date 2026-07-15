@@ -107,6 +107,16 @@ class JointVariableImpedanceAction(ActionTerm):
             device=self.device,
             dtype=torch.float32,
         )
+        # Absolute posture setpoint (p_abs): latched to the joint pose at reset, then nudged by the
+        # policy's scaled position deltas.  This gives K a real anchor so the arm actively holds its
+        # height (no droop), unlike p_rel where the error re-references the current pose every substep
+        # and the stiffness term vanishes at Delta q = 0.
+        self._pos_setpoint = torch.zeros(self.num_envs, self._num_joints, device=self.device)
+        self._setpoint_initialized = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._dof_pos_limits = dof_limits  # (num_envs, num_joints, 2)
+        self._max_setpoint_dev = (
+            None if cfg.max_setpoint_deviation is None else float(cfg.max_setpoint_deviation)
+        )
 
     @property
     def stiffness_cmd(self) -> torch.Tensor:
@@ -180,8 +190,28 @@ class JointVariableImpedanceAction(ActionTerm):
         n = self._num_joints
         pos_a = actions[:, :n].clamp(-1.0, 1.0)
         stiff_a = actions[:, n : 2 * n].clamp(-1.0, 1.0)
-        pos_cmd = pos_a * self._pos_scale
+        pos_delta = pos_a * self._pos_scale
         stiff_cmd = self._map_symmetric_to_range(stiff_a, self._stiffness_min, self._stiffness_span)
+        if self.cfg.command_type == "p_abs":
+            # Latch the setpoint to the current (reset) posture the first control step after a reset,
+            # then integrate the policy deltas.  Clamp to soft joint limits and (optionally) to a max
+            # deviation from the live pose to avoid integral wind-up when contact blocks the arm.
+            cur_q = self._asset.data.joint_pos[:, self._joint_ids]
+            new_env = ~self._setpoint_initialized
+            if bool(new_env.any()):
+                self._pos_setpoint[new_env] = cur_q[new_env]
+                self._setpoint_initialized[new_env] = True
+            self._pos_setpoint += pos_delta
+            if self._max_setpoint_dev is not None:
+                self._pos_setpoint.clamp_(
+                    cur_q - self._max_setpoint_dev, cur_q + self._max_setpoint_dev
+                )
+            self._pos_setpoint.clamp_(
+                self._dof_pos_limits[..., 0], self._dof_pos_limits[..., 1]
+            )
+            pos_cmd = self._pos_setpoint
+        else:
+            pos_cmd = pos_delta
         self._command_buf[:, :n] = pos_cmd
         self._command_buf[:, n : 2 * n] = stiff_cmd
         if self._blocks == 3:
@@ -206,12 +236,14 @@ class JointVariableImpedanceAction(ActionTerm):
             self._processed_actions[:] = 0.0
             self._stiffness_cmd[:] = float(self.cfg.default_stiffness)
             self._damping_ratio_cmd[:] = float(self.cfg.default_damping_ratio)
+            self._setpoint_initialized[:] = False
         else:
             ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
             self._raw_actions[ids] = 0.0
             self._processed_actions[ids] = 0.0
             self._stiffness_cmd[ids] = float(self.cfg.default_stiffness)
             self._damping_ratio_cmd[ids] = float(self.cfg.default_damping_ratio)
+            self._setpoint_initialized[ids] = False
         self._controller.reset_idx(
             None if env_ids is None else torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         )
@@ -323,6 +355,11 @@ class JointVariableImpedanceActionCfg(ActionTermCfg):
     default_stiffness: float = 60.0
     default_damping_ratio: float = 1.0
     gravity_compensation: bool = False
+    max_setpoint_deviation: float | None = None
+    """(``p_abs`` only) Clamp the integrated setpoint to ±this many rad around the live joint pose.
+
+    Prevents integral wind-up when contact blocks the arm during the push.  ``None`` = no cap
+    (only soft joint limits apply)."""
 
 
 class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
