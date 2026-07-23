@@ -400,6 +400,23 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
             self._task_push_axis_w = self._unit_axis_tensor(cfg.push_axis_world, self.device)
             self._task_lateral_axis_w = self._unit_axis_tensor(cfg.lateral_axis_world, self.device)
             self._task_vertical_axis_w = self._unit_axis_tensor(cfg.vertical_axis_world, self.device)
+        # Cumulative axis-angle rotation (small-angle, additive) commanded since the last reset,
+        # per task rotation axis (rx, ry, rz).  With ``pose_rel`` the per-step target is always
+        # "current + delta" -- there is no absolute orientation anchor, so a persistent policy
+        # bias (or unlucky exploration) can walk the roll/yaw target arbitrarily far over an
+        # episode with nothing pulling it back (unlike stiffness, which only resists *sudden*
+        # deviation from the *current* target, not slow drift).  This buffer tracks that sum so
+        # ``_clamp_pose_rel_rotation_box`` can cap it, the rotational analogue of
+        # ``task_position_box_enabled`` above.
+        self._cum_rot_vec = torch.zeros(self.num_envs, 3, device=self.device)
+        self._home_q: torch.Tensor | None = None
+        if getattr(cfg, "use_home_joint_posture_hold", False):
+            home_map = cfg.home_joint_pos or {}
+            home_vec = torch.zeros(self._num_DoF, device=self.device)
+            for i, name in enumerate(self._joint_names):
+                if name in home_map:
+                    home_vec[i] = float(home_map[name])
+            self._home_q = home_vec.unsqueeze(0)
 
     @staticmethod
     def _unit_axis_tensor(axis: Sequence[float], device: torch.device | None = None) -> torch.Tensor:
@@ -443,6 +460,27 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         delta_b_new = math_utils.quat_apply(math_utils.quat_inv(base_quat), delta_w_new)
         self._processed_actions[:, idx : idx + 3] = delta_b_new
 
+    def _clamp_pose_rel_rotation_box(self) -> None:
+        """Clamp cumulative axis-angle rotation (per component) to ``±orientation_max_dev_rad``.
+
+        Small-angle additive approximation: tracks ``sum(delta)`` per rotation component in
+        ``self._cum_rot_vec`` and clamps it, back-solving the per-step delta that would produce
+        the clamped sum.  This is not exact SO(3) composition, but per-step deltas here are small
+        (``orientation_scale`` × ``clip_actions`` ≈ a few degrees), so the approximation holds well
+        over the angular range (~±15-20°) this is meant to bound.  Purpose: stop roll/yaw from
+        silently integrating far off level over an episode when nothing else corrects it early
+        (see ``task_orientation_box_enabled`` docstring on the cfg).
+        """
+        if self._pose_rel_idx is None:
+            return
+        idx = self._pose_rel_idx
+        delta = self._processed_actions[:, idx + 3 : idx + 6]
+        prospective = self._cum_rot_vec + delta
+        max_dev = float(self.cfg.orientation_max_dev_rad)
+        clamped = prospective.clamp(-max_dev, max_dev)
+        self._processed_actions[:, idx + 3 : idx + 6] = clamped - self._cum_rot_vec
+        self._cum_rot_vec[:] = clamped
+
     def _arm_joint_reference(self) -> torch.Tensor | None:
         """Buffer straddle joint targets stored at slide reset (``_slide_reset_joint_pos``)."""
         env = self._env
@@ -475,6 +513,15 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         kp = float(self.cfg.joint_posture_hold_stiffness)
         kd = float(self.cfg.joint_posture_hold_damping)
         return kp * (q_ref - self._joint_pos) - kd * self._joint_vel
+
+    def _home_posture_hold_torques(self) -> torch.Tensor | None:
+        """Additive joint PD toward a fixed ``home_joint_pos`` (regulates the null space that
+        Isaac Lab's OSC ``nullspace_control`` cannot reach on a 6-DoF arm; see cfg docstring)."""
+        if self._home_q is None:
+            return None
+        kp = float(self.cfg.home_joint_posture_hold_stiffness)
+        kd = float(self.cfg.home_joint_posture_hold_damping)
+        return kp * (self._home_q - self._joint_pos) - kd * self._joint_vel
 
     def _nullspace_joint_target(self) -> torch.Tensor | None:
         """Per-env nullspace joint target (requires >6 arm joints in Isaac Lab OSC)."""
@@ -514,6 +561,9 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         tau_hold = self._joint_posture_hold_torques()
         if tau_hold is not None:
             self._joint_efforts[:] = self._joint_efforts + tau_hold
+        tau_home = self._home_posture_hold_torques()
+        if tau_home is not None:
+            self._joint_efforts[:] = self._joint_efforts + tau_home
         self._asset.set_joint_effort_target(self._joint_efforts, joint_ids=self._joint_ids)
 
     def _preprocess_actions(self, actions: torch.Tensor) -> None:
@@ -564,6 +614,15 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
             )
         if getattr(self.cfg, "task_position_box_enabled", False):
             self._clamp_pose_rel_to_reset_position_box()
+        if getattr(self.cfg, "task_orientation_box_enabled", False):
+            self._clamp_pose_rel_rotation_box()
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self._cum_rot_vec[:] = 0.0
+        else:
+            ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            self._cum_rot_vec[ids] = 0.0
 
 
 @configclass
@@ -580,11 +639,39 @@ class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
     """Additive joint PD toward ``_slide_reset_joint_pos`` (slide straddle hold on 6-DoF arm)."""
     joint_posture_hold_stiffness: float = 120.0
     joint_posture_hold_damping: float = 8.0
+    use_home_joint_posture_hold: bool = False
+    """Additive joint PD toward a fixed ``home_joint_pos`` target (any name/count of arm joints).
+
+    A 6-DoF arm doing < 6-DoF task-space control (e.g. translation-only) has uncontrolled
+    null-space DOF that Isaac Lab's OSC ``nullspace_control`` cannot regulate (it requires > 6
+    joints).  Jacobian-TRANSPOSE motion control is also not a minimum-norm IK solve, so those
+    null-space joints (typically the shoulder, which carries the largest lever arm / gravity
+    torque) can be driven to extreme values purely as a side-effect of reaching a translation
+    target, independent of (and not fixed by) gravity compensation.  This adds a light joint-space
+    spring-damper toward ``home_joint_pos`` to keep the arm's posture sane without fighting the
+    primary task (keep the gains well below the task-space stiffness).
+    """
+    home_joint_pos: dict[str, float] | None = None
+    home_joint_posture_hold_stiffness: float = 15.0
+    home_joint_posture_hold_damping: float = 3.0
     stiffness_action_floor: float = 0.0
     """Remap policy K block from [-1,1] to [floor,1] before physical limits."""
     damping_action_floor: float = 0.0
     task_position_box_enabled: bool = False
     """Clamp cumulative EE offset from ``_slide_reset_ee_pos_w`` (world frame)."""
+    task_orientation_box_enabled: bool = False
+    """Clamp cumulative commanded rotation (per axis-angle component) since the last reset.
+
+    With ``target_types=["pose_rel"]`` the per-step orientation target is always "current +
+    delta" -- there is no absolute anchor, so the impedance spring only resists a *sudden* jump
+    away from the *current* running target, not a slow, persistent drift of that target itself.
+    A policy that (even slightly) over-rotates one rotation axis on average will walk the
+    commanded orientation arbitrarily far off level over an episode, independent of stiffness.
+    This caps that drift to ``±orientation_max_dev_rad`` per component (rx, ry, rz in the task
+    frame) -- the rotational analogue of ``task_position_box_enabled``.
+    """
+    orientation_max_dev_rad: float = 0.26
+    """Max cumulative rotation (rad, ≈15°) per axis-angle component when the box is enabled."""
     push_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0)
     lateral_axis_world: tuple[float, float, float] = (1.0, 0.0, 0.0)
     vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -2768,6 +2855,12 @@ def _approach_gripper_debug_accumulate_all(
         width_sigma_m=width_sigma_m,
         gripper_joint_cfg=gripper_joint_cfg,
         tip_offset_m=tip_offset_m,
+        # Without width-gap targets the graspable gate falls back to Z-straddle (opposite
+        # thickness faces).  Open-jaw trailing-edge approach keeps both pads at mid-thickness,
+        # so that gate is almost always False and between_fingers_q stays ~0.  Pass the same
+        # ±width targets as closedness so the metric uses the width-straddle path.
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
     )
     push_step = pcb_leading_edge_push_axis_approach_progress(
         env, pcb_cfg, half_length_m, axis_world, max_step_m, update_prev=False
@@ -3748,6 +3841,37 @@ def straddle_finger_target_closedness(
     left_q = 1.0 - torch.tanh(lfinger_dist / sig)
     right_q = 1.0 - torch.tanh(rfinger_dist / sig)
     return torch.minimum(left_q, right_q)
+
+
+def gripper_jaw_tips_level_reward(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    std_m: float = 0.004,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+) -> torch.Tensor:
+    """Keep left/right pad tips at the same height along the PCB thickness axis (anti-roll).
+
+    This is **not** pitch.  Pitch tips both jaws up/down together; roll (rotation about the push
+    axis) is what makes one tip sit on the PCB top face and the other under the bottom.  Returns
+    ``1 - tanh(|proj(right-left, pcb_z)| / std)`` in ``[0, 1]`` — peaks when the jaw axis is
+    parallel to the board plane (zero thickness separation between the two tips).
+    """
+    left, right = gripper_jaw_pad_tips_world(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    z_w = pcb_body_axis_z_world(env, pcb_cfg)
+    thick_sep = torch.abs(torch.sum((right - left) * z_w, dim=-1))
+    sig = float(std_m) + 1e-9
+    return 1.0 - torch.tanh(thick_sep / sig)
 
 
 def straddle_tip_mid_thickness_shaping(
@@ -5027,6 +5151,24 @@ def pcb_push_axis_displacement_penalty(
     y_env = pcb.data.root_pos_w[:, 1] - env.scene.env_origins[:, 1]
     dy = y_env - float(initial_y_env)
     return torch.clamp(dy - float(max_displacement_m), min=0.0)
+
+
+def pcb_forward_push_displacement_indicator(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    initial_y_env: float,
+    max_displacement_m: float = 0.005,
+) -> torch.Tensor:
+    """Binary 1.0 when the PCB has been pushed +Y past ``max_displacement_m`` from spawn.
+
+    Approach must straddle the trailing edge **without** sliding the board toward the magazine.
+    Pair with a **negative** weight (e.g. -50) for a flat per-step penalty while the board
+    remains forward of the allowed tolerance.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    y_env = pcb.data.root_pos_w[:, 1] - env.scene.env_origins[:, 1]
+    dy = y_env - float(initial_y_env)
+    return (dy > float(max_displacement_m)).to(dtype=y_env.dtype)
 
 
 def pcb_x_displacement_penalty(

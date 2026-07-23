@@ -12,6 +12,15 @@ if [[ ! -f "${TRAIN_PY}" ]]; then
   exit 1
 fi
 
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON="${CONDA_PREFIX}/bin/python"
+elif [[ -x "${HOME}/miniconda3/envs/isaac-sim/bin/python" ]]; then
+  PYTHON="${HOME}/miniconda3/envs/isaac-sim/bin/python"
+else
+  PYTHON="python3"
+fi
+
 cd "${WORKSPACE_DIR}"
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_approach/"
-exec python "${TRAIN_PY}" --task Isaac-WidowX-PCB-Approach-v0 "$@"
+echo "[INFO] Python:         ${PYTHON}"
+exec "${PYTHON}" "${TRAIN_PY}" --task Isaac-WidowX-PCB-Approach-v0 "$@"

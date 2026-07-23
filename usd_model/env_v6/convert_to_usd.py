@@ -3,9 +3,9 @@
 Convert env_v6 URDF (assembly_6) to an IsaacSim-compatible USDA kinematic fixture.
 
 Material + physics settings:
-  SteelMaterial   — magazine body            mu_s 0.50  contactOffset 0.0001  restOffset 0.0001
+  SteelMaterial   — magazine body (incl. slot)  mu_s 0.80  contactOffset 0.0001  restOffset 0.0001
   RailMaterial    — guide-rail bars (Part_1_7.stl)  mu_s 0.10
-  BeltMaterial    — side conveyor belts (Part_1_2.stl)  mu_s 0.65
+  BeltMaterial    — side conveyor belts (Part_1_2.stl)  mu_s 0.90
   StandMaterial   — stand + frame            mu_s 0.50
 
 Collision approximations:
@@ -456,12 +456,12 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
     # -----------------------------------------------------------------------
     # Materials
     #
-    # SteelMaterial (magazine): mu_s 0.50 — enough grip to not slide; not so high
-    #   as to prevent the fine PCB sliding in. contactOffset / restOffset on
-    #   the mesh prim (not material) control slot clearance.
-    # RailMaterial (Part_1_7): mu_s 0.10 — smooth rail for PCB to slide along.
-    # BeltMaterial (Part_1_2): mu_s 0.65 — rubber-like grip on conveyor surface.
-    # StandMaterial (frame): mu_s 0.50.
+    # SteelMaterial (magazine, incl. slot walls): mu_s 0.80 — raised from 0.50 so the PCB
+    #   feels real resistance sliding into/through the slot (combine mode is "multiply" with
+    #   the PCB's own 0.7/0.5, so effective friction is still < these face values).
+    # RailMaterial (Part_1_7): mu_s 0.10 — smooth rail for PCB to slide along (unchanged).
+    # BeltMaterial (Part_1_2): mu_s 0.90 — raised from 0.65, rubber-like grip on conveyor.
+    # StandMaterial (frame): mu_s 0.50 (unchanged, decorative contact only).
     #
     # Gripper (carriage) friction is configured in widowx_pcb_env_cfg.py via
     #   _GRIPPER_FINGER_STATIC_FRICTION / _GRIPPER_FINGER_DYNAMIC_FRICTION
@@ -475,13 +475,13 @@ def create_usd(urdf_path: str, meshes_dir: str, output_path: str):
         name="SteelMaterial", root=root_path,
         r=0.55, g=0.57, b=0.60,
         roughness=0.30, metallic=0.88,
-        static_friction=0.50, dynamic_friction=0.38, restitution=0.01,
+        static_friction=0.80, dynamic_friction=0.60, restitution=0.01,
     )
     belt_mat = MATERIAL_TEMPLATE.format(
         name="BeltMaterial", root=root_path,
         r=0.10, g=0.10, b=0.11,
         roughness=0.88, metallic=0.0,
-        static_friction=0.65, dynamic_friction=0.50, restitution=0.01,
+        static_friction=0.90, dynamic_friction=0.70, restitution=0.01,
     )
     rail_mat = MATERIAL_TEMPLATE.format(
         name="RailMaterial", root=root_path,

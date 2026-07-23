@@ -21,8 +21,8 @@ def Xform "PCB_Env" (
         )
         {
             token outputs:surface.connect = </PCB_Env/Looks/SteelMaterial/Shader.outputs:surface>
-            float physics:staticFriction    = 0.5000
-            float physics:dynamicFriction   = 0.3800
+            float physics:staticFriction    = 0.8000
+            float physics:dynamicFriction   = 0.6000
             float physics:restitution       = 0.0100
             uniform token physxMaterial:frictionCombineMode     = "multiply"
             uniform token physxMaterial:restitutionCombineMode  = "multiply"
@@ -42,8 +42,8 @@ def Xform "PCB_Env" (
         )
         {
             token outputs:surface.connect = </PCB_Env/Looks/BeltMaterial/Shader.outputs:surface>
-            float physics:staticFriction    = 0.6500
-            float physics:dynamicFriction   = 0.5000
+            float physics:staticFriction    = 0.9000
+            float physics:dynamicFriction   = 0.7000
             float physics:restitution       = 0.0100
             uniform token physxMaterial:frictionCombineMode     = "multiply"
             uniform token physxMaterial:restitutionCombineMode  = "multiply"

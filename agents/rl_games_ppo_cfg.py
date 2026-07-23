@@ -77,7 +77,7 @@ WidowXPcbPPOBaseCfg = {
             "score_to_win": 20000,
             "max_epochs": 200,
             "save_best_after": 20,
-            "save_frequency": 15,
+            "save_frequency": 10,
             "print_stats": True,
             
             # 미니배치 및 최적화 설정
@@ -109,8 +109,9 @@ WidowXPcbApproachPPOCfg = {
         **WidowXPcbPPOBaseCfg["params"],
         "env": {
             **WidowXPcbPPOBaseCfg["params"]["env"],
-            # Task-space OSC: smaller Δxyz; orientation axes locked in env cfg.
-            "clip_actions": 0.20,
+            # Task-space OSC: Δxyz / Δrpy.  Raised 0.20 → 0.25 so exploration can leave the
+            # reset pose (with pose_rel, clip×position_scale caps per-step EE travel).
+            "clip_actions": 0.25,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -128,7 +129,7 @@ WidowXPcbApproachPPOCfg = {
             "name": "widowx_pcb_approach",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
-            "max_epochs": 60,
+            "max_epochs": 240,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
@@ -147,7 +148,7 @@ WidowXPcbSlidePPOCfg = {
             # Raised 0.25 -> 0.5: at 0.25 the policy could reach only ~mid-range Δpose targets and
             # stiffness, starving the +Y push authority.  With the stiffness floors added in the env
             # cfg the arm stays firm, so a wider clip gives real forward-push headroom.
-            "clip_actions": 0.5,
+            "clip_actions": 0.2,
         },
         "network": {
             **WidowXPcbPPOBaseCfg["params"]["network"],
@@ -165,7 +166,7 @@ WidowXPcbSlidePPOCfg = {
             "full_experiment_name": ".",
             "reward_shaper": {"scale_value": 1.0},
             "use_diagnostics": False,
-            "entropy_coef": 3e-2,
+            "entropy_coef": 1e-2,
             "max_epochs": 100,
             "horizon_length": 256,
             "mini_epochs": 8,
