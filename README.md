@@ -28,7 +28,7 @@ Legacy Grasp → Slide → Insert chaining scripts/configs may still exist in th
 | `__init__.py` | Registers `Isaac-WidowX-PCB-Approach-v0` (+ deprecated Straddle alias). |
 | `widowx_pcb_env_cfg.py` | Scene, Approach rewards / events / terminations, geometry constants. |
 | `mdp_custom.py` | Geometry, push-gated rewards, debug curriculum, reset helpers. |
-| `usd_model/env_v6/` | `assembly_6.urdf` + `convert_to_usd.py` → **`pcb_insertion_env.usd`** (runtime fixture). |
+| `usd_model/env_v7/` | `assembly_1.urdf` + `convert_to_usd.py` → **`pcb_insertion_env.usd`** (runtime fixture). |
 | `usd_model/usd_robot/wxai/` | WidowX follower USD. |
 | `scripts/train_approach.sh` / `play_approach.sh` | Primary train / play entry points. |
 | `scripts/train_straddle.sh` / `play_straddle.sh` | Wrappers → push scripts. |
@@ -63,20 +63,6 @@ Deprecated alias:
 
 ```bash
 bash scripts/train_straddle.sh --num_envs 2048 --headless
-```
-
-If you previously trained under Isaac Lab root:
-
-```bash
-bash scripts/sync_logs_from_isaaclab.sh
-```
-
-Alternative (logs under `<IsaacLab>/logs/`):
-
-```bash
-cd /path/to/IsaacLab
-python scripts/reinforcement_learning/rl_games/train.py \
-  --task Isaac-WidowX-PCB-Push-v0 --num_envs 2048 --headless
 ```
 
 PPO knobs: `agents/rl_games_ppo_cfg.py` → `WidowXPcbApproachPPOCfg`  
@@ -152,19 +138,24 @@ Push credit is gated on **finger-target closedness** (same family as straddle ge
 
 ---
 
-## Fixture USD (`env_v6`)
+## Fixture USD (`env_v7`)
 
 Runtime asset loaded by the scene:
 
 ```text
-usd_model/env_v6/pcb_insertion_env.usd
+usd_model/env_v7/pcb_insertion_env.usd
 ```
 
 Regenerate after changing the converter:
 
 ```bash
-cd usd_model/env_v6 && python3 convert_to_usd.py
+cd usd_model/env_v7 && python3 convert_to_usd.py
 ```
+
+`env_v7` is the same Onshape assembly as `env_v6` (`usd_model/env_v6/`, now superseded), re-exported
+with the side rail-guides (`Part_1_4`, `Part_1_6`) thinned from 15 mm to 4 mm so the gripper
+jaw/carriage clears them mid-slide. All materials, friction, and contact/rest offsets are kept
+identical to `env_v6/convert_to_usd.py`.
 
 ### What is included / excluded
 
@@ -173,20 +164,20 @@ cd usd_model/env_v6 && python3 convert_to_usd.py
 | Magazine | Triangle-mesh collider (`physics:approximation = none`) |
 | Guide rails (`Part_1_7`) | Horizontal PCB support — triangle mesh |
 | Side belts (`Part_1_2`) | Triangle mesh |
+| Side rail-guides (`Part_1_4`, `Part_1_6`) | Tall posts beside conveyor, thinned to 4 mm (env_v7) — triangle mesh |
 | Stand / frame | `convexDecomposition` |
 
 | Excluded | Reason |
 |----------|--------|
 | Chip / PCB mesh | Spawned as a separate cuboid in the env |
 | Short axles (`Part_1_3`) | Decorative |
-| Raised side rail-guides (`Part_1_4`, `Part_1_6`) | Tall posts beside conveyor — removed so they do not block approach |
 
 Contact / rest offsets on fixture meshes default to **0.0001 m**.  
 PCB cuboid uses the same order of magnitude in `widowx_pcb_env_cfg.py`.
 
 ### Support height vs “floating” look
 
-- Side **belt** top is lower than guide **rail** tops in the `env_v6` assembly — the PCB rests on the **rails**, not the belt surface.
+- Side **belt** top is lower than guide **rail** tops in the `env_v7` assembly — the PCB rests on the **rails**, not the belt surface.
 - A few mm gap above the belt in the viewport is normal when the board is seated on the rails (not only `rest_offset`).
 - Spawn height is driven by `_CONVEYOR_SURFACE_Z` → `_PCB_CENTER_Z_ENV` in `widowx_pcb_env_cfg.py`. Align that with **rail support**, not the belt visual alone.
 

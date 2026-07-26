@@ -16,6 +16,14 @@ if [[ ! -f "${PLAY_PY}" ]]; then
   exit 1
 fi
 
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON="${CONDA_PREFIX}/bin/python"
+elif [[ -x "${HOME}/miniconda3/envs/isaac-sim/bin/python" ]]; then
+  PYTHON="${HOME}/miniconda3/envs/isaac-sim/bin/python"
+else
+  PYTHON="python3"
+fi
+
 has_checkpoint=false
 use_last=false
 has_num_envs=false
@@ -56,11 +64,21 @@ resolve_checkpoint() {
 
 cd "${WORKSPACE_DIR}"
 
+echo "[INFO] Python: ${PYTHON}"
 if [[ "${has_checkpoint}" == false ]]; then
   CKPT="$(resolve_checkpoint)"
   echo "[INFO] Checkpoint: ${CKPT}"
-  exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Slide-v0 "${PLAY_ARGS[@]}" --checkpoint "${CKPT}"
+  exec "${PYTHON}" "${PLAY_PY}" \
+    --task Isaac-WidowX-PCB-Slide-v0 \
+    "hydra.run.dir=/tmp/widowx_pcb_hydra" \
+    "hydra.output_subdir=null" \
+    "${PLAY_ARGS[@]}" \
+    --checkpoint "${CKPT}"
 else
   echo "[INFO] Checkpoint dir: ${CKPT_DIR}/"
-  exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Slide-v0 "${PLAY_ARGS[@]}"
+  exec "${PYTHON}" "${PLAY_PY}" \
+    --task Isaac-WidowX-PCB-Slide-v0 \
+    "hydra.run.dir=/tmp/widowx_pcb_hydra" \
+    "hydra.output_subdir=null" \
+    "${PLAY_ARGS[@]}"
 fi

@@ -27,14 +27,9 @@ done
 
 SLIDE_LOG_DIR="${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_slide"
 if [[ "${CLEAN_ALL}" -eq 1 ]]; then
-  OUTPUTS_DIR="${WORKSPACE_DIR}/outputs"
   if [[ -d "${SLIDE_LOG_DIR}" ]]; then
     echo "[INFO] Removing previous slide logs: ${SLIDE_LOG_DIR}"
     rm -rf "${SLIDE_LOG_DIR}"
-  fi
-  if [[ -d "${OUTPUTS_DIR}" ]]; then
-    echo "[INFO] Removing Hydra outputs: ${OUTPUTS_DIR}"
-    rm -rf "${OUTPUTS_DIR}"
   fi
 elif [[ "${CLEAN_TENSORBOARD}" -eq 1 ]]; then
   SUMMARIES_DIR="${SLIDE_LOG_DIR}/summaries"
@@ -89,4 +84,6 @@ echo "[INFO] Python:         ${PYTHON}"
 
 "${PYTHON}" "${TRAIN_PY}" \
   --task Isaac-WidowX-PCB-Slide-v0 \
+  "hydra.run.dir=/tmp/widowx_pcb_hydra" \
+  "hydra.output_subdir=null" \
   "${TRAIN_ARGS[@]}"

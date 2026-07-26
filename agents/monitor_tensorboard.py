@@ -107,7 +107,6 @@ def _print_cwd_hint() -> None:
         return
     print("[HINT] Train with scripts/train_approach.sh / train_slide.sh / train_insert.sh")
     print("       so logs land in ./logs/rl_games/ (this workspace).")
-    print("       To copy existing Isaac Lab logs: bash scripts/sync_logs_from_isaaclab.sh")
     print()
 
 

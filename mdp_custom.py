@@ -492,15 +492,34 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         return ref_all[:, self._joint_ids]
 
     def _map_stiffness_action(self, stiff_a: torch.Tensor) -> torch.Tensor:
+        """Remap raw [-1,1] action so the resulting K fraction-of-range is clamped to [floor, 1].
+
+        BUG FIX (2026-07-24): this used to return ``floor + (1-floor)*0.5*(a+1)`` directly, i.e. a
+        value already expressed as a *fraction of [0,1]*.  But the caller (``_preprocess_actions``)
+        feeds this straight back into the SAME ``lo + 0.5*(x+1)*span`` formula used for the
+        unfloored path, which expects ``x`` in **[-1, 1]**, not already a [0,1] fraction.  Passing a
+        [floor,1] value through ``0.5*(x+1)`` a second time silently squashed the *effective* floor
+        to ``floor + (1-floor)*0.5`` (e.g. floor=0.5 actually enforced a minimum of 75% of the K
+        range, not 50%) -- on EVERY task axis, including the ones deliberately tuned "soft"
+        (tz/rx/ry in Slide). That meant the policy could never actually command a soft touch: every
+        contact (including light exploratory ones) landed near-max stiffness, which for a ~100g PCB
+        is enough to launch it on first contact ("PCB flies forward when pushed" symptom). Fix:
+        return the value in the SAME [-1,1] domain the downstream formula expects, by pre-applying
+        the inverse of that formula so the two compositions cancel out to exactly ``[floor, 1]``
+        fraction-of-range.
+        """
         floor = float(getattr(self.cfg, "stiffness_action_floor", 0.0) or 0.0)
         if floor > 0.0:
-            stiff_a = floor + (1.0 - floor) * 0.5 * (stiff_a + 1.0)
+            frac = floor + (1.0 - floor) * 0.5 * (stiff_a + 1.0)  # fraction-of-range in [floor, 1]
+            stiff_a = 2.0 * frac - 1.0  # back to [-1, 1] so the caller's 0.5*(x+1) recovers `frac`
         return stiff_a
 
     def _map_damping_action(self, damp_a: torch.Tensor) -> torch.Tensor:
+        """See ``_map_stiffness_action`` bug-fix note -- identical issue, identical fix."""
         floor = float(getattr(self.cfg, "damping_action_floor", 0.0) or 0.0)
         if floor > 0.0:
-            damp_a = floor + (1.0 - floor) * 0.5 * (damp_a + 1.0)
+            frac = floor + (1.0 - floor) * 0.5 * (damp_a + 1.0)
+            damp_a = 2.0 * frac - 1.0
         return damp_a
 
     def _joint_posture_hold_torques(self) -> torch.Tensor | None:
@@ -1187,6 +1206,75 @@ def gripper_wrist_carriage_target_pitch_shaping(
     sigma_z = max(float(np.sin(np.radians(pitch_sigma_deg))), 1e-6)
     pitch_q = torch.exp(-torch.abs(z_abs - target_z) / sigma_z)
     return yaw * pitch_q
+
+
+def gripper_wrist_carriage_tip_down_pitch_shaping(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    target_pitch_down_deg: float = 20.0,
+    pitch_sigma_deg: float = 5.0,
+) -> torch.Tensor:
+    """Yaw alignment in XY plus a SIGNED, tip-DOWN-only target on wrist->jaw pitch.
+
+    ``gripper_wrist_carriage_target_pitch_shaping`` uses ``|u_wc_z|`` (absolute value), so it is
+    direction-agnostic: a wrist tilted UP (jaw above wrist) and one tilted DOWN by the same angle
+    (jaw below wrist) score identically. That ambiguity meant the policy had no actual incentive to
+    pick the tip-DOWN configuration needed to clear the rail guide, and converged to a near-flat
+    posture instead (see chat 2026-07-23 clearance discussion).
+
+    This variant uses the SIGNED z-component of the wrist->jaw unit vector (world frame, +Z up), so
+    ONLY jaw-below-wrist (tip-down) is rewarded. With world +Z up, ``u_wc_z`` is
+    ``-sin(pitch_down)`` when the jaw droops below the wrist by ``pitch_down`` degrees from
+    horizontal; credit peaks when ``u_wc_z`` reaches ``-sin(target_pitch_down_deg)`` and falls off
+    over a ``pitch_sigma_deg``-wide band (same shape as the unsigned version, just sign-locked).
+    """
+    yaw = gripper_wrist_carriage_yaw_align_axis(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        push_axis_world,
+    )
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return yaw
+
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
+    mid = 0.5 * (left + right)
+    u_wc = mid - wrist
+    u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
+    z_signed = u_wc[:, 2]
+    target_z = -float(np.sin(np.radians(target_pitch_down_deg)))
+    sigma_z = max(float(np.sin(np.radians(pitch_sigma_deg))), 1e-6)
+    pitch_q = torch.exp(-torch.abs(z_signed - target_z) / sigma_z)
+    return yaw * pitch_q
+
+
+def gripper_wrist_pitch_deg_signed_obs(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+) -> torch.Tensor:
+    """Debug scalar: signed wrist->jaw pitch in degrees (world +Z up; negative = tip-down).
+
+    Not part of the task reward on its own -- wire with a near-zero weight (like
+    ``approach_gripper_debug_monitor``) purely so TensorBoard shows the actual achieved pitch sign
+    and magnitude, to sanity-check ``gripper_wrist_carriage_tip_down_pitch_shaping`` convergence.
+    """
+    if wrist_body_cfg is None or len(wrist_body_cfg.body_ids) == 0:
+        return torch.zeros(env.num_envs, device=env.device, dtype=torch.float32)
+    robot = env.scene[left_finger_cfg.name]
+    wrist = robot.data.body_pos_w[:, wrist_body_cfg.body_ids[0]]
+    left, right = gripper_finger_tips_world(env, left_finger_cfg, right_finger_cfg)
+    mid = 0.5 * (left + right)
+    u_wc = mid - wrist
+    u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
+    return torch.asin(u_wc[:, 2].clamp(-1.0, 1.0)) * (180.0 / float(np.pi))
 
 
 def _gripper_belt_corridor_x_bounds_env(
@@ -1978,9 +2066,11 @@ def approach_success_bonus_reward(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    tip_mid_thickness_std: float | None = None,
+    tip_mid_thickness_threshold: float = 0.5,
     state_attr: str = "_approach_success_bonus_paid",
 ) -> torch.Tensor:
-    """One-shot bonus (1.0) the first time finger-target closedness crosses ``closedness_threshold``."""
+    """One-shot bonus (1.0) the first time :func:`approach_finger_target_success` is achieved."""
     if not hasattr(env, state_attr):
         setattr(env, state_attr, torch.zeros(env.num_envs, device=env.device, dtype=torch.bool))
     paid: torch.Tensor = getattr(env, state_attr)
@@ -2004,6 +2094,8 @@ def approach_success_bonus_reward(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        tip_mid_thickness_std=tip_mid_thickness_std,
+        tip_mid_thickness_threshold=tip_mid_thickness_threshold,
     )
     newly = achieved & (~paid)
     paid[:] = paid | achieved
@@ -4127,8 +4219,17 @@ def approach_finger_target_success(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    tip_mid_thickness_std: float | None = None,
+    tip_mid_thickness_threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Episode success when :func:`straddle_finger_target_closedness` ≥ ``closedness_threshold``."""
+    """Episode success when finger-target closedness AND tip mid-thickness index both clear their thresholds.
+
+    ``closedness`` (:func:`straddle_finger_target_closedness`) must be ``>= closedness_threshold``.
+    If ``tip_mid_thickness_std`` is given, the tip mid-thickness index
+    (:func:`straddle_tip_mid_thickness_shaping`, also in ``[0, 1]``) must additionally be
+    ``>= tip_mid_thickness_threshold``.  Leaving ``tip_mid_thickness_std=None`` reproduces the old
+    closedness-only behaviour.
+    """
     closedness = straddle_finger_target_closedness(
         env,
         std,
@@ -4143,7 +4244,24 @@ def approach_finger_target_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
     )
-    return closedness >= float(closedness_threshold)
+    achieved = closedness >= float(closedness_threshold)
+    if tip_mid_thickness_std is not None:
+        tip_mid_thickness = straddle_tip_mid_thickness_shaping(
+            env,
+            float(tip_mid_thickness_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+        )
+        achieved = achieved & (tip_mid_thickness >= float(tip_mid_thickness_threshold))
+    return achieved
 
 
 def straddle_finger_trailing_width_proximity(

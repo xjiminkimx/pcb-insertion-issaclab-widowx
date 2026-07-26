@@ -28,6 +28,14 @@ if [[ ! -f "${PLAY_PY}" ]]; then
   exit 1
 fi
 
+if [[ -n "${CONDA_PREFIX:-}" && -x "${CONDA_PREFIX}/bin/python" ]]; then
+  PYTHON="${CONDA_PREFIX}/bin/python"
+elif [[ -x "${HOME}/miniconda3/envs/isaac-sim/bin/python" ]]; then
+  PYTHON="${HOME}/miniconda3/envs/isaac-sim/bin/python"
+else
+  PYTHON="python3"
+fi
+
 has_checkpoint=false
 use_last=false
 for arg in "$@"; do
@@ -57,7 +65,7 @@ resolve_checkpoint() {
 }
 
 patch_approach_checkpoint() {
-  python - "${1}" <<'PY'
+  "${PYTHON}" - "${1}" <<'PY'
 import sys
 from agents.checkpoint_compat import ensure_approach_checkpoint_compatible
 
@@ -118,4 +126,9 @@ else
 fi
 
 echo "[INFO] Checkpoint dir: ${CKPT_DIR}/"
-exec python "${PLAY_PY}" --task Isaac-WidowX-PCB-Approach-v0 "${PLAY_ARGS[@]}"
+echo "[INFO] Python:         ${PYTHON}"
+exec "${PYTHON}" "${PLAY_PY}" \
+  --task Isaac-WidowX-PCB-Approach-v0 \
+  "hydra.run.dir=/tmp/widowx_pcb_hydra" \
+  "hydra.output_subdir=null" \
+  "${PLAY_ARGS[@]}"

@@ -32,7 +32,7 @@ from isaaclab.app import AppLauncher  # noqa: E402
 parser = argparse.ArgumentParser(description="Collect approach (straddle) terminal states.")
 parser.add_argument("--checkpoint", required=True, help="Path to trained Approach .pth checkpoint.")
 parser.add_argument("--num_envs", type=int, default=4096, help="Number of parallel environments.")
-parser.add_argument("--num_states", type=int, default=2000, help="Target number of states to collect.")
+parser.add_argument("--num_states", type=int, default=500, help="Target number of states to collect.")
 parser.add_argument(
     "--out",
     default=os.path.join(_WORKSPACE, "data", "approach_terminal_states.npz"),

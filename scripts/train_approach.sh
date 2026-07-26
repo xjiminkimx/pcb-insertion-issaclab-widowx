@@ -23,4 +23,8 @@ fi
 cd "${WORKSPACE_DIR}"
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_approach/"
 echo "[INFO] Python:         ${PYTHON}"
-exec "${PYTHON}" "${TRAIN_PY}" --task Isaac-WidowX-PCB-Approach-v0 "$@"
+exec "${PYTHON}" "${TRAIN_PY}" \
+  --task Isaac-WidowX-PCB-Approach-v0 \
+  "hydra.run.dir=/tmp/widowx_pcb_hydra" \
+  "hydra.output_subdir=null" \
+  "$@"
