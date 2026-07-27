@@ -400,6 +400,11 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
             self._task_push_axis_w = self._unit_axis_tensor(cfg.push_axis_world, self.device)
             self._task_lateral_axis_w = self._unit_axis_tensor(cfg.lateral_axis_world, self.device)
             self._task_vertical_axis_w = self._unit_axis_tensor(cfg.vertical_axis_world, self.device)
+        # Cumulative commanded EE translation (world frame) since the last reset.  Used by
+        # ``_clamp_pose_rel_to_reset_position_box`` to turn ``pose_rel`` into an absolute-from-reset
+        # target -- without this, gravity residual sinks the arm and the sunk pose becomes the new
+        # setpoint (the "쳐짐" ratchet).  See the method docstring.
+        self._cum_pos_w = torch.zeros(self.num_envs, 3, device=self.device)
         # Cumulative axis-angle rotation (small-angle, additive) commanded since the last reset,
         # per task rotation axis (rx, ry, rz).  With ``pose_rel`` the per-step target is always
         # "current + delta" -- there is no absolute orientation anchor, so a persistent policy
@@ -424,7 +429,24 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         return a / torch.norm(a).clamp_min(1e-9)
 
     def _clamp_pose_rel_to_reset_position_box(self) -> None:
-        """Clamp cumulative EE translation: lateral ±range, push long travel, vertical ±range."""
+        """Anchor ``pose_rel`` translation to the reset EE pose, then clamp the cumulative offset.
+
+        WHY THIS IS NOT A SIMPLE CLIP OF ``current + delta``: Isaac Lab's OSC with
+        ``target_types=["pose_rel"]`` sets ``desired = current_ee + delta`` every step.  Gravity-
+        compensation residual (and any soft-impedance droop) therefore sinks the arm AND the
+        setpoint together -- a ratchet.  The previous implementation computed
+        ``offset = current + delta - p0``, clamped that, and wrote ``delta = (p0 + offset) - current``.
+        With zero action that algebra reduces to ``delta = 0`` for every pose still *inside* the
+        box, so the arm free-falls until it hits the box floor (measured: -29 mm in 1.2 s with a
+        ±60 mm box; the image "쳐짐" is this continuing past the floor when the reset-pose event
+        was missing).  Stiffness cannot fix a ratchet whose target is the already-sunk pose.
+
+        FIX: treat the policy's scaled ``delta`` as an *increment to a cumulative absolute offset
+        from the reset pose* (same pattern as ``_cum_rot_vec`` for orientation).  Clamp that
+        cumulative offset along push / lateral / vertical, then set this step's ``delta`` so the
+        OSC target equals ``p0 + clamped_offset``.  Zero action then springs the EE back to the
+        reset pose; a sustained policy command walks the absolute setpoint within the box.
+        """
         if self._pose_rel_idx is None or self._task_push_axis_w is None:
             return
         env = self._env
@@ -439,14 +461,15 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         base_quat = self._asset.data.root_quat_w
         delta_w = math_utils.quat_apply(base_quat, delta_b)
 
-        offset_w = p_cur_w + delta_w - p0_w
+        # Accumulate the *policy* delta (before we overwrite it with the absolute correction).
+        prospective = self._cum_pos_w + delta_w
         push = self._task_push_axis_w.unsqueeze(0)
         lat = self._task_lateral_axis_w.unsqueeze(0)
         vert = self._task_vertical_axis_w.unsqueeze(0)
 
-        s_push = torch.sum(offset_w * push, dim=-1, keepdim=True)
-        s_lat = torch.sum(offset_w * lat, dim=-1, keepdim=True)
-        s_vert = torch.sum(offset_w * vert, dim=-1, keepdim=True)
+        s_push = torch.sum(prospective * push, dim=-1, keepdim=True)
+        s_lat = torch.sum(prospective * lat, dim=-1, keepdim=True)
+        s_vert = torch.sum(prospective * vert, dim=-1, keepdim=True)
 
         lat_lim = float(self.cfg.lateral_half_range_m)
         vert_lim = float(self.cfg.vertical_half_range_m)
@@ -455,31 +478,49 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         s_vert = s_vert.clamp(-vert_lim, vert_lim)
 
         offset_c = s_push * push + s_lat * lat + s_vert * vert
+        self._cum_pos_w[:] = offset_c
+        # Absolute target from reset; rewrite pose_rel delta so OSC desired = p_des.
         p_des_w = p0_w + offset_c
         delta_w_new = p_des_w - p_cur_w
         delta_b_new = math_utils.quat_apply(math_utils.quat_inv(base_quat), delta_w_new)
         self._processed_actions[:, idx : idx + 3] = delta_b_new
 
     def _clamp_pose_rel_rotation_box(self) -> None:
-        """Clamp cumulative axis-angle rotation (per component) to ``±orientation_max_dev_rad``.
+        """Anchor ``pose_rel`` orientation to the reset EE quat, then clamp the cumulative delta.
 
-        Small-angle additive approximation: tracks ``sum(delta)`` per rotation component in
-        ``self._cum_rot_vec`` and clamps it, back-solving the per-step delta that would produce
-        the clamped sum.  This is not exact SO(3) composition, but per-step deltas here are small
-        (``orientation_scale`` × ``clip_actions`` ≈ a few degrees), so the approximation holds well
-        over the angular range (~±15-20°) this is meant to bound.  Purpose: stop roll/yaw from
-        silently integrating far off level over an episode when nothing else corrects it early
-        (see ``task_orientation_box_enabled`` docstring on the cfg).
+        Same gravity/contact ratchet as translation: with ``desired = current ⊕ delta`` and zero
+        action, any wrist roll from coupling becomes the new setpoint.  Measured symptom after the
+        position-only absolute fix: EE tip Z settled (~-13 mm) but ``joint_4`` still drifted
+        +0.17 rad and the pads dropped another ~15 mm.  Fix mirrors the position box -- accumulate
+        an absolute axis-angle offset from the reset orientation, clamp per component, and rewrite
+        this step's rotational delta so the OSC target equals ``reset ⊕ cum``.
         """
         if self._pose_rel_idx is None:
             return
+        env = self._env
         idx = self._pose_rel_idx
         delta = self._processed_actions[:, idx + 3 : idx + 6]
         prospective = self._cum_rot_vec + delta
         max_dev = float(self.cfg.orientation_max_dev_rad)
         clamped = prospective.clamp(-max_dev, max_dev)
-        self._processed_actions[:, idx + 3 : idx + 6] = clamped - self._cum_rot_vec
         self._cum_rot_vec[:] = clamped
+
+        if not hasattr(env, "_slide_reset_ee_quat_w"):
+            # No reset quat stored -- fall back to relative (bounded) increments only.
+            self._processed_actions[:, idx + 3 : idx + 6] = clamped - (prospective - delta)
+            return
+
+        self._compute_ee_pose()
+        q0_w = env._slide_reset_ee_quat_w
+        p0_w = env._slide_reset_ee_pos_w if hasattr(env, "_slide_reset_ee_pos_w") else self._ee_pose_w[:, :3]
+        q_cur_w = self._ee_pose_w[:, 3:7]
+        # Desired orientation = reset ⊕ cum (same left-multiply convention as ``apply_delta_pose``).
+        zeros = torch.zeros(self.num_envs, 3, device=self.device, dtype=torch.float32)
+        delta_pose = torch.cat([zeros, clamped], dim=-1)
+        _, q_des_w = math_utils.apply_delta_pose(p0_w, q0_w, delta_pose)
+        # pose_rel rot delta such that ``quat_mul(δq, q_cur) = q_des``.
+        q_err = math_utils.quat_mul(q_des_w, math_utils.quat_inv(q_cur_w))
+        self._processed_actions[:, idx + 3 : idx + 6] = math_utils.axis_angle_from_quat(q_err)
 
     def _arm_joint_reference(self) -> torch.Tensor | None:
         """Buffer straddle joint targets stored at slide reset (``_slide_reset_joint_pos``)."""
@@ -638,9 +679,11 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
 
     def reset(self, env_ids: Sequence[int] | None = None) -> None:
         if env_ids is None:
+            self._cum_pos_w[:] = 0.0
             self._cum_rot_vec[:] = 0.0
         else:
             ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
+            self._cum_pos_w[ids] = 0.0
             self._cum_rot_vec[ids] = 0.0
 
 
@@ -677,7 +720,11 @@ class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
     """Remap policy K block from [-1,1] to [floor,1] before physical limits."""
     damping_action_floor: float = 0.0
     task_position_box_enabled: bool = False
-    """Clamp cumulative EE offset from ``_slide_reset_ee_pos_w`` (world frame)."""
+    """Anchor ``pose_rel`` translation to ``_slide_reset_ee_pos_w`` and clamp the cumulative offset.
+
+    See ``WidowXTaskSpaceImpedanceAction._clamp_pose_rel_to_reset_position_box``: this is what stops
+    the pose_rel gravity ratchet ("쳐짐").  Requires the ``store_reset_ee_pose`` reset event.
+    """
     task_orientation_box_enabled: bool = False
     """Clamp cumulative commanded rotation (per axis-angle component) since the last reset.
 
@@ -705,14 +752,18 @@ def store_slide_reset_ee_pose_w(
     env_ids: torch.Tensor,
     action_name: str = "arm_action",
 ) -> None:
-    """Record OSC EE world position at slide reset for cumulative translation box."""
+    """Record OSC EE world pose at reset for the absolute-from-reset position/orientation boxes."""
     term = get_task_space_impedance_action(env, action_name)
     if term is None:
         return
     term._compute_ee_pose()
     if not hasattr(env, "_slide_reset_ee_pos_w"):
         env._slide_reset_ee_pos_w = torch.zeros(env.num_envs, 3, device=env.device, dtype=torch.float32)
+    if not hasattr(env, "_slide_reset_ee_quat_w"):
+        env._slide_reset_ee_quat_w = torch.zeros(env.num_envs, 4, device=env.device, dtype=torch.float32)
+        env._slide_reset_ee_quat_w[:, 0] = 1.0
     env._slide_reset_ee_pos_w[env_ids] = term._ee_pose_w[env_ids, :3].clone()
+    env._slide_reset_ee_quat_w[env_ids] = term._ee_pose_w[env_ids, 3:7].clone()
 
 
 class RelativeJointPositionActionWithPosLimits(joint_actions.RelativeJointPositionAction):
@@ -4287,6 +4338,372 @@ def straddle_finger_trailing_width_proximity(
         right_finger_cfg,
         gripper_joint_cfg,
         half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+
+
+def approach_near_success_shaping_scale(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """Scale in ``[min_scale, 1]`` that fades dense shaping as tight closedness nears success.
+
+    Uses the same tight-σ closedness as the success termination.  Below ``fade_start`` the scale
+    is 1 (full shaping credit while approaching).  Between ``fade_start`` and ``fade_end`` it
+    linearly falls to ``min_scale``, so lingering near-success no longer farms more return than
+    terminating with the success bonus (the collapse mode seen around epoch 10 → 100).
+    """
+    closedness_tight = straddle_finger_target_closedness(
+        env,
+        success_std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    start = float(fade_start)
+    end = float(fade_end)
+    lo = float(min_scale)
+    if end <= start:
+        return torch.ones_like(closedness_tight)
+    t = ((closedness_tight - start) / (end - start)).clamp(0.0, 1.0)
+    return 1.0 - t * (1.0 - lo)
+
+
+def _apply_near_success_fade(
+    env: ManagerBasedRLEnv,
+    reward: torch.Tensor,
+    *,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    success_std: float,
+    fade_start: float,
+    fade_end: float,
+    min_scale: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    scale = approach_near_success_shaping_scale(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    return reward * scale
+
+
+def straddle_finger_trailing_width_proximity_fade_near_success(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """:func:`straddle_finger_trailing_width_proximity` with near-success shaping fade."""
+    reward = straddle_finger_trailing_width_proximity(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+
+
+def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    min_closedness: float = 0.3,
+    closedness_std: float = 0.10,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """:func:`straddle_tip_mid_thickness_shaping_gated` with near-success shaping fade."""
+    reward = straddle_tip_mid_thickness_shaping_gated(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        min_closedness=min_closedness,
+        closedness_std=closedness_std,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+
+
+def straddle_trailing_face_bounded_approach_reward_fade_near_success(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    approach_std_m: float,
+    overshoot_std_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    target_along_m: float = 0.0,
+    height_gate_std_m: float | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    finger_offset_m: float = 0.020,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """:func:`straddle_trailing_face_bounded_approach_reward` with near-success shaping fade."""
+    reward = straddle_trailing_face_bounded_approach_reward(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        approach_std_m,
+        overshoot_std_m,
+        target_along_m=target_along_m,
+        height_gate_std_m=height_gate_std_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+
+
+def pcb_between_gripper_fingers_fade_near_success(
+    env: ManagerBasedRLEnv,
+    proximity_sigma_m: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    width_sigma_m: float = 0.025,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    width_gap_sigma_m: float | None = None,
+    pcb_half_width_m: float | None = None,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    finger_offset_m: float = 0.020,
+) -> torch.Tensor:
+    """:func:`pcb_between_gripper_fingers` with near-success shaping fade."""
+    if gripper_joint_cfg is None:
+        raise ValueError("gripper_joint_cfg is required for near-success fade (tight closedness).")
+    reward = pcb_between_gripper_fingers(
+        env,
+        proximity_sigma_m,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        half_length_m,
+        pcb_half_thickness_m,
+        width_sigma_m=width_sigma_m,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        width_gap_sigma_m=width_gap_sigma_m,
+        pcb_half_width_m=pcb_half_width_m,
+        gripper_joint_cfg=gripper_joint_cfg,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+
+
+def straddle_lateral_gap_shaping_fade_near_success(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    width_gap_target_left_m: float,
+    width_gap_target_right_m: float,
+    width_gap_sigma_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    finger_offset_m: float = 0.020,
+) -> torch.Tensor:
+    """:func:`straddle_lateral_gap_shaping` with near-success shaping fade."""
+    reward = straddle_lateral_gap_shaping(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        width_gap_target_left_m,
+        width_gap_target_right_m,
+        width_gap_sigma_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+    )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
         finger_offset_m=finger_offset_m,
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,

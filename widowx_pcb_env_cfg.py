@@ -37,20 +37,22 @@ from .mdp_custom import (
     pcb_leading_edge_push_axis_approach_progress,
     pcb_push_axis_velocity_reward,
     action_rate_l2,
-    straddle_lateral_gap_shaping,
+    straddle_lateral_gap_shaping_fade_near_success,
     slide_success_bonus_reward,
     slide_leading_edge_travel_milestone_bonus,
-    straddle_tip_mid_thickness_shaping_gated,
+    straddle_tip_mid_thickness_shaping_gated_fade_near_success,
     gripper_jaw_tips_level_reward,
     gripper_wrist_carriage_tip_down_pitch_shaping,
     gripper_wrist_pitch_deg_signed_obs,
-    straddle_trailing_face_bounded_approach_reward,
+    straddle_trailing_face_bounded_approach_reward_fade_near_success,
+    straddle_finger_trailing_width_proximity_fade_near_success,
     straddle_finger_trailing_width_proximity,
+    straddle_lateral_gap_shaping,
     approach_finger_target_success,
     approach_success_bonus_reward,
     arm_joint_home_deviation_penalty,
     pcb_forward_push_displacement_indicator,
-    pcb_between_gripper_fingers,
+    pcb_between_gripper_fingers_fade_near_success,
     reset_pcb_on_guide_rails_randomized,
     reset_from_straddle_states,
     reset_pcb_from_straddle_states,
@@ -117,7 +119,7 @@ ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
 #   env_x = root_Y + tx,   env_y = -root_X + ty,   env_z = root_Z + tz
 #
 # _MAG_POS kept at prior Sim-tuned placement (not re-derived from env_v7 FK).
-_MAG_POS      = (0.255, 0.094, 0.0)
+_MAG_POS      = (0.255, 0.094, 0.05)
 _MAG_ROT_WXYZ = (0.7071068, 0.0, 0.0, -0.7071068)   # -90 deg about world Z
 
 # World-frame push direction: root -X  →  world +Y.
@@ -134,46 +136,89 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # further out as the PCB advanced, walking the arm toward its reach limit (least-manipulable
 # direction) right as insertion needed the most force -> droop / force collapse.
 #
-# Now the base sits beside the belt at standoff D_x = 0.32 m (world -X) and at the Y-midpoint of
-# the push travel.  Reach from base to the gripper contact point (world XY distance) stays nearly
-# CONSTANT (~42-45% of the arm's 0.769 m max reach) across the whole push -- see table below --
-# because the push is executed mostly as a joint_0 (base yaw) SWEEP with the shoulder/elbow
-# holding a steady, comfortable mid-range configuration, instead of an elbow/wrist extension.
-#   gripper Y = -0.070 (push start)  -> dist = sqrt(0.32^2 + (-0.070-0.07)^2) = 0.349 m (45% reach), joint_0 ~ -24 deg
-#   gripper Y =  0.070 (push mid)    -> dist = 0.320 m                        (42% reach), joint_0 ~   0 deg
-#   gripper Y =  0.207 (push/insert end) -> dist = 0.348 m                    (45% reach), joint_0 ~ +23 deg
+# Now the base sits beside the belt (standoff along world -X) so the push is executed largely as a
+# joint_0 (base yaw) SWEEP with the shoulder/elbow holding a steady mid-range configuration, instead
+# of an elbow/wrist extension that walks the arm toward its reach limit.
+#
+# RESTORED (2026-07-26): the values below had been left at the OLD behind-the-belt placement
+# ((0.06, -0.30) + 90 deg yaw) while every comment and axis table in this file (see the Approach /
+# Slide ``motion_control_axes_task`` and per-axis stiffness blocks) had already been rewritten for
+# the un-rotated side placement.  That mismatch silently applied each task axis's tuning to the
+# WRONG physical direction: with a +90 deg yawed base, base-local ty (documented and tuned as "the
+# push/insertion axis, stiffest") is actually world -X (lateral), and base-local tx ("lateral") is
+# the real push axis.
+#
+# Placement chosen by measured FK, not by hand: ``scripts/diag_side_base_home_pose.py`` searches arm
+# postures against the straddle geometry the Approach rewards require (jaws opening along the PCB
+# width = world X, both pads level, wrist trailing the pads along +Y) and sweeps the base.  The
+# binding constraint is that the WRIST sits ~0.14 m behind the pads whenever the jaws open across the
+# width, so the base has to sit further back in Y than the pad-travel midpoint, and the reach that
+# matters is the wrist's, not the pads':
+#   approach start (pads Y = -0.10, wrist Y ~ -0.24) -> wrist dist 0.255 m (33% of the 0.769 m reach)
+#   insert end     (pads Y =  0.207, wrist Y ~ 0.07) -> wrist dist 0.414 m (54%)
 # NOTE: moving/re-orienting the base invalidates the approach terminal states -> approach must be
 # retrained (and terminal states re-collected) before slide/insert.
-# NOTE: verify in Sim that this placement doesn't clip the conveyor/magazine housing meshes;
-# nudge D_x (via X below) if it does.
-_ROBOT_BASE_POS = (0.06, -0.30, 0.0025)
-# +90° CCW about world +Z (w, x, y, z).
-_ROBOT_BASE_ROT_WXYZ = (0.7071068, 0.0, 0.0, 0.7071068)
+# NOTE: verify in Sim that this placement doesn't clip the conveyor/magazine housing meshes; the
+# standoff (0.256 m from lane X) sits between the old side placement's 0.226 m and the 0.32 m that
+# was sketched here before, so clipping is not expected -- nudge X if it does.
+_ROBOT_BASE_POS = (-0.25, -0.25, 0.0025)
+# Identity (no yaw): arm faces world +X, i.e. across the belt whose travel/push axis is world +Y,
+# so the arm approaches the PCB from the SIDE at 90 deg to the belt.  Keeping this identity is what
+# makes base-local task axes equal world axes (tx = lateral +X, ty = push +Y, tz = vertical +Z).
+_ROBOT_BASE_ROT_WXYZ = (1.0, 0.0, 0.0, 0.0)
 
 # wxai carriage: physical jaw span (m) ≈ ``left_carriage_joint`` × scale (q=0.02 → 40 mm).
 _GRIPPER_JOINT_TO_SPAN_M = 2.0
 _APPROACH_JAW_SPAN_M = 0.030
 _APPROACH_OPEN_WIDTH_M = _APPROACH_JAW_SPAN_M / _GRIPPER_JOINT_TO_SPAN_M
 
+# Reset posture for the side base, solved by measured FK (``scripts/diag_side_base_home_pose.py``).
+#
+# WHY IT CANNOT BE HAND-WAVED: with the base beside the belt the arm's shoulder plane points across
+# the belt (+X), but the gripper must still be oriented as if approaching along the belt -- jaws
+# opening along the PCB width (world X), both pads at the same height, wrist trailing the pads along
+# +Y -- because that is the straddle geometry every Approach reward scores (``tip_mid_thickness``,
+# ``between_fingers``, the width-gap targets).  The wrist therefore has to absorb ~90 deg of yaw, and
+# the Approach action term caps CUMULATIVE commanded rotation at ~8.6 deg
+# (``_ARM_TASK_ORIENTATION_MAX_DEV_RAD``), so whatever orientation error the RESET pose has is
+# permanent -- the policy can never twist the wrist into place.  Taking the old behind-the-belt
+# posture unchanged is exactly this failure: measured with the base un-rotated it gives
+# |jaw . worldX| = 0.000 (jaws open along the PUSH axis instead of the width), i.e. Approach becomes
+# unlearnable rather than merely harder.
+#
+# Measured geometry of the values below (env frame): pads at (0.054, -0.139, 0.190) -- on the lane X,
+# 69 mm behind the trailing face, 40 mm above the board -- with |jaw . worldX| = 0.999, pad height
+# difference 0.005, wrist-to-pad direction . +Y = 0.930, and no joint within 0.20 rad of a limit.
+# Position (unlike orientation) is NOT boxed, so the policy closes the remaining gap itself.
+#
+# The 69 mm standoff is deliberate, not slack: with zero actions the arm free-drifts 10-15 mm/s, so a
+# pose parked ~30 mm behind the board leans on it within a second and pre-pushes the PCB toward the
+# slot (measured: 3.9 mm lateral + 2.4 mm toward the slot in 0.8 s, vs 0.0 mm at this standoff).
+# _ROBOT_HOME_JOINT_POS = {
+#     "joint_0": -0.1837,  # base yaw — arm points across the belt (+X)
+#     "joint_1": 1.6224,   # shoulder mid-range (limit is [0, π]; 0 = collapsed "shoulder down")
+#     "joint_2": 1.0864,   # elbow bent — wrist ~0.25 m from base at the approach start
+#     "joint_3": -1.3709,  # wrist pitch
+#     "joint_4": -1.1742,  # wrist roll — levels the jaw rail (both pads at the same height)
+#     "joint_5": 1.2032,   # wrist yaw — turns the jaw rail onto the PCB width axis (world X)
+#     "left_carriage_joint": _APPROACH_OPEN_WIDTH_M,
+# }
+
 _ROBOT_HOME_JOINT_POS = {
-    # Side-reach mid pose for the un-rotated base beside the belt.  joint_1 MUST NOT sit near its
-    # lower limit (0): that is the collapsed "shoulder down" extreme that made the EE droop and
-    # that home-posture-hold previously locked the arm into (zero motion + reward farming).
-    # Mid-range shoulder/elbow keeps the EE near PCB height at ~0.32 m standoff so approach starts
-    # in the usable workspace instead of on the floor.
-    "joint_0": 0.0,     # base yaw — face conveyor (+X)
-    "joint_1": 0.0,     # shoulder mid (limit is [0, π]; 0 = collapsed)
-    "joint_2": 0.35,     # elbow bent for ~0.3 m reach
-    "joint_3": -0.7,    # wrist pitch
-    "joint_4": 0.0,
-    "joint_5": 0.0,     # wrist yaw
+    "joint_0": -0.1837,  # base yaw — arm points across the belt (+X)
+    "joint_1": 1.6224,   # shoulder mid-range (limit is [0, π]; 0 = collapsed "shoulder down")
+    "joint_2": 1.2864,   # elbow bent — wrist ~0.25 m from base at the approach start
+    "joint_3": -1.3709,  # wrist pitch
+    "joint_4": -1.51,  # wrist roll — levels the jaw rail (both pads at the same height)
+    "joint_5": -1.57,   # wrist yaw — turns the jaw rail onto the PCB width axis (world X)
     "left_carriage_joint": _APPROACH_OPEN_WIDTH_M,
 }
+
 # PCB pose offsets (env-local m / world-Z yaw rad) applied on top of ``_PCB_INIT_POS`` / ``_PCB_INIT_ROT_WXYZ``.
 _PCB_POS_OFFSET_RANGES = {
     "x": (-0.002, 0.002),
 }
-_PCB_YAW_OFFSET_RANGE = (-0.002, 0.002)
+_PCB_YAW_OFFSET_RANGE = (-0.003, 0.00)
 _GRIPPER_OPEN_WIDTH_M = _APPROACH_OPEN_WIDTH_M
 # Distal offset from ``gripper_left``/``gripper_right`` body origin to contact pad tip (wrist→jaw).
 _GRIPPER_TIP_OFFSET_M = 0.06
@@ -183,7 +228,7 @@ _GRIPPER_TIP_OFFSET_M = 0.06
 # ---------------------------------------------------------------------------
 _CONVEYOR_CENTER_X_ENV = 0.056     # chip / conveyor centre X in env frame
 # PCB lane X for straddle / slide (not magazine bbox centre X ≈ 0.277).
-_CONVEYOR_SURFACE_Z = 0.150        # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
+_CONVEYOR_SURFACE_Z = 0.200       # conveyor top Z (chip FK z + _MAG_POS[2] − PCB_Z/2)
 # Approach spawn height (+50 mm above belt clears guide-rail meshes; lower than +70 mm → less knock-off).
 _PCB_CENTER_Z_ENV = _CONVEYOR_SURFACE_Z + PCB_Z * 0.5
 # Rail contact: PCB centre when the bottom sits on guide rails (~78 mm above belt top).
@@ -230,7 +275,7 @@ _PCB_FRONT_EDGE_GAP_M = 0.030      # front edge (toward +Y) this far before slot
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
     _CONVEYOR_CENTER_X_ENV,
-    0.08 - _PCB_FRONT_EDGE_GAP_M,
+    0.06 - _PCB_FRONT_EDGE_GAP_M,
     _PCB_CENTER_Z_ENV,
 )
 
@@ -339,29 +384,41 @@ _ARM_TASK_MOTION_AXES = (1, 1, 1, 1, 1, 1)
 # Doubled to (60, 300) (still ~5x softer than the task-critical axes) so rx has more authority to
 # resist that coupling as the policy's push force ramps up; re-tune again if the same decline
 # pattern reappears at a higher ceiling.
+#
+# AXIS REMAP (2026-07-26): these are BASE-frame axes, and the base yaw was just removed (see
+# ``_ROBOT_BASE_ROT_WXYZ``).  While the base still carried its +90 deg yaw, base rx was roll about
+# the push axis and base ry was pitch about the lateral axis -- i.e. the rotational floors were tuned
+# with the two swapped relative to the labels below.  The floor of 500 was raised empirically to
+# resist the wrist pitching down, so it now belongs on rx; ry (roll about the push axis, which only
+# needs to keep the board flat) goes back to 300.
 _ARM_TASK_STIFFNESS_LIMITS_PER_AXIS = (
-    (300.0, 1500.0),
-    (300.0, 1500.0),
-    (600.0, 1500.0),
-    (300.0, 1500.0),
-    (500.0, 1500.0),
-    (100.0, 1500.0),
+    (300.0, 1500.0),  # tx — lateral (world +X, across the belt)
+    (300.0, 1500.0),  # ty — push / insertion (world +Y)
+    (800.0, 2000.0),  # tz — vertical; raised 2026-07-26 (side-base wrist twist loses vertical authority)
+    (500.0, 1500.0),  # rx — pitch about the lateral axis = the "nose drops" droop direction
+    (300.0, 1500.0),  # ry — roll about the push axis (board flatness / anti side-tilt)
+    (100.0, 1500.0),  # rz — yaw about vertical; softest, lets the gripper align to the board
 )
 _ARM_TASK_STIFFNESS_LIMITS = (200.0, 1500.0)
 _ARM_TASK_DAMPING_RATIO_LIMITS = (0.6, 2.0)
 _ARM_TASK_DEFAULT_STIFFNESS = 200.0
 _ARM_TASK_DEFAULT_DAMPING_RATIO = 1.2
 # Floor on the policy-commanded K/ζ fraction-of-range (see ``_map_stiffness_action`` bug-fix note
-# in mdp_custom.py — now fixed, so a floor here means what it says: min fraction of
-# ``_ARM_TASK_STIFFNESS_LIMITS`` / ``_ARM_TASK_DAMPING_RATIO_LIMITS``).  Approach had NO floor
-# (default 0.0), so with the free pitch (ry) null-space DOF above and only joint damping=5.0
-# resisting gravity-compensation residual error, an exploring/undertrained policy could drive
-# stiffness/damping all the way down to the raw limits (200 N·m/rad, ζ=0.6) on every axis, making
-# the whole arm noticeably "softer" and more visibly droop-prone. Mirrors the Slide floors (which
-# were tuned once the same remap bug was fixed) — high enough to keep the arm firm, low enough to
-# still let the policy comply/soften where useful for approach positioning.
-_ARM_TASK_STIFFNESS_ACTION_FLOOR = 0.3
-_ARM_TASK_DAMPING_ACTION_FLOOR = 0.5
+# in mdp_custom.py).  Raised 0.3 -> 0.5 after the side-base re-place: the wrist-yawed home pose
+# that opens the jaws along world X has worse vertical manipulability than the old behind-belt
+# home, so the same soft floor let gravity-compensation residual win even with the absolute EE
+# anchor (diag_ee_box: restoring delta commanded but live Z still sank ~18 mm).
+_ARM_TASK_STIFFNESS_ACTION_FLOOR = 0.5
+_ARM_TASK_DAMPING_ACTION_FLOOR = 0.6
+# Soft joint-space PD toward ``_ROBOT_HOME_JOINT_POS`` (additive on top of OSC).  The side-base
+# home twists the wrist ~90 deg so task-space vertical force maps poorly through the Jacobian;
+# this joint spring keeps shoulder/elbow from folding under gravity residual.  Gains stay well
+# below task-space stiffness so the policy can still move — and with the absolute EE anchor
+# (see ``_clamp_pose_rel_to_reset_position_box``) a zero action no longer means "desired =
+# current", so this hold cannot freeze the arm into proximity-reward farming the way it did
+# under naive pose_rel.
+_APPROACH_HOME_JOINT_HOLD_KP = 150.0
+_APPROACH_HOME_JOINT_HOLD_KD = 8.0
 # With ``pose_rel`` the per-step orientation target is "current + delta" with NO absolute anchor
 # -- the impedance spring only resists a sudden jump off the *current* target, not a slow drift
 # of that target itself.  A slight systematic roll bias in the policy (or unlucky exploration)
@@ -370,6 +427,24 @@ _ARM_TASK_DAMPING_ACTION_FLOOR = 0.5
 # cumulative commanded rotation per axis-angle component to keep it bounded regardless of what
 # the policy outputs; see ``task_orientation_box_enabled`` on the action cfg below.
 _ARM_TASK_ORIENTATION_MAX_DEV_RAD = 0.15  # ~15 deg
+# TRANSLATION "쳐짐" (arm sinking): with ``pose_rel`` the OSC target is ``current + delta`` every
+# step, so gravity-compensation residual sinks the arm AND the setpoint together (a ratchet).
+# Measured with ZERO actions: pad Z -6 mm @ 0.2 s, -38 mm @ 2 s, -71 mm @ 3.8 s.  Raising stiffness
+# cannot fix a ratchet whose target is the already-sunk pose, and freeing a DOF makes it worse
+# (uncontrolled axis = zero restoring torque on that direction).  ``task_position_box_enabled``
+# alone was also insufficient when it only clipped ``current+delta`` inside the box -- zero action
+# then still yields delta=0 for every pose *inside* the box, so the arm free-falls to the floor of
+# the box.  The real fix is in ``_clamp_pose_rel_to_reset_position_box``: accumulate an absolute
+# offset from the reset EE pose (like the orientation box), clamp that, and rewrite each step's
+# delta so the OSC target equals ``p0 + clamped_offset``.  Zero action then springs back to home.
+# Ranges (absolute travel from reset the policy may command):
+#   vertical  ±0.06 m -- home starts ~40 mm above the board; must descend onto it
+#   lateral   ±0.08 m -- lane-X correction + reposition room
+#   push  [-0.05, +0.20] m -- home sits ~69 mm behind the trailing face; must close that in +Y
+_APPROACH_EE_VERTICAL_HALF_RANGE_M = 0.06
+_APPROACH_EE_LATERAL_HALF_RANGE_M = 0.08
+_APPROACH_EE_PUSH_OFFSET_MIN_M = -0.05
+_APPROACH_EE_PUSH_OFFSET_MAX_M = 0.20
 # Task-space OSC (Slide): Z translation locked; lateral (short-edge / lane X) ±1 cm cumulative box.
 #
 # NOTE ON ``pose_rel`` SEMANTICS (root cause of the "PCB never moves" stall): Isaac Lab's OSC
@@ -486,6 +561,11 @@ _LANE_X_MAX_EXCESS_M = 0.020
 _APPROACH_JAW_GATE_MIN = 0.3
 
 # Terminal-state buffers (Sequential Dexterity chaining).
+# These are raw JOINT values, so they are only valid for the base placement they were recorded with:
+# Slide replays them and then spawns the PCB relative to wherever the gripper ends up.  After the base
+# moved back beside the belt (2026-07-26, see ``_ROBOT_BASE_POS``) the existing file is stale --
+# re-run Approach training and ``scripts/collect_approach_states.py`` before training Slide, or Slide
+# will reset the arm (and the board with it) to a pose that no longer exists.
 _APPROACH_STATES_PATH = os.path.join(ASSET_DIR, "data", "approach_terminal_states.npz")
 # Slide success: leading short-edge centre at magazine back (+Y); mouth for approach shaping.
 _SLIDE_MOUTH_Y_MARGIN_M = 0.015
@@ -597,11 +677,26 @@ _APPROACH_PREDEEP_ALONG_GATE_M = 0.0
 # Symmetric approach — midpoint stays on trailing-edge centreline.
 _APPROACH_MIDPOINT_JAW_OFFSET_M = 0.0
 # Success: mean per-jaw ``1 - tanh(dist/std)`` must reach this closedness (in [0, 1]).
-_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.5
+_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.55
 # Success ALSO requires the tip mid-thickness index (straddle_tip_mid_thickness_shaping, in
 # [0, 1]) to reach this value — pads must sit near the PCB mid-thickness plane, not just be
 # laterally closed around the trailing edge.
 _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
+# Dense shaping fade near success (tight closedness): full credit below fade_start, linearly
+# down to min_scale by fade_end.  Stops farming loose shaping for a full episode instead of
+# taking the one-shot success bonus / early terminate.
+#
+# IMPORTANT: fade_start MUST be >= _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD. The env terminates
+# the same step ``approach_success`` fires, so a policy can never "camp" AT or above the
+# threshold across multiple steps -- the only farmable region is BELOW it. Fading dense reward
+# below the threshold weakens the exact gradient needed to cross into success in the first
+# place (this previously started at 0.40 while the threshold was 0.45-0.55, actively fighting
+# convergence). Starting the fade AT the threshold means dense shaping stays at full strength
+# all the way up to success; it only discounts states that somehow linger past the closedness
+# bar without terminating (e.g. the tip-mid-thickness gate not yet satisfied).
+_APPROACH_SHAPING_FADE_START = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD
+_APPROACH_SHAPING_FADE_END = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD + 0.15
+_APPROACH_SHAPING_FADE_MIN_SCALE = 0.05
 
 # Shared geometry kwargs for straddle checks and phase transitions.
 _APPROACH_CHECK_KWARGS = {
@@ -638,6 +733,21 @@ def _approach_entity_params(**extra) -> dict:
         "right_finger_cfg": _RIGHT_FINGER,
         "half_length_m": _HALF_LENGTH_M,
         **_gripper_wrist_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _approach_near_success_fade_params(**extra) -> dict:
+    """Shared kwargs that fade dense Approach shaping as tight closedness nears success."""
+    base = {
+        "success_std": _APPROACH_SUCCESS_STD_M,
+        "fade_start": _APPROACH_SHAPING_FADE_START,
+        "fade_end": _APPROACH_SHAPING_FADE_END,
+        "min_scale": _APPROACH_SHAPING_FADE_MIN_SCALE,
+        "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+        "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+        "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
     }
     base.update(extra)
     return base
@@ -1129,19 +1239,28 @@ class ActionsCfgApproach:
         # (2026-07-24 droop fix). All 6 axes are now impedance-controlled; this patches the OSC's
         # per-axis K clamp so pitch stays much softer than the other axes without being fully free.
         motion_stiffness_limits_per_axis=_ARM_TASK_STIFFNESS_LIMITS_PER_AXIS,
-        # DO NOT enable use_home_joint_posture_hold here.  With pose_rel, Δ=0 already has zero
-        # spring force (desired = current); adding joint PD toward home freezes the arm at the
-        # reset pose.  The policy then farms static proximity reward with zero motion
-        # (ep reward jumped ~36 → ~680 with no visible movement).  Anti-droop is handled by
-        # controlling all 6 axes (with a soft pitch ceiling) in `_ARM_TASK_MOTION_AXES` instead.
-        # # Bound cumulative roll/yaw drift (see constant comment above) -- controlling the axis
-        # # (`_ARM_TASK_MOTION_AXES`) stops null-space dumping but does NOT stop slow drift of the
-        # # ``pose_rel`` target itself; this box caps that drift directly.
+        # Soft joint PD toward the side-base home.  Safe now that the position box rewrites
+        # pose_rel into an absolute-from-reset target (zero action = spring to home, not
+        # "desired = current"); see ``_APPROACH_HOME_JOINT_HOLD_KP`` comment.  Do NOT free any
+        # motion axis to "fix" droop -- an uncontrolled axis has literally zero restoring torque.
+        use_home_joint_posture_hold=True,
+        home_joint_pos=_ROBOT_HOME_JOINT_POS,
+        home_joint_posture_hold_stiffness=_APPROACH_HOME_JOINT_HOLD_KP,
+        home_joint_posture_hold_damping=_APPROACH_HOME_JOINT_HOLD_KD,
         task_orientation_box_enabled=True,
         orientation_max_dev_rad=_ARM_TASK_ORIENTATION_MAX_DEV_RAD,
-        # Floor the policy-commanded K/ζ so it can't soften the (already-vulnerable, free-pitch)
-        # arm all the way to the raw stiffness/damping-ratio limits -- see constant comment above
-        # (2026-07-24 droop fix).
+        # Absolute-from-reset EE translation box (world frame).  Anchored by ``store_reset_ee_pose``
+        # in ``EventCfgApproach``; the clamp itself accumulates an absolute offset and rewrites
+        # each step's pose_rel delta so the OSC target equals ``p0 + offset`` (see mdp_custom).
+        # WITHOUT the reset-pose event this clamp silently no-ops and the arm free-falls.
+        task_position_box_enabled=True,
+        push_axis_world=PUSH_AXIS_WORLD,
+        lateral_axis_world=_LATERAL_AXIS_WORLD,
+        vertical_axis_world=(0.0, 0.0, 1.0),
+        lateral_half_range_m=_APPROACH_EE_LATERAL_HALF_RANGE_M,
+        vertical_half_range_m=_APPROACH_EE_VERTICAL_HALF_RANGE_M,
+        push_offset_min_m=_APPROACH_EE_PUSH_OFFSET_MIN_M,
+        push_offset_max_m=_APPROACH_EE_PUSH_OFFSET_MAX_M,
         stiffness_action_floor=_ARM_TASK_STIFFNESS_ACTION_FLOOR,
         damping_action_floor=_ARM_TASK_DAMPING_ACTION_FLOOR,
     )
@@ -1421,8 +1540,8 @@ class RewardsApproachCfg():
     # (150, see below) and could not "brake" the approach right at the edge -> pads punched through
     # onto the PCB top/bottom faces instead of stopping at the trailing edge.
     trailing_face_approach = RewardTermCfg(
-        func=straddle_trailing_face_bounded_approach_reward,
-        params=_approach_along_approach_params(),
+        func=straddle_trailing_face_bounded_approach_reward_fade_near_success,
+        params=_approach_along_approach_params(**_approach_near_success_fade_params()),
         weight=150.0,
     )
 
@@ -1431,8 +1550,8 @@ class RewardsApproachCfg():
     # for fixing "left pad on top face / right pad on bottom face" (both pads should sit at the
     # SAME mid-thickness height, straddling the board along its width, not its thickness).
     tip_mid_thickness = RewardTermCfg(
-        func=straddle_tip_mid_thickness_shaping_gated,
-        params=_approach_mid_thickness_gated_params(),
+        func=straddle_tip_mid_thickness_shaping_gated_fade_near_success,
+        params=_approach_mid_thickness_gated_params(**_approach_near_success_fade_params()),
         weight=150.0,
     )
 
@@ -1440,9 +1559,11 @@ class RewardsApproachCfg():
     # brake above (it *does* penalize overshoot, but the sigma is so loose that a 1-2 cm punch-
     # through barely registers), effectively letting the policy trade a small proximity loss here
     # for a much bigger ``between_fingers`` payout by pushing well past the edge.
+    # Near-success fade: dense credit collapses once tight closedness nears the success bar so
+    # farming a full episode cannot beat early terminate + success bonus.
     finger_proximity = RewardTermCfg(
-        func=straddle_finger_trailing_width_proximity,
-        params=_approach_finger_proximity_params(),
+        func=straddle_finger_trailing_width_proximity_fade_near_success,
+        params=_approach_finger_proximity_params(**_approach_near_success_fade_params()),
         weight=150.0,
     )
 
@@ -1459,15 +1580,25 @@ class RewardsApproachCfg():
     # this term still rewards reaching + width-centering the straddle, just no longer overpowers
     # the "stop here" signal.
     between_fingers = RewardTermCfg(
-        func=pcb_between_gripper_fingers,
-        params=_approach_between_fingers_params(),
+        func=pcb_between_gripper_fingers_fade_near_success,
+        params=_approach_between_fingers_params(**_approach_near_success_fade_params()),
         weight=60.0,
     )
 
+    # Weight raised 20 -> 120: TensorBoard showed a persistent ~9-10 mm LEFT/RIGHT gap asymmetry
+    # (e.g. gap_left ~25 mm vs. target 15 mm, gap_right ~5 mm vs. target 15 mm) that never
+    # closed over a full 150-epoch run — the jaws open to the correct ~30 mm span but sit
+    # off-centre on the PCB.  This is the ONLY term whose gradient directly targets that specific
+    # error; ``finger_proximity`` (σ=100 mm) is already saturated near this scale (its gradient
+    # here is ~10x weaker than at long range), and ``tip_mid_thickness``/``trailing_face`` don't
+    # see the width axis at all.  At weight 20 the lateral centering had far less effective
+    # gradient than the other 150-weighted terms and was essentially free to drift, which is why
+    # ``closedness_tight`` (the success index) plateaued well below threshold despite the other
+    # two success components (tip mid-thickness, along) looking fine.
     lateral_gap = RewardTermCfg(
-        func=straddle_lateral_gap_shaping,
-        params=_approach_lateral_gap_params(),
-        weight=20.0,
+        func=straddle_lateral_gap_shaping_fade_near_success,
+        params=_approach_lateral_gap_params(**_approach_near_success_fade_params()),
+        weight=120.0,
     )
 
     # Approach = straddle only: any +Y slide of the PCB toward the magazine is forbidden.
@@ -1479,7 +1610,7 @@ class RewardsApproachCfg():
             "initial_y_env": _PCB_INIT_POS[1],
             "max_displacement_m": 0.005,
         },
-        weight=-30.0,
+        weight=-3000.0,
     )
 
     # SIGNED tip-down shaping (2026-07-23): swapped from the unsigned
@@ -1515,7 +1646,7 @@ class RewardsApproachCfg():
     approach_success_bonus = RewardTermCfg(
         func=approach_success_bonus_reward,
         params=_approach_termination_params(),
-        weight=1000.0,
+        weight=20000.0,
     )
 
     approach_gripper_debug_monitor = RewardTermCfg(
@@ -1674,6 +1805,14 @@ class EventCfgApproach:
             "joint_positions": _ROBOT_HOME_JOINT_POS,
             "velocity_scale": 0.0,
         },
+    )
+    # Anchor for the cumulative EE translation box on ``arm_action`` (anti-droop).  Must run AFTER
+    # ``reset_robot_home`` so the recorded pose is the home pose, and must exist at all: the clamp
+    # in ``_clamp_pose_rel_to_reset_position_box`` no-ops unless this has stored ``_slide_reset_ee_pos_w``.
+    store_reset_ee_pose = EventTermCfg(
+        func=store_slide_reset_ee_pose_w,
+        mode="reset",
+        params={"action_name": "arm_action"},
     )
     # Gripper implicit PD default target is 0 (closed).  Command 40 mm open and cache target.
     hold_gripper_on_reset = EventTermCfg(
@@ -1891,7 +2030,7 @@ class WidowXPcbApproachEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 4.0
+        self.episode_length_s = 3.0
 
 
 @configclass
