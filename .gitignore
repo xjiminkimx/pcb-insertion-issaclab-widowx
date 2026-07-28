@@ -222,4 +222,13 @@ __marimo__/
 outputs/
 logs/
 .checkpoint_cache/
-usd_models/env*
+
+# Local-only artifacts. The only USD assets the env loads at runtime are
+# usd_model/env_v7/ and usd_model/usd_robot/ -- everything else here is history.
+video/
+weights/
+usd_model/usd_env/
+usd_model/env_v3/
+usd_model/env_v4/
+usd_model/env_v5/
+usd_model/env_v6/

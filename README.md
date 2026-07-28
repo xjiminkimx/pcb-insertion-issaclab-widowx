@@ -348,10 +348,13 @@ Regenerate after changing the converter:
 cd usd_model/env_v7 && python3 convert_to_usd.py
 ```
 
-`env_v7` is the same Onshape assembly as `env_v6` (`usd_model/env_v6/`, now superseded), re-exported
-with the side rail-guides (`Part_1_4`, `Part_1_6`) thinned from 15 mm to 4 mm so the gripper
-jaw/carriage clears them mid-slide. All materials, friction, and contact/rest offsets are kept
-identical to `env_v6/convert_to_usd.py`.
+`env_v7` is the same Onshape assembly as `env_v6`, re-exported with the side rail-guides
+(`Part_1_4`, `Part_1_6`) thinned from 15 mm to 4 mm so the gripper jaw/carriage clears them
+mid-slide. All materials, friction, and contact/rest offsets are unchanged from v6.
+
+`env_v7` and `usd_model/usd_robot/` are the only USD assets the env loads. Superseded fixtures
+(`env_v3` … `env_v6`, `usd_env`) and the archived `weights/` and `video/` directories are
+gitignored and kept local only.
 
 ### What is included / excluded
 
@@ -449,22 +452,6 @@ the fixture moves.
 
 ---
 
-## Troubleshooting
-
-| Symptom | Likely cause / fix |
-|---------|-------------------|
-| Arm sinks over the episode ("쳐짐") | `task_position_box_enabled` off, or its `store_*_reset_ee_pose` event missing — the clamp silently no-ops without the anchor. |
-| Gripper head flops down mid-episode | `task_orientation_box_enabled` off. Raising stiffness will not help; the `pose_rel` target follows the sagged pose. |
-| Policy freezes and refuses to push | Static shaping outearns pushing. Compare per-second static income against `alive_penalty` before touching the push weights. |
-| Slide "succeeds" for almost no return | Remember the `step_dt` scaling — a one-shot bonus is worth `0.008 × weight`. |
-| Diagnostic reports a perfectly still arm | PhysX GPU allocation failed. Grep the log for `fail to launch kernel`; free the GPU or shrink the buffers. |
-| PhysX `collisionStackSize` overflow | Lower `--num_envs` (2048 recommended with the triangle-mesh magazine). |
-| PCB looks above the belt | Expected — it rests on the rails, not the belt. |
-| PCB sinks / tunnels | Dropped contacts from GPU overflow, or spawn Z below the rail collision. |
-| Slide resets into an impossible pose | Stale `data/approach_terminal_states.npz`; re-collect after any base move or Approach retrain. |
-| Checkpoint not found in play | Run play from the `widowx_pcb` cwd, not the Isaac Lab root. |
-
----
 
 ## License
 
