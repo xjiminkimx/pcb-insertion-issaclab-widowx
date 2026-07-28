@@ -537,8 +537,35 @@ _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
 # horizontal (jaw below wrist), not a magnitude that could equally be satisfied tip-up. Paired with
 # the raised rx stiffness ceiling above so the policy both WANTS to pitch down (reward) and CAN
 # hold it against contact reaction forces (stiffness).
-_SLIDE_WRIST_TARGET_PITCH_DOWN_DEG = 30.0
-_SLIDE_WRIST_PITCH_SIGMA_DEG = 6.0
+#
+# 2026-07-27: this is now the angle at which the ramp SATURATES (full credit at or past it), not a
+# narrow peak, so "25 deg or steeper" is all rewarded equally -- set to the clearance minimum (25)
+# rather than a guessed optimum (was 30 with a 6 deg sigma, which measured 0.013 of full credit at
+# the actual reset posture -- see the shape note in the reward function).  ``MAX`` only guards
+# against degenerate near-vertical postures that would swing the pads off the trailing face.
+_SLIDE_WRIST_TARGET_PITCH_DOWN_DEG = 20.0
+_SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 30.0
+# Cumulative EE rotation box for Slide, per task axis (rx, ry, rz) in rad, measured FROM THE RESET
+# ORIENTATION (the replayed straddle pose, measured at -13 deg pitch by
+# ``scripts/diag_ee_box.py --slide``).  The base is un-rotated, so these are world axes:
+#
+#   rx  pitch about world X.  NEGATIVE = tip-DOWN (rotating the wrist->jaw vector, which points
+#       along +Y, about +X by -theta drops its Z).  -0.35 rad lets the wrist reach ~-33 deg total,
+#       covering the 25 deg clearance target with margin; +0.09 rad stops it flopping back up.
+#   ry  roll about the push axis.  Kept small: this is the axis that tilts the jaw rail so the two
+#       pads stop being level, and the replayed reset pose already carries ~10-13 deg of inherited
+#       roll error that must not grow.
+#   rz  yaw about vertical.  Small but non-zero -- the policy is meant to steer the board into the
+#       slot with yaw/roll corrections, it just must not walk the target away over the episode.
+#
+# A single symmetric ``orientation_max_dev_rad`` cannot express this (see the ``_clamp_pose_rel_
+# rotation_box`` note): 0.15 rad on every axis would forbid the tip-down entirely, and 0.35 rad on
+# every axis would let roll/yaw drift 20 deg.
+_SLIDE_ORIENTATION_DEV_LIMITS_PER_AXIS = (
+    (-0.30, 0.09),
+    (-0.10, 0.10),
+    (-0.12, 0.12),
+)
 _SLIDE_EE_LATERAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_PUSH_OFFSET_MIN_M = 0.0
@@ -570,7 +597,7 @@ _APPROACH_STATES_PATH = os.path.join(ASSET_DIR, "data", "approach_terminal_state
 # Slide success: leading short-edge centre at magazine back (+Y); mouth for approach shaping.
 _SLIDE_MOUTH_Y_MARGIN_M = 0.015
 _SLIDE_MOUTH_LEAD_Y_ENV = _MAG_Y_NEAR_FACE_ENV - _SLIDE_MOUTH_Y_MARGIN_M
-_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.025
+_SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M = 0.01
 # Success / milestone terminus: leading edge near magazine back wall (slide +Y direction).
 _SLIDE_SUCCESS_LEAD_Y_ENV = _MAG_Y_FAR_FACE_ENV - _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M
 _SLIDE_MOUTH_LEAD_X_ENV = _CONVEYOR_CENTER_X_ENV
@@ -1275,9 +1302,12 @@ class ActionsCfgSlide:
     of max reach -- instead of the previous straight-line radial extension towards the reach limit.
     Cartesian impedance is set the way insertion needs it: STIFFEST along the push/insertion axis
     (``ty`` = world +Y) to drive the board in, but softer laterally (``tx``) and in yaw (``rz``) so
-    the PCB self-aligns and slips past slot-wall jams instead of binding.  ``tz``/``rx`` are left
-    uncontrolled for kinematic redundancy.  The cumulative EE box anchors translation to the reset
-    pose (±1 cm lateral/vertical, forward-only push), which also suppresses vertical droop.
+    the PCB self-aligns and slips past slot-wall jams instead of binding.  ``tz``/``rx``/``ry`` are
+    impedance-controlled but SOFT (never free -- see the crash post-mortem above
+    ``_ARM_TASK_SLIDE_MOTION_AXES``), leaving reach/reconfiguration room; ``rx`` keeps enough
+    authority to hold the commanded tip-down wrist pitch under contact load.  The cumulative EE box
+    anchors translation to the reset pose (±1 cm lateral/vertical, forward-only push), which also
+    suppresses vertical droop.
     """
 
     arm_action = WidowXTaskSpaceImpedanceActionCfg(
@@ -1322,7 +1352,31 @@ class ActionsCfgSlide:
         damping_action_floor=0.5,
         # Cumulative EE box (world frame): anchors translation to the reset pose so the EE cannot
         # droop vertically or drift backward; forward push travel up to _SLIDE_EE_PUSH_OFFSET_MAX_M.
-        task_position_box_enabled=False,
+        #
+        # ENABLED 2026-07-27: this was ``False`` while this class's own docstring (and the constants
+        # above) described the box as active, so every box parameter below was dead config and Slide
+        # ran with the raw ``pose_rel`` gravity ratchet that the Approach phase had already been
+        # fixed for -- measured with zero actions: pad Z -6 mm @ 0.2 s, -38 mm @ 2 s, -71 mm @ 3.8 s
+        # (see the "쳐짐" note above ``_ARM_TASK_ORIENTATION_MAX_DEV_RAD``).  Over a multi-second
+        # slide that sinks the gripper tens of mm, which drags the board down onto the rails and
+        # destroys any commanded tip-down posture regardless of what ``wrist_tip_down`` pays.
+        # ``store_slide_reset_ee_pose`` in ``EventCfgSlide`` already supplies the anchor pose.
+        #
+        # ORIENTATION box, ENABLED 2026-07-27 with PER-AXIS bounds ("gripper head가 아래로 툭
+        # 떨어진다"): with ``pose_rel`` the orientation target is "current ⊕ delta" every step, so
+        # with this box off the wrist has NO orientation anchor at all -- gravity-compensation
+        # residual tips the head down and the tipped pose immediately becomes the new setpoint.
+        # Stiffness cannot stop it (the tracking error is ~0 by construction; the spring only
+        # resists a sudden jump from the *current* target).  Measured with ZERO actions and the
+        # position box already on: pitch ran -13 deg -> -25 deg in 1.6 s and was still falling
+        # linearly, i.e. the head simply flops down over an 8 s episode, which also destroys the
+        # pad-to-trailing-edge contact the whole push depends on.
+        # It stayed off earlier only because the scalar ``orientation_max_dev_rad`` clamps all three
+        # components equally and would have forbidden the intended tip-down; the per-axis limits
+        # below give rx the room it needs while pinning roll/yaw.
+        task_orientation_box_enabled=True,
+        orientation_dev_limits_per_axis=_SLIDE_ORIENTATION_DEV_LIMITS_PER_AXIS,
+        task_position_box_enabled=True,
         push_axis_world=PUSH_AXIS_WORLD,
         lateral_axis_world=_LATERAL_AXIS_WORLD,
         vertical_axis_world=(0.0, 0.0, 1.0),
@@ -1627,7 +1681,7 @@ class RewardsApproachCfg():
     #         "wrist_body_cfg": _WRIST_BODY,
     #         "push_axis_world": PUSH_AXIS_WORLD,
     #         "target_pitch_down_deg": _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG,
-    #         "pitch_sigma_deg": _SLIDE_WRIST_PITCH_SIGMA_DEG,
+    #         "max_pitch_down_deg": _SLIDE_WRIST_MAX_PITCH_DOWN_DEG,
     #     },
     #     weight=80.0,
     # )
@@ -1678,7 +1732,28 @@ class RewardsSlideCfg:
     # pays ~6x more. -12 flips idling from net-positive to net-negative (12 - 12 = 0) so positive
     # return requires real +Y progress, while the 500/500/300-weighted push terms still dwarf it
     # once discovered.
-    alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-12.0)
+    #
+    # -12 -> -25 (2026-07-27), measured rather than guessed: ``scripts/diag_ee_box.py --slide`` with
+    # ZERO actions collects 18.5/s of static income (straddle_hold 3.1 + lateral_gap 3.5 +
+    # pcb_yaw_alignment 5.0 + goal_lead_proximity 0.7 + wrist_tip_down 6.2), so over the 8 s episode
+    # idling paid 148 against only 96 of alive penalty -- still net +52 for standing perfectly
+    # still.  -25 flips that to -52.  The comment above anticipated exactly this ("raise toward
+    # -20/-25 if the policy still freezes") and its warning is now covered by ``failure_penalty``
+    # below: with idling net-negative, ending the episode early becomes the cheap escape, so
+    # dropping/skewing the board has to cost more than the idling loss it avoids.
+    alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-25.0)
+
+    # Early-failure penalty (2026-07-27), the counterweight to the raised alive penalty above.
+    # Fires once, on the step a non-timeout, non-success termination triggers.  Rewards are scaled
+    # by ``step_dt`` (0.008 s), so weight W contributes only -0.008*W to the return: -10000 gives
+    # -80, comfortably more than the -52 of idling loss a suicide would dodge.  ``slide_success``
+    # and ``time_out`` are deliberately excluded (success must never be penalised, and a timeout is
+    # already paid for through 8 s of alive penalty).
+    failure_penalty = RewardTermCfg(
+        func=mdp.is_terminated_term,
+        params={"term_keys": ["pcb_fallen_below_rail", "pcb_long_axis_not_horizontal"]},
+        weight=-10000.0,
+    )
 
     # Static straddle-quality shaping trimmed 10 -> 4: still points the grip at the trailing
     # edge, but no longer a large guaranteed payout for standing still.
@@ -1749,6 +1824,14 @@ class RewardsSlideCfg:
     # ``_ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS`` so the policy can actually hold it under contact
     # load). Weight kept modest (similar to lateral_gap/pcb_yaw_alignment) so it nudges posture
     # without competing with the push rewards.
+    #
+    # WEIGHT 30 -> 8 (2026-07-27), to KEEP that intended balance after the shaping was fixed: with
+    # the old narrow peak the term evaluated to only 0.07-0.2 at the poses Slide actually visits, so
+    # weight 30 paid ~2-6/s; the monotone ramp saturates near 1.0 there instead, and measured with
+    # zero actions (``scripts/diag_ee_box.py --slide``) weight 30 paid 23.6/s -- 5x lateral_gap
+    # (3.6/s) and pcb_yaw_alignment (5.0/s), and enough static income on its own to make "freeze and
+    # survive" beat pushing again (the exact failure ``alive_penalty`` exists to prevent). 8 puts it
+    # back at ~6/s, in the same band as the other posture terms.
     wrist_tip_down = RewardTermCfg(
         func=gripper_wrist_carriage_tip_down_pitch_shaping,
         params={
@@ -1757,9 +1840,9 @@ class RewardsSlideCfg:
             "wrist_body_cfg": _WRIST_BODY,
             "push_axis_world": PUSH_AXIS_WORLD,
             "target_pitch_down_deg": _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG,
-            "pitch_sigma_deg": _SLIDE_WRIST_PITCH_SIGMA_DEG,
+            "max_pitch_down_deg": _SLIDE_WRIST_MAX_PITCH_DOWN_DEG,
         },
-        weight=30.0,
+        weight=8.0,
     )
     # Debug-only (near-zero weight): logs the SIGNED achieved pitch in degrees to TensorBoard.
     wrist_pitch_deg_debug = RewardTermCfg(
@@ -1772,10 +1855,15 @@ class RewardsSlideCfg:
         weight=1e-10,
     )
 
+    # Weight 1000 -> 25000 (2026-07-27): rewards are scaled by ``step_dt`` (0.008 s) and this fires
+    # once (``slide_success`` terminates the episode), so 1000 paid a total of EIGHT -- less than a
+    # tenth of what idling for the episode collected, and now an order of magnitude less than the
+    # -80 ``failure_penalty``.  25000 pays 200, i.e. the same order as Approach's success bonus
+    # (20000 -> 160) and clearly the largest single event in the episode.
     slide_success_bonus = RewardTermCfg(
         func=slide_success_bonus_reward,
         params=_slide_success_params(),
-        weight=1000.0,
+        weight=25000.0,
     )
 
 

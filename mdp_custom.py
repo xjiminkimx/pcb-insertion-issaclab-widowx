@@ -414,6 +414,15 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         # ``_clamp_pose_rel_rotation_box`` can cap it, the rotational analogue of
         # ``task_position_box_enabled`` above.
         self._cum_rot_vec = torch.zeros(self.num_envs, 3, device=self.device)
+        # Per-axis (lo, hi) bounds on that cumulative rotation.  A single symmetric scalar cannot
+        # express what Slide needs: the wrist must be free to pitch ~25-30 deg DOWN (rx) for rail
+        # clearance while roll (ry) and yaw (rz) stay pinned within a few degrees of the reset pose.
+        # Defaults to the symmetric ``±orientation_max_dev_rad`` on every axis.
+        max_dev = float(getattr(cfg, "orientation_max_dev_rad", 0.26))
+        per_axis = getattr(cfg, "orientation_dev_limits_per_axis", None)
+        bounds = [(-max_dev, max_dev)] * 3 if per_axis is None else [tuple(b) for b in per_axis]
+        self._rot_box_lo = torch.tensor([[b[0] for b in bounds]], device=self.device, dtype=torch.float32)
+        self._rot_box_hi = torch.tensor([[b[1] for b in bounds]], device=self.device, dtype=torch.float32)
         self._home_q: torch.Tensor | None = None
         if getattr(cfg, "use_home_joint_posture_hold", False):
             home_map = cfg.home_joint_pos or {}
@@ -501,8 +510,7 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         idx = self._pose_rel_idx
         delta = self._processed_actions[:, idx + 3 : idx + 6]
         prospective = self._cum_rot_vec + delta
-        max_dev = float(self.cfg.orientation_max_dev_rad)
-        clamped = prospective.clamp(-max_dev, max_dev)
+        clamped = torch.max(torch.min(prospective, self._rot_box_hi), self._rot_box_lo)
         self._cum_rot_vec[:] = clamped
 
         if not hasattr(env, "_slide_reset_ee_quat_w"):
@@ -738,6 +746,14 @@ class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
     """
     orientation_max_dev_rad: float = 0.26
     """Max cumulative rotation (rad, ≈15°) per axis-angle component when the box is enabled."""
+    orientation_dev_limits_per_axis: Sequence[tuple[float, float]] | None = None
+    """Optional per-axis ``(lo, hi)`` cumulative rotation bounds (rad) for ``(rx, ry, rz)``.
+
+    Overrides the symmetric ``±orientation_max_dev_rad``.  Needed whenever one rotation axis must
+    stay free while the others are pinned -- Slide's wrist has to pitch tens of degrees DOWN about
+    ``rx`` for rail-guide clearance, but must not roll (``ry``) or yaw (``rz``) away from the
+    straddle orientation it was reset into.
+    """
     push_axis_world: tuple[float, float, float] = (0.0, 1.0, 0.0)
     lateral_axis_world: tuple[float, float, float] = (1.0, 0.0, 0.0)
     vertical_axis_world: tuple[float, float, float] = (0.0, 0.0, 1.0)
@@ -1266,9 +1282,9 @@ def gripper_wrist_carriage_tip_down_pitch_shaping(
     wrist_body_cfg: SceneEntityCfg | None,
     push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     target_pitch_down_deg: float = 20.0,
-    pitch_sigma_deg: float = 5.0,
+    max_pitch_down_deg: float = 60.0,
 ) -> torch.Tensor:
-    """Yaw alignment in XY plus a SIGNED, tip-DOWN-only target on wrist->jaw pitch.
+    """Yaw alignment in XY times a SIGNED, tip-DOWN-only, MONOTONE ramp on wrist->jaw pitch.
 
     ``gripper_wrist_carriage_target_pitch_shaping`` uses ``|u_wc_z|`` (absolute value), so it is
     direction-agnostic: a wrist tilted UP (jaw above wrist) and one tilted DOWN by the same angle
@@ -1277,10 +1293,24 @@ def gripper_wrist_carriage_tip_down_pitch_shaping(
     posture instead (see chat 2026-07-23 clearance discussion).
 
     This variant uses the SIGNED z-component of the wrist->jaw unit vector (world frame, +Z up), so
-    ONLY jaw-below-wrist (tip-down) is rewarded. With world +Z up, ``u_wc_z`` is
-    ``-sin(pitch_down)`` when the jaw droops below the wrist by ``pitch_down`` degrees from
-    horizontal; credit peaks when ``u_wc_z`` reaches ``-sin(target_pitch_down_deg)`` and falls off
-    over a ``pitch_sigma_deg``-wide band (same shape as the unsigned version, just sign-locked).
+    ONLY jaw-below-wrist (tip-down) earns credit: ``down = -u_wc_z`` is ``sin(pitch_down)`` when the
+    jaw droops below the wrist.
+
+    SHAPE (2026-07-27 fix): this used to be a NARROW SYMMETRIC PEAK,
+    ``exp(-|u_wc_z - target_z| / sin(pitch_sigma_deg))`` with a 6 deg sigma.  Measured by FK at the
+    side-base reset posture the wrist->jaw pitch is only ``-2.8 deg``, i.e. ~27 deg away from the
+    30 deg target, so that form evaluated to ``exp(-4.3) ~ 0.013`` of full credit with a gradient of
+    ~0.3% of the term's weight per degree -- a flat dead zone the policy could never climb, and it
+    also PENALISED going deeper than the target even though any angle at or past the clearance
+    requirement is equally acceptable (usually better).
+
+    Now the pitch factor is a monotone ramp that is linear in ``sin`` space:
+
+    * ``0`` while flat or tip-UP (no credit for the wrong sign),
+    * rising linearly to ``1`` at ``target_pitch_down_deg`` -- a real gradient from the reset pose,
+    * held at ``1`` through ``max_pitch_down_deg`` (so "target or steeper" is free), then
+    * decaying back toward 0 past ``max_pitch_down_deg``, which guards against degenerate
+      near-vertical postures that would swing the pads off the trailing face.
     """
     yaw = gripper_wrist_carriage_yaw_align_axis(
         env,
@@ -1298,11 +1328,16 @@ def gripper_wrist_carriage_tip_down_pitch_shaping(
     mid = 0.5 * (left + right)
     u_wc = mid - wrist
     u_wc = u_wc / torch.norm(u_wc, dim=-1, keepdim=True).clamp(min=1e-6)
-    z_signed = u_wc[:, 2]
-    target_z = -float(np.sin(np.radians(target_pitch_down_deg)))
-    sigma_z = max(float(np.sin(np.radians(pitch_sigma_deg))), 1e-6)
-    pitch_q = torch.exp(-torch.abs(z_signed - target_z) / sigma_z)
-    return yaw * pitch_q
+    # +1 = jaw straight below the wrist; <=0 = flat or jaw above the wrist (tip-up).
+    down = -u_wc[:, 2]
+    target_down = max(float(np.sin(np.radians(target_pitch_down_deg))), 1e-6)
+    max_down = float(np.sin(np.radians(max_pitch_down_deg)))
+    ramp = (down / target_down).clamp(0.0, 1.0)
+    if max_down > target_down:
+        # Linear decay from full credit at ``max_down`` to zero at straight-down (down = 1).
+        excess = (down - max_down).clamp(min=0.0)
+        ramp = ramp * (1.0 - excess / max(1.0 - max_down, 1e-6)).clamp(0.0, 1.0)
+    return yaw * ramp
 
 
 def gripper_wrist_pitch_deg_signed_obs(
