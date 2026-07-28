@@ -486,6 +486,22 @@ class WidowXTaskSpaceImpedanceAction(OperationalSpaceControllerAction):
         s_lat = s_lat.clamp(-lat_lim, lat_lim)
         s_vert = s_vert.clamp(-vert_lim, vert_lim)
 
+        # Leash the push target to what the arm has actually achieved.  The box alone only bounds
+        # where the target may END UP, not how far AHEAD of the arm it may sit: with
+        # position_scale=0.04 the policy saturates a 0.60 m push box in ~15 steps, and the target
+        # then sits a quarter of a metre beyond the fingertips for the rest of the episode.  The
+        # OSC reads that as a constant maximal position error on the stiffest axis and hauls the
+        # arm out to its reach boundary, where a 6-DoF arm cannot satisfy position and orientation
+        # at once -- position wins (ty stiffness 250-2500 vs rx 30-150) and the wrist collapses.
+        # Measured with a constant full push command: target +600 mm vs achieved +366 mm, EE lifted
+        # +72 mm through a +/-10 mm vertical box, wrist pitch -13 deg -> -75 deg.  Bounding the lead
+        # makes the setpoint advance only as fast as the arm follows, which also caps the push force
+        # at ``K_push * push_lead_max_m`` instead of ``K_push * position_scale`` every step.
+        lead = float(getattr(self.cfg, "push_lead_max_m", 0.0) or 0.0)
+        if lead > 0.0:
+            achieved_push = torch.sum((p_cur_w - p0_w) * push, dim=-1, keepdim=True)
+            s_push = torch.min(s_push, achieved_push + lead)
+
         offset_c = s_push * push + s_lat * lat + s_vert * vert
         self._cum_pos_w[:] = offset_c
         # Absolute target from reset; rewrite pose_rel delta so OSC desired = p_des.
@@ -761,6 +777,15 @@ class WidowXTaskSpaceImpedanceActionCfg(OperationalSpaceControllerActionCfg):
     vertical_half_range_m: float = 0.01
     push_offset_min_m: float = -0.05
     push_offset_max_m: float = 0.60
+    push_lead_max_m: float = 0.0
+    """Max distance the push target may sit AHEAD of the EE pose actually achieved (0 = disabled).
+
+    Without this the position box bounds only the target's endpoint, so a saturating policy parks
+    the setpoint a quarter of a metre past the fingertips and the OSC drags the arm to its reach
+    boundary, where orientation control collapses.  See
+    ``_clamp_pose_rel_to_reset_position_box``.  Doubles as a push-force cap: the steady-state
+    contact force becomes ``K_push * push_lead_max_m``.
+    """
 
 
 def store_slide_reset_ee_pose_w(
@@ -2154,6 +2179,7 @@ def approach_success_bonus_reward(
     width_gap_target_right_m: float | None = None,
     tip_mid_thickness_std: float | None = None,
     tip_mid_thickness_threshold: float = 0.5,
+    min_tip_down_deg: float | None = None,
     state_attr: str = "_approach_success_bonus_paid",
 ) -> torch.Tensor:
     """One-shot bonus (1.0) the first time :func:`approach_finger_target_success` is achieved."""
@@ -2182,6 +2208,7 @@ def approach_success_bonus_reward(
         width_gap_target_right_m=width_gap_target_right_m,
         tip_mid_thickness_std=tip_mid_thickness_std,
         tip_mid_thickness_threshold=tip_mid_thickness_threshold,
+        min_tip_down_deg=min_tip_down_deg,
     )
     newly = achieved & (~paid)
     paid[:] = paid | achieved
@@ -4307,6 +4334,7 @@ def approach_finger_target_success(
     width_gap_target_right_m: float | None = None,
     tip_mid_thickness_std: float | None = None,
     tip_mid_thickness_threshold: float = 0.5,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """Episode success when finger-target closedness AND tip mid-thickness index both clear their thresholds.
 
@@ -4315,6 +4343,14 @@ def approach_finger_target_success(
     (:func:`straddle_tip_mid_thickness_shaping`, also in ``[0, 1]``) must additionally be
     ``>= tip_mid_thickness_threshold``.  Leaving ``tip_mid_thickness_std=None`` reproduces the old
     closedness-only behaviour.
+
+    ``min_tip_down_deg`` additionally requires the wrist->pad-tip line to be pitched at least that
+    far below horizontal.  This is a Slide feasibility gate, not an Approach objective: this
+    termination is what ``scripts/collect_approach_states.py`` filters on, so whatever posture is
+    admitted here becomes the entire starting distribution of the Slide phase.  With the pad tips
+    pinned to the trailing edge, the finger bodies clear the board-support rails by roughly
+    ``tip_offset_m * sin(pitch)``, so a shallow terminal pose leaves the lower finger inside the rail
+    and the slide jams a few centimetres in no matter what the Slide policy does.
     """
     closedness = straddle_finger_target_closedness(
         env,
@@ -4347,6 +4383,9 @@ def approach_finger_target_success(
             width_gap_target_right_m=width_gap_target_right_m,
         )
         achieved = achieved & (tip_mid_thickness >= float(tip_mid_thickness_threshold))
+    if min_tip_down_deg is not None:
+        pitch_deg = gripper_wrist_pitch_deg_signed_obs(env, left_finger_cfg, right_finger_cfg, wrist_body_cfg)
+        achieved = achieved & (pitch_deg <= -float(min_tip_down_deg))
     return achieved
 
 
@@ -4397,6 +4436,7 @@ def approach_near_success_shaping_scale(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """Scale in ``[min_scale, 1]`` that fades dense shaping as tight closedness nears success.
 
@@ -4404,6 +4444,12 @@ def approach_near_success_shaping_scale(
     is 1 (full shaping credit while approaching).  Between ``fade_start`` and ``fade_end`` it
     linearly falls to ``min_scale``, so lingering near-success no longer farms more return than
     terminating with the success bonus (the collapse mode seen around epoch 10 → 100).
+
+    ``min_tip_down_deg`` must mirror the success termination's pitch gate whenever that gate is in
+    use.  The fade only makes sense once staying put is genuinely worse than terminating, and that
+    is false while the pose is still pitch-ineligible: closedness alone can sit past ``fade_end``
+    with the wrist too flat to ever trigger success, which would strand the policy holding position
+    on 5% shaping with no way to bank the bonus.  Envs that fail the pitch gate keep full shaping.
     """
     closedness_tight = straddle_finger_target_closedness(
         env,
@@ -4425,6 +4471,9 @@ def approach_near_success_shaping_scale(
     if end <= start:
         return torch.ones_like(closedness_tight)
     t = ((closedness_tight - start) / (end - start)).clamp(0.0, 1.0)
+    if min_tip_down_deg is not None:
+        pitch_deg = gripper_wrist_pitch_deg_signed_obs(env, left_finger_cfg, right_finger_cfg, wrist_body_cfg)
+        t = torch.where(pitch_deg <= -float(min_tip_down_deg), t, torch.zeros_like(t))
     return 1.0 - t * (1.0 - lo)
 
 
@@ -4446,6 +4495,7 @@ def _apply_near_success_fade(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     scale = approach_near_success_shaping_scale(
         env,
@@ -4463,6 +4513,7 @@ def _apply_near_success_fade(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
     return reward * scale
 
@@ -4484,6 +4535,7 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_finger_trailing_width_proximity` with near-success shaping fade."""
     reward = straddle_finger_trailing_width_proximity(
@@ -4517,6 +4569,7 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
 
 
@@ -4539,6 +4592,7 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
     closedness_std: float = 0.10,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_tip_mid_thickness_shaping_gated` with near-success shaping fade."""
     reward = straddle_tip_mid_thickness_shaping_gated(
@@ -4574,6 +4628,7 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
 
 
@@ -4597,6 +4652,7 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
     finger_offset_m: float = 0.020,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_trailing_face_bounded_approach_reward` with near-success shaping fade."""
     reward = straddle_trailing_face_bounded_approach_reward(
@@ -4630,6 +4686,7 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
 
 
@@ -4654,6 +4711,7 @@ def pcb_between_gripper_fingers_fade_near_success(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     finger_offset_m: float = 0.020,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """:func:`pcb_between_gripper_fingers` with near-success shaping fade."""
     if gripper_joint_cfg is None:
@@ -4692,6 +4750,7 @@ def pcb_between_gripper_fingers_fade_near_success(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
 
 
@@ -4712,6 +4771,7 @@ def straddle_lateral_gap_shaping_fade_near_success(
     tip_offset_m: float = 0.0,
     wrist_body_cfg: SceneEntityCfg | None = None,
     finger_offset_m: float = 0.020,
+    min_tip_down_deg: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_lateral_gap_shaping` with near-success shaping fade."""
     reward = straddle_lateral_gap_shaping(
@@ -4744,6 +4804,7 @@ def straddle_lateral_gap_shaping_fade_near_success(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
     )
 
 

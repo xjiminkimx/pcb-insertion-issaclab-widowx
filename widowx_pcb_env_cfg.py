@@ -426,7 +426,22 @@ _APPROACH_HOME_JOINT_HOLD_KD = 8.0
 # fingers ending up split across the PCB top+bottom faces instead of side-by-side).  Cap the
 # cumulative commanded rotation per axis-angle component to keep it bounded regardless of what
 # the policy outputs; see ``task_orientation_box_enabled`` on the action cfg below.
-_ARM_TASK_ORIENTATION_MAX_DEV_RAD = 0.15  # ~15 deg
+_ARM_TASK_ORIENTATION_MAX_DEV_RAD = 0.15  # 0.15 rad = 8.6 deg (NOT 15 deg -- old comment was wrong)
+# Per-axis cumulative rotation bounds for Approach, (min, max) rad, ordered (rx, ry, rz).
+#
+# rx (pitch) is opened asymmetrically to -0.50 rad = -29 deg on the tip-down side.  The symmetric
+# 0.15 rad box was the reason Approach kept handing Slide a nearly flat wrist: the home pose starts
+# at only -2.8 deg of tip-down, so 8.6 deg of travel caps the terminal pose near -11 deg, and -13 deg
+# is exactly what was measured -- the policy was pinned against the box, not choosing that posture.
+# Slide cannot recover it later (its OSC pivots about the wrist, so tipping down there swings the
+# pads off the board), and the board's support rails need the finger bodies lifted, which with the
+# pads pinned to the trailing edge means ``_GRIPPER_TIP_OFFSET_M * sin(pitch)``.  -0.50 rad leaves
+# room to reach the 25 deg shaping target with margin.  The tip-UP side stays at 0.15.
+_APPROACH_ORIENTATION_DEV_LIMITS_PER_AXIS = (
+    (-0.50, 0.15),  # rx — pitch, tip-down is negative
+    (-0.15, 0.15),  # ry — roll about the push axis
+    (-0.15, 0.15),  # rz — yaw about vertical
+)
 # TRANSLATION "쳐짐" (arm sinking): with ``pose_rel`` the OSC target is ``current + delta`` every
 # step, so gravity-compensation residual sinks the arm AND the setpoint together (a ratchet).
 # Measured with ZERO actions: pad Z -6 mm @ 0.2 s, -38 mm @ 2 s, -71 mm @ 3.8 s.  Raising stiffness
@@ -514,19 +529,29 @@ _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
     # (keeping scale=0.01) or scale alone (keeping stiffness=1000) was NOT enough in isolation --
     # the max deliverable force is ~stiffness * scale, so both needed to move together.
     (250.0, 2500.0),
-    # tz/ry: LOW (not zero) ceilings -- soft compliance instead of the fully-free (motion
-    # axis=0) config that let ty's stronger push force excite an unrestrained, undamped runaway
-    # in these directions and crash the sim (see note above _ARM_TASK_SLIDE_MOTION_AXES). ~15-50x
-    # softer than tx/ty/rz so the arm still has real reach/reconfiguration freedom.
-    (15.0, 60.0),
-    # rx (pitch) ceiling raised 50 -> 150 (2026-07-23): with rx capped at 50, the policy could
-    # command a tip-down wrist (see wrist_tip_down reward below) but had no authority to HOLD it
-    # once the jaw/carriage mechanism made contact with the rail guide mid-slide -- the contact
-    # reaction torque simply overpowered the soft spring and the jaw sagged back down, jamming
-    # against the guide and stalling the slide. Raised enough to survive that specific contact
-    # load while staying well below tx/ty/rz (200-2500) so reach/reconfiguration compliance and
-    # the earlier flailing-crash margin (see post-mortem above) are preserved.
-    (30.0, 150.0),
+    # tz ceiling raised again 1200 -> 4000 (2026-07-28).  Even at a full stiffness command, 1200 N/m
+    # leaves ~8 mm of pure static gravity sag at the pads -- and the feature they have to stay on is
+    # the board's 1 mm thick trailing edge, so 8 mm of sag is the difference between pushing the edge
+    # and missing it entirely.  Measured finger height above the board plane at full stiffness:
+    # -0.9 mm with a 1200 ceiling, +3.7 mm with 4000, +4.5 mm with 10000, so 4000 recovers nearly all
+    # of the sag and anything past it is wasted torque headroom.
+    #
+    # tz raised 15-60 -> 200-1200 (2026-07-27, "wrist가 아래로 쳐진다" post-mortem).  A 60 N/m
+    # ceiling is nearly a free axis: pushing on ty couples into +Z, and 60 N/m cannot resist it.
+    # Measured under a constant full push command, with the vertical box already clamping the
+    # TARGET to +/-10 mm, the EE still climbed +162 mm -- a 152 mm tracking error the spring
+    # answered with 9 N.  The pads left the 1 mm board edge, the board stopped at 28 mm, and the
+    # wrist rolled over to -75 deg following the runaway.  The floor matters as much as the
+    # ceiling here: with lo=15 a soft policy command still bought only ~22 N/m.  At 200-1200 the
+    # same test holds the EE inside +7 mm and the pitch inside 2 deg of its commanded value.
+    (200.0, 4000.0),
+    # rx (pitch) 30-150 -> 100-400 (2026-07-27).  Same story one axis over: 150 N.m/rad is not
+    # enough to hold the commanded tip-down once the push reaction loads the wrist, and the pitch
+    # is the whole point of the posture (jaw/carriage rail-guide clearance).  Earlier note from
+    # 2026-07-23 raised this 50 -> 150 for exactly the same symptom under a lighter load; the
+    # measurement above shows 150 was still short.  Stays well below tx/ty (1000-2500) so the arm
+    # keeps reach/reconfiguration compliance and the flailing-crash margin from the post-mortem.
+    (100.0, 400.0),
     (10.0, 50.0),
     (60.0, 300.0),
 )
@@ -563,6 +588,10 @@ _SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 30.0
 # every axis would let roll/yaw drift 20 deg.
 _SLIDE_ORIENTATION_DEV_LIMITS_PER_AXIS = (
     (-0.30, 0.09),
+    # ry (roll about the push axis).  Do NOT open this up to fix the jaw roll -- measured 2026-07-27,
+    # commanding ry does not roll about the pad line, it lifts the whole EE ~33 mm and the pads let
+    # go of the board (EE advanced 42 mm while the board moved 15.6 mm).  The roll has to be fixed
+    # upstream, in the home pose / Approach handoff; see the note on the rail channel below.
     (-0.10, 0.10),
     (-0.12, 0.12),
 )
@@ -570,6 +599,17 @@ _SLIDE_EE_LATERAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.01
 _SLIDE_EE_PUSH_OFFSET_MIN_M = 0.0
 _SLIDE_EE_PUSH_OFFSET_MAX_M = 0.60
+# Max lead of the push SETPOINT over the pose the arm actually reached.  The box above bounds only
+# where the target ends up; with position_scale=0.04 a saturating policy hits +600 mm in ~15 steps
+# and the setpoint then sits ~234 mm past the fingertips forever.  The OSC turns that standing error
+# into maximum force on the stiffest axis and hauls the arm to its reach boundary, where position
+# and orientation can no longer both be satisfied -- position wins (ty 250-2500 vs rx 30-150) and
+# the wrist collapses (measured: pitch -13 deg -> -75 deg, EE lifted +72 mm through a +/-10 mm
+# vertical box).  Set equal to ``_ARM_TASK_SLIDE_POSITION_SCALE`` so the steady-state push force is
+# the same ``K_push * scale`` the stiffness table was tuned around -- the lead caps how far the
+# setpoint may run away, without changing the force envelope.  Halving it to 0.02 was measured to
+# stall the board at 13 mm, so this is a floor, not a free parameter.
+_SLIDE_EE_PUSH_LEAD_MAX_M = _ARM_TASK_SLIDE_POSITION_SCALE
 _LATERAL_AXIS_WORLD = (1.0, 0.0, 0.0)
 # OSC body frame: wrist link (``link_6``); pad-tip frame uses ``body_offset`` below.
 _EE_OSC_BODY_NAME = "link_6"
@@ -709,6 +749,23 @@ _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.55
 # [0, 1]) to reach this value — pads must sit near the PCB mid-thickness plane, not just be
 # laterally closed around the trailing edge.
 _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
+# Success ALSO requires the wrist->pad-tip line to be tipped at least this far below horizontal.
+#
+# This is the Slide phase's feasibility gate, imposed here because `collect_approach_states.py`
+# filters on this very termination -- every pose it admits becomes a Slide starting state.  The
+# board runs in a channel whose support rails top out ~0.5 mm BELOW the board plane, and the fingers
+# straddle the board directly over those rails.  With the pads pinned to the trailing edge, finger
+# body height over the rails is ~``_GRIPPER_TIP_OFFSET_M * sin(pitch)`` = 60 mm * sin(pitch), and the
+# home posture's inherited jaw roll skews the two fingers ~+/-8.75 mm about that mean.  So the lower
+# finger clears the rail only above ~12 deg, and the measured terminal pose of the current policy is
+# 13 deg -- right on the boundary, which is why the slide jammed after 35 mm of a 312 mm push with
+# four joints at their torque limits.  18 deg puts the low finger ~10 mm clear; the shaping target
+# below asks for more so the gate is not the binding constraint.
+_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 18.0
+# Shaping target/ceiling for the same posture.  Aimed above the gate so the policy settles with
+# margin: 25 deg puts the mean finger body 25 mm over the rails, low finger ~16 mm.
+_APPROACH_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
+_APPROACH_WRIST_MAX_PITCH_DOWN_DEG = 35.0
 # Dense shaping fade near success (tight closedness): full credit below fade_start, linearly
 # down to min_scale by fade_end.  Stops farming loose shaping for a full episode instead of
 # taking the one-shot success bonus / early terminate.
@@ -775,6 +832,9 @@ def _approach_near_success_fade_params(**extra) -> dict:
         "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
         "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
         "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+        # Must track the success termination's pitch gate, or shaping fades out on poses that can
+        # never actually succeed.
+        "min_tip_down_deg": _APPROACH_SUCCESS_MIN_TIP_DOWN_DEG,
     }
     base.update(extra)
     return base
@@ -881,6 +941,7 @@ def _approach_success_params(**extra) -> dict:
         closedness_threshold=_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD,
         tip_mid_thickness_std=_APPROACH_MID_THICKNESS_STD_M,
         tip_mid_thickness_threshold=_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
+        min_tip_down_deg=_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG,
         **extra,
     )
 
@@ -1277,6 +1338,7 @@ class ActionsCfgApproach:
         home_joint_posture_hold_damping=_APPROACH_HOME_JOINT_HOLD_KD,
         task_orientation_box_enabled=True,
         orientation_max_dev_rad=_ARM_TASK_ORIENTATION_MAX_DEV_RAD,
+        orientation_dev_limits_per_axis=_APPROACH_ORIENTATION_DEV_LIMITS_PER_AXIS,
         # Absolute-from-reset EE translation box (world frame).  Anchored by ``store_reset_ee_pose``
         # in ``EventCfgApproach``; the clamp itself accumulates an absolute offset and rewrites
         # each step's pose_rel delta so the OSC target equals ``p0 + offset`` (see mdp_custom).
@@ -1385,6 +1447,7 @@ class ActionsCfgSlide:
         vertical_half_range_m=_SLIDE_EE_VERTICAL_HALF_RANGE_M,
         push_offset_min_m=_SLIDE_EE_PUSH_OFFSET_MIN_M,
         push_offset_max_m=_SLIDE_EE_PUSH_OFFSET_MAX_M,
+        push_lead_max_m=_SLIDE_EE_PUSH_LEAD_MAX_M,
     )
 
 
@@ -1671,32 +1734,39 @@ class RewardsApproachCfg():
     # SIGNED tip-down shaping (2026-07-23): swapped from the unsigned
     # ``gripper_wrist_carriage_target_pitch_shaping`` (which scored tip-up and tip-down identically
     # via ``|u_wc_z|``, so the policy had no reason to pick tip-down) to
-    # ``gripper_wrist_carriage_tip_down_pitch_shaping``, which only rewards jaw-below-wrist. Reuses
-    # the Slide target angle here too so Approach's terminal pose already anchors near the posture
-    # Slide needs for rail-guide clearance.
-    # wrist_tip_down = RewardTermCfg(
-    #     func=gripper_wrist_carriage_tip_down_pitch_shaping,
-    #     params={
-    #         "left_finger_cfg": _LEFT_FINGER,
-    #         "right_finger_cfg": _RIGHT_FINGER,
-    #         "wrist_body_cfg": _WRIST_BODY,
-    #         "push_axis_world": PUSH_AXIS_WORLD,
-    #         "target_pitch_down_deg": _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG,
-    #         "max_pitch_down_deg": _SLIDE_WRIST_MAX_PITCH_DOWN_DEG,
-    #     },
-    #     weight=80.0,
-    # )
-    # # Debug-only (near-zero weight): logs the SIGNED achieved pitch in degrees to TensorBoard so
-    # # the tip-down direction/convergence can be sanity-checked without a live play session.
-    # wrist_pitch_deg_debug = RewardTermCfg(
-    #     func=gripper_wrist_pitch_deg_signed_obs,
-    #     params={
-    #         "left_finger_cfg": _LEFT_FINGER,
-    #         "right_finger_cfg": _RIGHT_FINGER,
-    #         "wrist_body_cfg": _WRIST_BODY,
-    #     },
-    #     weight=1e-10,
-    # )
+    # ``gripper_wrist_carriage_tip_down_pitch_shaping``, which only rewards jaw-below-wrist.
+    #
+    # Re-enabled 2026-07-28 and given its own (steeper) target rather than reusing the Slide one.
+    # It was commented out on the theory that Slide could tip the wrist down itself, and that turned
+    # out to be false: the Slide OSC rotates about the WRIST, so commanding tip-down there swings the
+    # pads down off the board instead of lifting the carriage.  The pivot is only at the pads while
+    # Approach's trailing-edge terms are holding them there, so this posture has to be established
+    # HERE.  Paired with the ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` gate on the success termination
+    # so the collected terminal states cannot include shallow poses.
+    wrist_tip_down = RewardTermCfg(
+        func=gripper_wrist_carriage_tip_down_pitch_shaping,
+        params={
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "wrist_body_cfg": _WRIST_BODY,
+            "push_axis_world": PUSH_AXIS_WORLD,
+            "target_pitch_down_deg": _APPROACH_WRIST_TARGET_PITCH_DOWN_DEG,
+            "max_pitch_down_deg": _APPROACH_WRIST_MAX_PITCH_DOWN_DEG,
+        },
+        weight=80.0,
+    )
+    # Debug-only (near-zero weight): logs the SIGNED achieved pitch in degrees to TensorBoard so the
+    # tip-down direction/convergence can be sanity-checked without a live play session.  Worth
+    # watching during this retrain: if it plateaus above -18 deg the success gate will never fire.
+    wrist_pitch_deg_debug = RewardTermCfg(
+        func=gripper_wrist_pitch_deg_signed_obs,
+        params={
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "wrist_body_cfg": _WRIST_BODY,
+        },
+        weight=1e-10,
+    )
 
     approach_success_bonus = RewardTermCfg(
         func=approach_success_bonus_reward,
@@ -1965,6 +2035,12 @@ class EventCfgSlide:
         mode="reset",
         params=_approach_hold_gripper_open_always_params(),
     )
+    # Deliberately NOT levelling the jaw roll here (tried and reverted 2026-07-28).  Rolling the jaw
+    # at reset does lift the low finger clear of the support rails, but it pivots about the WRIST, so
+    # it lifts the pad tips off the board's 1 mm edge too -- the board then got scooped upward 14 mm
+    # and slid backwards.  Finger-body height over the rails is ~``tip_offset * sin(pitch)`` with the
+    # pads pinned to the trailing edge, so the posture has to come out of Approach already tipped
+    # down; see ``wrist_tip_down`` in ``RewardsApproachCfg`` and the success pitch gate.
     store_slide_reset_ee_pose = EventTermCfg(
         func=store_slide_reset_ee_pose_w,
         mode="reset",
@@ -2134,7 +2210,7 @@ class WidowXPcbSlideEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 8.0
+        self.episode_length_s = 5.0
         _rb_x, _rb_y, _ = _ROBOT_BASE_POS
         self.viewer.eye = (_rb_x + 0.82, _rb_y + 0.08, _RAIL_CENTER_Z_ENV + 0.28)
         self.viewer.lookat = (_CONVEYOR_CENTER_X_ENV, 0.28, _RAIL_CENTER_Z_ENV)
