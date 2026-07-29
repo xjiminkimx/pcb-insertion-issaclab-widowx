@@ -8228,6 +8228,33 @@ def pcb_leading_edge_z_lift_penalty(
     return torch.square(excess / cap)
 
 
+def pcb_trailing_edge_lift_vs_leading_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    max_lift_m: float = 0.003,
+    max_penalty_excess_m: float = 0.015,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """Penalty when the trailing short edge sits higher than the leading edge (shovel / tip-under).
+
+    Tip-down pitch is needed for carriage/rail clearance, but if the pads dig *under* the board's
+    1 mm trailing face they pry the trailing edge up while the leading edge stays on the belt.
+    Flat slide keeps ``trail_z ≈ lead_z``; shovel tilt makes ``trail_z - lead_z`` positive.
+
+    ``excess = relu(trail_z - lead_z - max_lift_m)`` squared and normalised to ``[0, 1]``.
+    Pair with a **negative** weight.
+    """
+    trail_w = pcb_trailing_short_edge_center_w(env, pcb_cfg, half_length_m, axis_world)
+    lead_w = pcb_leading_short_edge_center_w(env, pcb_cfg, half_length_m, axis_world)
+    origin_z = env.scene.env_origins[:, 2]
+    delta = (trail_w[:, 2] - origin_z) - (lead_w[:, 2] - origin_z)
+    excess = torch.clamp(delta - float(max_lift_m), min=0.0)
+    cap = max(float(max_penalty_excess_m), 1e-9)
+    excess = torch.clamp(excess, max=cap)
+    return torch.square(excess / cap)
+
+
 def pcb_leading_edge_z_lift_exponential_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,

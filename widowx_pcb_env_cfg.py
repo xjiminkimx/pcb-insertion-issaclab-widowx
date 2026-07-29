@@ -67,6 +67,8 @@ from .mdp_custom import (
     slide_pcb_yaw_xy_alignment_shaping,
     slide_pcb_yaw_sin_obs,
     pcb_yaw_abs_exceeds,
+    pcb_trailing_edge_lift_vs_leading_penalty,
+    straddle_tip_mid_thickness_shaping,
     slide_finger_push_axis_delta_obs,
     store_slide_reset_ee_pose_w,
     WidowXTaskSpaceImpedanceActionCfg,
@@ -587,8 +589,8 @@ _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
 # rather than a guessed optimum (was 30 with a 6 deg sigma, which measured 0.013 of full credit at
 # the actual reset posture -- see the shape note in the reward function).  ``MAX`` only guards
 # against degenerate near-vertical postures that would swing the pads off the trailing face.
-_SLIDE_WRIST_TARGET_PITCH_DOWN_DEG = 20.0
-_SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 30.0
+_SLIDE_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
+_SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 35.0
 # Cumulative EE rotation box for Slide, per task axis (rx, ry, rz) in rad, measured FROM THE RESET
 # ORIENTATION (the replayed straddle pose, measured at -13 deg pitch by
 # ``scripts/diag_ee_box.py --slide``).  The base is un-rotated, so these are world axes:
@@ -666,7 +668,12 @@ _SLIDE_SUCCESS_TARGET_LEAD_XY_ENV = (
     _SLIDE_SUCCESS_LEAD_Y_ENV,
 )
 _SLIDE_SUCCESS_LEAD_XY_TOLERANCE_M = (
-    0.003,
+    # X loosened 0.003 -> 0.010 (2026-07-29).  After ~90 Slide epochs milestones/travel looked
+    # meaningful in play but ``slide_success`` / success_bonus stayed at 0: a ±3 mm box on the
+    # leading-edge centre is tighter than the rail lane the milestones already allow (±20 mm), so
+    # the policy could push far along +Y and still never bank the bonus.  ±10 mm matches a
+    # realistic mouth/lane tolerance without turning success into a freebie.
+    0.010,
     _SLIDE_SUCCESS_LEAD_Y_TOLERANCE_M,
 )
 _SLIDE_MAX_GRIPPER_GAP_M = PCB_Z * 2.0  # ``left_carriage_joint`` must stay below this at success
@@ -780,7 +787,7 @@ _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
 # 13 deg -- right on the boundary, which is why the slide jammed after 35 mm of a 312 mm push with
 # four joints at their torque limits.  18 deg puts the low finger ~10 mm clear; the shaping target
 # below asks for more so the gate is not the binding constraint.
-_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 15.0
+_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 17.5
 # Shaping target/ceiling for the same posture.  Aimed above the gate so the policy settles with
 # margin: 25 deg puts the mean finger body 25 mm over the rails, low finger ~16 mm.
 _APPROACH_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
@@ -1886,6 +1893,30 @@ class RewardsSlideCfg:
         func=straddle_lateral_gap_shaping,
         params=_approach_lateral_gap_params(),
         weight=4.0,
+    )
+
+    # Keep pad tips on the trailing-edge mid-thickness plane during the push.  Tip-down for
+    # carriage/rail clearance is correct, but without this the pads can slide *under* the 1 mm
+    # board and shovel the trailing edge up (seen in play ~ep90).  Same geometry as Approach.
+    tip_mid_thickness = RewardTermCfg(
+        func=straddle_tip_mid_thickness_shaping,
+        params=_approach_mid_thickness_params(),
+        weight=15.0,
+    )
+
+    # Shovel / tip-under: trailing edge higher than leading edge.  Complements tip_mid above --
+    # tip_mid is a soft attractor to the mid-plane; this is an explicit penalty once the board
+    # is already being pried up.  max_lift 3 mm ignores tiny contact wobble.
+    pcb_trailing_lift_penalty = RewardTermCfg(
+        func=pcb_trailing_edge_lift_vs_leading_penalty,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "max_lift_m": 0.003,
+            "max_penalty_excess_m": 0.015,
+            "axis_world": PUSH_AXIS_WORLD,
+        },
+        weight=-40.0,
     )
 
     # Ungated: credit any +Y leading-edge progress / push-axis speed (no closedness gate).
