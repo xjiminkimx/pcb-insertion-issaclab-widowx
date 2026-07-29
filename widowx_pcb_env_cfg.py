@@ -43,6 +43,7 @@ from .mdp_custom import (
     straddle_tip_mid_thickness_shaping_gated_fade_near_success,
     gripper_jaw_tips_level_reward,
     gripper_wrist_carriage_tip_down_pitch_shaping,
+    gripper_wrist_carriage_tip_down_pitch_shaping_gated,
     gripper_wrist_pitch_deg_signed_obs,
     straddle_trailing_face_bounded_approach_reward_fade_near_success,
     straddle_finger_trailing_width_proximity_fade_near_success,
@@ -392,24 +393,42 @@ _ARM_TASK_MOTION_AXES = (1, 1, 1, 1, 1, 1)
 # resist the wrist pitching down, so it now belongs on rx; ry (roll about the push axis, which only
 # needs to keep the board flat) goes back to 300.
 _ARM_TASK_STIFFNESS_LIMITS_PER_AXIS = (
-    (300.0, 1500.0),  # tx — lateral (world +X, across the belt)
-    (300.0, 1500.0),  # ty — push / insertion (world +Y)
-    (800.0, 2000.0),  # tz — vertical; raised 2026-07-26 (side-base wrist twist loses vertical authority)
-    (500.0, 1500.0),  # rx — pitch about the lateral axis = the "nose drops" droop direction
-    (300.0, 1500.0),  # ry — roll about the push axis (board flatness / anti side-tilt)
-    (100.0, 1500.0),  # rz — yaw about vertical; softest, lets the gripper align to the board
+    # Softened 2026-07-28 (Approach contact chatter post-mortem).  Training was commanding
+    # mean K ≈ 1283 N/m (near the old 1500 ceilings) with ζ ≈ 1.7 from epoch 5 onward, and play
+    # showed the pads reach the trailing edge tip-down but then SHAKE instead of seating -- so
+    # ``closedness_tight`` peaks briefly (~0.25 live @ ep15) and collapses back to ~0.08 while tip
+    # distances stall at ~43 mm (need ~12 mm for the 0.55 success bar).  High task-space K against
+    # a 1 mm board edge is classic contact chatter; the tip-down reward gate alone could not fix
+    # it because the policy was already tip-down without that reward.  tx/ty ceilings cut so the
+    # approach along/across the edge cannot go stiff-max; tz/rx stay firmer to hold height/pitch.
+    #
+    # Approach-only: Slide keeps ``_ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS`` (stiff ty for push).
+    (200.0, 800.0),   # tx — lateral across the belt (was 300-1500)
+    (200.0, 800.0),   # ty — approach / push toward trailing edge (was 300-1500)
+    (600.0, 1600.0),  # tz — vertical; still firm vs gravity, but ceiling cut 2000->1600
+    (400.0, 1200.0),  # rx — pitch hold (was 500-1500)
+    (200.0, 800.0),   # ry — roll about push axis (was 300-1500)
+    (100.0, 800.0),   # rz — yaw align (was 100-1500)
 )
-_ARM_TASK_STIFFNESS_LIMITS = (200.0, 1500.0)
-_ARM_TASK_DAMPING_RATIO_LIMITS = (0.6, 2.0)
+# Shared OSC ``motion_stiffness_limits_task`` envelope (must span BOTH Approach and Slide per-axis
+# ceilings; Slide ty goes to 2500).  Per-axis clamps do the real policy limiting.
+_ARM_TASK_STIFFNESS_LIMITS = (200.0, 2500.0)
+# Approach prefers a higher ζ band against contact chatter; Slide ActionsCfg overrides with its
+# own floors but reuses this envelope (2.5 ceiling is fine for both).
+_ARM_TASK_DAMPING_RATIO_LIMITS = (0.8, 2.5)
 _ARM_TASK_DEFAULT_STIFFNESS = 200.0
 _ARM_TASK_DEFAULT_DAMPING_RATIO = 1.2
-# Floor on the policy-commanded K/ζ fraction-of-range (see ``_map_stiffness_action`` bug-fix note
-# in mdp_custom.py).  Raised 0.3 -> 0.5 after the side-base re-place: the wrist-yawed home pose
-# that opens the jaws along world X has worse vertical manipulability than the old behind-belt
-# home, so the same soft floor let gravity-compensation residual win even with the absolute EE
-# anchor (diag_ee_box: restoring delta commanded but live Z still sank ~18 mm).
-_ARM_TASK_STIFFNESS_ACTION_FLOOR = 0.5
-_ARM_TASK_DAMPING_ACTION_FLOOR = 0.6
+# Approach-only floors on the policy-commanded K/ζ fraction-of-range (see ``_map_stiffness_action``
+# bug-fix note in mdp_custom.py).  Slide sets its own floors on ``ActionsCfgSlide``.
+#
+# 0.5 was raised after the side-base re-place to fight gravity sag, but it made soft contact
+# unreachable: with floor=0.5 the softest ty was already ~900 N/m, and the measured policy sat near
+# the ceiling (~1283) anyway.  Lowered 0.5 -> 0.15 so the policy can command a compliant touch at
+# the trailing edge; droop is primarily held by the absolute EE position box + home joint hold.
+# Damping floor 0.5 on the (0.8, 2.5) ζ range forces ζ ≳ 1.65 -- critically/over-damped -- so
+# contact chatter has less room to grow.
+_ARM_TASK_STIFFNESS_ACTION_FLOOR = 0.15
+_ARM_TASK_DAMPING_ACTION_FLOOR = 0.5
 # Soft joint-space PD toward ``_ROBOT_HOME_JOINT_POS`` (additive on top of OSC).  The side-base
 # home twists the wrist ~90 deg so task-space vertical force maps poorly through the Jacobian;
 # this joint spring keeps shoulder/elbow from folding under gravity residual.  Gains stay well
@@ -717,8 +736,8 @@ _APPROACH_GAP_RIGHT_M = 0.015
 _APPROACH_FINGER_OFFSET_M = 0.015
 # Approach shaping (finger_proximity): wide σ so gradient is active from ~10–15 cm behind edge.
 _APPROACH_PROXIMITY_STD_M = 0.10
-# Success / termination closedness: tight σ for ±20 mm placement at trailing edge.
-_APPROACH_SUCCESS_STD_M = 0.025
+# Success / termination closedness σ at the trailing-edge ±width targets.
+_APPROACH_SUCCESS_STD_M = 0.035
 _APPROACH_WIDTH_GAP_SIGMA_M = _APPROACH_SUCCESS_STD_M
 # Far-field along (+Y) approach to trailing face (per-jaw, one-sided).
 _APPROACH_ALONG_APPROACH_STD_M = 0.050
@@ -761,11 +780,17 @@ _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
 # 13 deg -- right on the boundary, which is why the slide jammed after 35 mm of a 312 mm push with
 # four joints at their torque limits.  18 deg puts the low finger ~10 mm clear; the shaping target
 # below asks for more so the gate is not the binding constraint.
-_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 18.0
+_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 15.0
 # Shaping target/ceiling for the same posture.  Aimed above the gate so the policy settles with
 # margin: 25 deg puts the mean finger body 25 mm over the rails, low finger ~16 mm.
 _APPROACH_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
 _APPROACH_WRIST_MAX_PITCH_DOWN_DEG = 35.0
+# Tip-down reward only unlocks after tight closedness has started climbing.  Without this gate the
+# policy farmed a deep wrist pitch (``wrist_tip_down`` ~full credit) while ``closedness_tight``
+# plateaued at ~0.10-0.15 and success stayed ~0 for 260 epochs. Soft ramp: 0 at gate_start, 1 at
+# gate_full, using the same σ as the success termination.
+_APPROACH_TIP_DOWN_GATE_START = 0.20
+_APPROACH_TIP_DOWN_GATE_FULL = 0.40
 # Dense shaping fade near success (tight closedness): full credit below fade_start, linearly
 # down to min_scale by fade_end.  Stops farming loose shaping for a full episode instead of
 # taking the one-shot success bonus / early terminate.
@@ -1720,7 +1745,15 @@ class RewardsApproachCfg():
     )
 
     # Approach = straddle only: any +Y slide of the PCB toward the magazine is forbidden.
-    # Flat -50 per step once the board has moved >5 mm past spawn Y (binary indicator).
+    # Binary indicator once the board has moved >5 mm past spawn Y.
+    #
+    # Weight cut -3000 -> -100 (2026-07-28).  At -3000, the moment the pads seat tip-down on the
+    # trailing edge and the board jitters a few mm forward (visible shake in play), every remaining
+    # step of the episode is crushed -- so the policy learns to hover / chatter just short of firm
+    # contact rather than hold the straddle.  Episode-mean push_pen looked small (-1..-10) because
+    # most envs never contact hard enough to trip it; the rare seated envs that do are the ones
+    # that would have produced success.  -100 still discourages real sliding without overpowering
+    # the ~100-weighted seating terms.
     pcb_forward_push_penalty = RewardTermCfg(
         func=pcb_forward_push_displacement_indicator,
         params={
@@ -1728,7 +1761,7 @@ class RewardsApproachCfg():
             "initial_y_env": _PCB_INIT_POS[1],
             "max_displacement_m": 0.005,
         },
-        weight=-3000.0,
+        weight=-100.0,
     )
 
     # SIGNED tip-down shaping (2026-07-23): swapped from the unsigned
@@ -1743,21 +1776,36 @@ class RewardsApproachCfg():
     # Approach's trailing-edge terms are holding them there, so this posture has to be established
     # HERE.  Paired with the ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` gate on the success termination
     # so the collected terminal states cannot include shallow poses.
+    #
+    # GATED + weight 80 -> 40 (2026-07-28 post-mortem): un-gated tip-down at weight 80 let the
+    # policy farm a deep wrist pitch while ``closedness_tight`` sat at ~0.10-0.15 (need 0.55) and
+    # success never fired.  Tip-down now only pays after tight closedness has climbed past
+    # ``_APPROACH_TIP_DOWN_GATE_START``, so seating comes first and pitch reinforces the seated pose.
     wrist_tip_down = RewardTermCfg(
-        func=gripper_wrist_carriage_tip_down_pitch_shaping,
+        func=gripper_wrist_carriage_tip_down_pitch_shaping_gated,
         params={
             "left_finger_cfg": _LEFT_FINGER,
             "right_finger_cfg": _RIGHT_FINGER,
             "wrist_body_cfg": _WRIST_BODY,
+            "pcb_cfg": _PCB_ENT,
+            "gripper_joint_cfg": _GRIPPER_JOINT,
+            "half_length_m": _HALF_LENGTH_M,
+            "closedness_std": _APPROACH_SUCCESS_STD_M,
             "push_axis_world": PUSH_AXIS_WORLD,
             "target_pitch_down_deg": _APPROACH_WRIST_TARGET_PITCH_DOWN_DEG,
             "max_pitch_down_deg": _APPROACH_WRIST_MAX_PITCH_DOWN_DEG,
+            "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+            "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+            "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+            "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+            "gate_start": _APPROACH_TIP_DOWN_GATE_START,
+            "gate_full": _APPROACH_TIP_DOWN_GATE_FULL,
         },
-        weight=80.0,
+        weight=40.0,
     )
-    # Debug-only (near-zero weight): logs the SIGNED achieved pitch in degrees to TensorBoard so the
-    # tip-down direction/convergence can be sanity-checked without a live play session.  Worth
-    # watching during this retrain: if it plateaus above -18 deg the success gate will never fire.
+    # Prefer ``Curriculum/approach_gripper_debug/pitch_deg_*`` for the real angle.  This near-zero
+    # Episode_Reward term stays only so the reward manager still evaluates the obs helper; the
+    # weight zeroes it in TensorBoard.
     wrist_pitch_deg_debug = RewardTermCfg(
         func=gripper_wrist_pitch_deg_signed_obs,
         params={

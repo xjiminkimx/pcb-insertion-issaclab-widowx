@@ -1365,6 +1365,70 @@ def gripper_wrist_carriage_tip_down_pitch_shaping(
     return yaw * ramp
 
 
+def gripper_wrist_carriage_tip_down_pitch_shaping_gated(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    pcb_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    closedness_std: float,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    target_pitch_down_deg: float = 20.0,
+    max_pitch_down_deg: float = 60.0,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    gate_start: float = 0.20,
+    gate_full: float = 0.40,
+) -> torch.Tensor:
+    """Tip-down shaping that only pays after trailing-edge closedness has started to rise.
+
+    Ungated tip-down (weight 80) let Approach farm a deep wrist pitch while ``closedness_tight``
+    sat at ~0.10-0.15 — well below the 0.55 success bar — because the OSC rotates about the wrist
+    and pitching early pulls the pads off the trailing edge.  Measured run: ep~20 had the best
+    tight closedness (0.22) with tip-down still weak; once tip-down saturated (~ep 60+) tight
+    closedness never recovered and success stayed ~0.
+
+    Gate is a soft ramp on the SAME tight closedness index the success termination uses
+    (``closedness_std`` should be ``_APPROACH_SUCCESS_STD_M``): 0 below ``gate_start``, full
+    credit from ``gate_full`` upward.  Tip-down then reinforces the seated posture instead of
+    competing with seating.
+    """
+    tip = gripper_wrist_carriage_tip_down_pitch_shaping(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        push_axis_world=push_axis_world,
+        target_pitch_down_deg=target_pitch_down_deg,
+        max_pitch_down_deg=max_pitch_down_deg,
+    )
+    closedness = straddle_finger_target_closedness(
+        env,
+        float(closedness_std),
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    start = float(gate_start)
+    full = float(gate_full)
+    if full <= start:
+        gate = (closedness >= start).to(dtype=tip.dtype)
+    else:
+        gate = ((closedness - start) / (full - start)).clamp(0.0, 1.0)
+    return tip * gate
+
+
 def gripper_wrist_pitch_deg_signed_obs(
     env: ManagerBasedRLEnv,
     left_finger_cfg: SceneEntityCfg,
@@ -2575,6 +2639,9 @@ _STRADDLE_LEAD_VY_SUM: torch.Tensor | None = None
 _STRADDLE_LEAD_VY_LAST: torch.Tensor | None = None
 _STRADDLE_BETWEEN_FINGERS_SUM: torch.Tensor | None = None
 _STRADDLE_BETWEEN_FINGERS_LAST: torch.Tensor | None = None
+_STRADDLE_PITCH_DEG_SUM: torch.Tensor | None = None
+_STRADDLE_PITCH_DEG_LAST: torch.Tensor | None = None
+_STRADDLE_PITCH_DEG_EP_MIN: torch.Tensor | None = None  # most tip-down (most negative) this episode
 _SLIDE_TRAVEL_FRAC_MAX: torch.Tensor | None = None
 _SLIDE_TRAVEL_FRAC_LAST: torch.Tensor | None = None
 _SLIDE_MILESTONE_POSE_OK_SUM: torch.Tensor | None = None
@@ -2663,6 +2730,7 @@ def _approach_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
     global _STRADDLE_LEAD_Y_SUM, _STRADDLE_LEAD_Y_LAST
     global _STRADDLE_LEAD_VY_SUM, _STRADDLE_LEAD_VY_LAST
     global _STRADDLE_BETWEEN_FINGERS_SUM, _STRADDLE_BETWEEN_FINGERS_LAST
+    global _STRADDLE_PITCH_DEG_SUM, _STRADDLE_PITCH_DEG_LAST, _STRADDLE_PITCH_DEG_EP_MIN
     global _VIC_STIFFNESS_SUM, _VIC_STIFFNESS_LAST, _VIC_DAMPING_SUM, _VIC_DAMPING_LAST
     n = env.num_envs
     if not _debug_buf_matches_env(_STRADDLE_DEBUG_JOINT_SUM, env):
@@ -2706,10 +2774,19 @@ def _approach_gripper_debug_ensure_buffers(env: ManagerBasedEnv) -> None:
         _STRADDLE_LEAD_VY_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_BETWEEN_FINGERS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _STRADDLE_BETWEEN_FINGERS_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_PITCH_DEG_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_PITCH_DEG_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        # Init to +inf so the first sample wins the min (most tip-down) reduction.
+        _STRADDLE_PITCH_DEG_EP_MIN = torch.full((n,), float("inf"), device=env.device, dtype=torch.float32)
         _VIC_STIFFNESS_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _VIC_STIFFNESS_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
         _VIC_DAMPING_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
         _VIC_DAMPING_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+    # Pitch buffers may be missing if the process already allocated the older buffer set.
+    if not _debug_buf_matches_env(_STRADDLE_PITCH_DEG_SUM, env):
+        _STRADDLE_PITCH_DEG_SUM = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_PITCH_DEG_LAST = torch.zeros(n, device=env.device, dtype=torch.float32)
+        _STRADDLE_PITCH_DEG_EP_MIN = torch.full((n,), float("inf"), device=env.device, dtype=torch.float32)
 
 
 def _read_straddle_debug_sample(
@@ -2787,6 +2864,7 @@ def _approach_gripper_debug_accumulate_step(
     closedness_tight: torch.Tensor | None = None,
     dist_left: torch.Tensor | None = None,
     dist_right: torch.Tensor | None = None,
+    pitch_deg: torch.Tensor | None = None,
 ) -> None:
     """Accumulate per-step jaw gaps and closedness for episode-mean TensorBoard scalars."""
     global _STRADDLE_GAP_LEFT_SUM, _STRADDLE_GAP_RIGHT_SUM
@@ -2795,6 +2873,7 @@ def _approach_gripper_debug_accumulate_step(
     global _STRADDLE_CLOSEDNESS_SUM, _STRADDLE_CLOSEDNESS_LAST
     global _STRADDLE_CLOSEDNESS_TIGHT_SUM, _STRADDLE_CLOSEDNESS_TIGHT_LAST, _STRADDLE_CLOSEDNESS_EP_MAX
     global _STRADDLE_DIST_L_SUM, _STRADDLE_DIST_R_SUM, _STRADDLE_DIST_L_LAST, _STRADDLE_DIST_R_LAST
+    global _STRADDLE_PITCH_DEG_SUM, _STRADDLE_PITCH_DEG_LAST, _STRADDLE_PITCH_DEG_EP_MIN
     gap_left_f = gap_left.detach().to(dtype=torch.float32)
     gap_right_f = gap_right.detach().to(dtype=torch.float32)
     _STRADDLE_GAP_LEFT_SUM += gap_left_f
@@ -2819,6 +2898,11 @@ def _approach_gripper_debug_accumulate_step(
         dist_r_f = dist_right.detach().to(dtype=torch.float32)
         _STRADDLE_DIST_R_SUM += dist_r_f
         _STRADDLE_DIST_R_LAST = dist_r_f
+    if pitch_deg is not None:
+        pitch_f = pitch_deg.detach().to(dtype=torch.float32)
+        _STRADDLE_PITCH_DEG_SUM += pitch_f
+        _STRADDLE_PITCH_DEG_LAST = pitch_f
+        _STRADDLE_PITCH_DEG_EP_MIN = torch.minimum(_STRADDLE_PITCH_DEG_EP_MIN, pitch_f)
 
 
 def _push_debug_accumulate_step(
@@ -3033,6 +3117,7 @@ def _approach_gripper_debug_accumulate_all(
         width_gap_target_right_m=width_gap_target_right_m,
     )
     achieved = closedness_prox >= float(closedness_threshold)
+    pitch_deg = gripper_wrist_pitch_deg_signed_obs(env, left_finger_cfg, right_finger_cfg, wrist_body_cfg)
     _approach_gripper_debug_accumulate_step(
         gap_left,
         gap_right,
@@ -3041,6 +3126,7 @@ def _approach_gripper_debug_accumulate_all(
         closedness_tight=closedness_tight,
         dist_left=dist_left,
         dist_right=dist_right,
+        pitch_deg=pitch_deg,
     )
 
     push_thresh = (
@@ -3131,6 +3217,7 @@ def _approach_gripper_debug_accumulate_all(
         "lead_vy": lead_vy,
         "achieved": achieved,
         "slide_success": slide_ok,
+        "pitch_deg": pitch_deg,
     }
 
 
@@ -3501,6 +3588,7 @@ def approach_gripper_debug_curriculum(
     global _STRADDLE_LEAD_Y_SUM, _STRADDLE_LEAD_Y_LAST
     global _STRADDLE_LEAD_VY_SUM, _STRADDLE_LEAD_VY_LAST
     global _STRADDLE_BETWEEN_FINGERS_SUM, _STRADDLE_BETWEEN_FINGERS_LAST
+    global _STRADDLE_PITCH_DEG_SUM, _STRADDLE_PITCH_DEG_LAST, _STRADDLE_PITCH_DEG_EP_MIN
     global _VIC_STIFFNESS_SUM, _VIC_STIFFNESS_LAST, _VIC_DAMPING_SUM, _VIC_DAMPING_LAST
     if _STRADDLE_DEBUG_STEP_COUNT is None:
         _approach_gripper_debug_ensure_buffers(env)
@@ -3545,6 +3633,12 @@ def approach_gripper_debug_curriculum(
     lead_vy_live = _STRADDLE_LEAD_VY_LAST[ids][valid].mean()
     between_q_mean = (_STRADDLE_BETWEEN_FINGERS_SUM[ids] / counts_safe)[valid].mean()
     between_q_live = _STRADDLE_BETWEEN_FINGERS_LAST[ids][valid].mean()
+    pitch_deg_mean = (_STRADDLE_PITCH_DEG_SUM[ids] / counts_safe)[valid].mean()
+    pitch_deg_live = _STRADDLE_PITCH_DEG_LAST[ids][valid].mean()
+    pitch_ep_min = _STRADDLE_PITCH_DEG_EP_MIN[ids][valid]
+    # Replace +inf (never sampled) with 0 so the mean stays finite.
+    pitch_ep_min = torch.where(torch.isfinite(pitch_ep_min), pitch_ep_min, torch.zeros_like(pitch_ep_min))
+    pitch_deg_ep_min = pitch_ep_min.mean()
     vic_stiffness_mean = (_VIC_STIFFNESS_SUM[ids] / counts_safe)[valid].mean()
     vic_stiffness_live = _VIC_STIFFNESS_LAST[ids][valid].mean()
     vic_damping_mean = (_VIC_DAMPING_SUM[ids] / counts_safe)[valid].mean()
@@ -3565,6 +3659,8 @@ def approach_gripper_debug_curriculum(
     _STRADDLE_LEAD_Y_SUM[ids] = 0.0
     _STRADDLE_LEAD_VY_SUM[ids] = 0.0
     _STRADDLE_BETWEEN_FINGERS_SUM[ids] = 0.0
+    _STRADDLE_PITCH_DEG_SUM[ids] = 0.0
+    _STRADDLE_PITCH_DEG_EP_MIN[ids] = float("inf")
     _VIC_STIFFNESS_SUM[ids] = 0.0
     _VIC_DAMPING_SUM[ids] = 0.0
 
@@ -3618,6 +3714,11 @@ def approach_gripper_debug_curriculum(
         "lead_vy_live": float(lead_vy_live.item()),
         "between_fingers_q_mean": float(between_q_mean.item()),
         "between_fingers_q_live": float(between_q_live.item()),
+        # Signed wrist->pad-tip pitch in degrees (negative = tip-down).  Use these, NOT the
+        # ``Episode_Reward/wrist_pitch_deg_debug`` term (weight 1e-10 zeroes it out in TB).
+        "pitch_deg_mean": float(pitch_deg_mean.item()),
+        "pitch_deg_live": float(pitch_deg_live.item()),
+        "pitch_deg_ep_min": float(pitch_deg_ep_min.item()),
         "vic_stiffness_mean": float(vic_stiffness_mean.item()),
         "vic_stiffness_live": float(vic_stiffness_live.item()),
         "vic_damping_mean": float(vic_damping_mean.item()),

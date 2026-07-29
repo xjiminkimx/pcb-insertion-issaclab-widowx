@@ -129,7 +129,7 @@ WidowXPcbApproachPPOCfg = {
             "name": "widowx_pcb_approach",
             "full_experiment_name": ".",
             "entropy_coef": 1e-2,
-            "max_epochs": 150,
+            "max_epochs": 360,
             "reward_shaper": {"scale_value": 1.0},
         },
     },
