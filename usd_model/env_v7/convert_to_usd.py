@@ -3,10 +3,11 @@
 Convert env_v7 URDF (assembly_1) to an IsaacSim-compatible USDA kinematic fixture.
 
 env_v7 vs env_v6: identical assembly, re-exported from Onshape with the side rail-guides
-(Part_1_4.stl / Part_1_6.stl -- tall vertical lane walls beside the conveyor) thinned from
-15 mm to 4 mm (2026-07-23/24) to clear the gripper jaw open/close carriage mechanism during
-Slide, which was previously catching on them mid-push. All other meshes (magazine, horizontal
-guide rails Part_1_7.stl, side belts, stand/frame) are unchanged from env_v6. Materials,
+(Part_1_4.stl / Part_1_6.stl) optionally thinned to 4 mm in CAD. As of 2026-07-31 those two
+side rail-guides are **excluded from the USD export** (no collision/visual prims) so the gripper
+jaw/carriage cannot foul them during Slide; lane keeping is handled by reward/termination instead.
+All other meshes (magazine, horizontal guide rails Part_1_7.stl, side belts, stand/frame) are
+unchanged from env_v6.
 friction, and collision/offset settings below are intentionally kept identical to env_v6's
 ``convert_to_usd.py`` -- only the source URDF/mesh directory changed.
 
@@ -17,7 +18,8 @@ Material + physics settings:
   StandMaterial   — stand + frame            mu_s 0.50
 
 Collision approximations:
-  Magazine / guide rails / side belts / side rail-guides — Triangle Mesh (``none``).
+  Magazine / guide rails / side belts — Triangle Mesh (``none``).
+  Side rail-guides (Part_1_4 / Part_1_6) — omitted from export.
   Stand / frame                                         — convexDecomposition (decorative contact).
 Short axle rods (Part_1_3.stl) and chip/PCB link excluded — chip spawned separately.
 
@@ -206,7 +208,7 @@ USDA_HEADER = """\
 #usda 1.0
 (
     defaultPrim = "PCB_Env"
-    doc = "PCB Insertion Environment v7 - magazine (fine slot) + guide rails + side belts + stand (kinematic fixture); side rail-guides thinned to 4mm"
+    doc = "PCB Insertion Environment v7 - magazine (fine slot) + guide rails + side belts + stand (kinematic fixture); side rail-guides (Part_1_4/6) omitted"
     metersPerUnit = 1
     timeCodesPerSecond = 24
     upAxis = "Z"
@@ -283,10 +285,7 @@ MESH_TEMPLATE_TRIANGLE = """\
 CHIP_LINKS = {"root", "chip"}
 MAGAZINE_LINKS = {"magazine"}
 SHORT_AXLE_MESH = "Part_1_3.stl"    # short axle rods — decorative, excluded
-# Tall vertical guides beside the conveyor (included in fixture for lane walls).
-# env_v7: thinned 15mm -> 4mm in CAD (see module docstring) so the gripper jaw/carriage
-# clears them mid-slide; still included in export (unlike the fully-removed attempt on
-# env_v6, this thinner geometry is meant to stay).
+# Tall vertical lane walls beside the conveyor — excluded from export (gripper clearance).
 SIDE_RAIL_GUIDE_MESHES = frozenset({"Part_1_4.stl", "Part_1_6.stl"})
 BELT_MESH = "Part_1_2.stl"          # side conveyor belts
 RAIL_MESH = "Part_1_7.stl"          # guide-rail bars (horizontal PCB support)
@@ -298,7 +297,7 @@ def export_links(links: dict) -> list[str]:
         if not info.get("mesh") or name in CHIP_LINKS:
             continue
         base = mesh_basename(info["mesh"])
-        if base == SHORT_AXLE_MESH:
+        if base == SHORT_AXLE_MESH or base in SIDE_RAIL_GUIDE_MESHES:
             continue
         out.append(name)
     return sorted(out)

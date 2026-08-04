@@ -792,8 +792,15 @@ def store_slide_reset_ee_pose_w(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
     action_name: str = "arm_action",
+    ee_z_bias_m: float = 0.0,
 ) -> None:
-    """Record OSC EE world pose at reset for the absolute-from-reset position/orientation boxes."""
+    """Record OSC EE world pose at reset for the absolute-from-reset position/orientation boxes.
+
+    ``ee_z_bias_m`` shifts only the *anchor* upward.  With ``cum = 0`` the OSC then pulls the EE
+    toward that higher setpoint, so a small positive bias is a cheap "start already lifted" nudge
+    without changing the Approach handoff joints or the pitch box.  Tips still have to stay seated
+    via ``tip_mid_thickness`` / the seating factor on ``jaw_rail_clearance``.
+    """
     term = get_task_space_impedance_action(env, action_name)
     if term is None:
         return
@@ -804,6 +811,8 @@ def store_slide_reset_ee_pose_w(
         env._slide_reset_ee_quat_w = torch.zeros(env.num_envs, 4, device=env.device, dtype=torch.float32)
         env._slide_reset_ee_quat_w[:, 0] = 1.0
     env._slide_reset_ee_pos_w[env_ids] = term._ee_pose_w[env_ids, :3].clone()
+    if ee_z_bias_m:
+        env._slide_reset_ee_pos_w[env_ids, 2] += float(ee_z_bias_m)
     env._slide_reset_ee_quat_w[env_ids] = term._ee_pose_w[env_ids, 3:7].clone()
 
 
@@ -1383,6 +1392,9 @@ def gripper_wrist_carriage_tip_down_pitch_shaping_gated(
     width_gap_target_right_m: float | None = None,
     gate_start: float = 0.20,
     gate_full: float = 0.40,
+    tip_mid_std: float | None = None,
+    tip_mid_gate_start: float = 0.30,
+    tip_mid_gate_full: float = 0.70,
 ) -> torch.Tensor:
     """Tip-down shaping that only pays after trailing-edge closedness has started to rise.
 
@@ -1396,6 +1408,13 @@ def gripper_wrist_carriage_tip_down_pitch_shaping_gated(
     (``closedness_std`` should be ``_APPROACH_SUCCESS_STD_M``): 0 below ``gate_start``, full
     credit from ``gate_full`` upward.  Tip-down then reinforces the seated posture instead of
     competing with seating.
+
+    Setting ``tip_mid_std`` adds a SECOND, multiplicative ramp on the mid-thickness index.  Lateral
+    closedness alone does not pin the pads to the trailing edge along the board's thickness, so with
+    only the closedness gate the policy can still buy pitch by dropping the pads under the board --
+    which is exactly how the 2026-07-29 handoff ended up 12 mm low.  Because this reward converts
+    pitch into rail clearance through the 60 mm pad lever, it is only meaningful when that lever is
+    actually anchored at the board edge, and this gate is what enforces it.
     """
     tip = gripper_wrist_carriage_tip_down_pitch_shaping(
         env,
@@ -1426,7 +1445,134 @@ def gripper_wrist_carriage_tip_down_pitch_shaping_gated(
         gate = (closedness >= start).to(dtype=tip.dtype)
     else:
         gate = ((closedness - start) / (full - start)).clamp(0.0, 1.0)
+    if tip_mid_std is not None:
+        tip_mid = straddle_tip_mid_thickness_shaping(
+            env,
+            float(tip_mid_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+        )
+        mid_start = float(tip_mid_gate_start)
+        mid_full = float(tip_mid_gate_full)
+        if mid_full <= mid_start:
+            mid_gate = (tip_mid >= mid_start).to(dtype=tip.dtype)
+        else:
+            mid_gate = ((tip_mid - mid_start) / (mid_full - mid_start)).clamp(0.0, 1.0)
+        gate = gate * mid_gate
     return tip * gate
+
+
+def gripper_wrist_carriage_tip_down_pitch_shaping_gated_on_tip_mid(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    wrist_body_cfg: SceneEntityCfg | None,
+    pcb_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    tip_mid_std: float,
+    push_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    target_pitch_down_deg: float = 20.0,
+    max_pitch_down_deg: float = 60.0,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    gate_start: float = 0.45,
+    gate_full: float = 0.75,
+    gate_floor: float = 0.5,
+    thickness_target_offset_m: float = 0.0,
+    travel_target_lead_y_env: float | None = None,
+    travel_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    travel_gate_start_m: float | None = None,
+    travel_gate_full_m: float | None = None,
+    travel_gate_floor: float = 0.25,
+) -> torch.Tensor:
+    """Tip-down credit scaled by tip-mid seating, optionally also by board travel.
+
+    Slide often starts with trailing-edge closedness already high (replayed Approach states), so a
+    closedness gate does not stop early tip-under while the wrist pitches for rail clearance.
+    Gating on :func:`straddle_tip_mid_thickness_shaping` instead: tip-down pays more once tips are
+    near the (possibly offset) thickness target, and pays less if they dig under the board.
+
+    ``gate_floor`` is the fraction of tip-down credit that is paid unconditionally from the seating
+    ramp.  It must stay well above zero: the tip-down posture is what keeps the jaw carriage off the
+    conveyor rail guide, so a gate that can reach 0 leaves the policy with no reason to hold any
+    pitch during the exact early-slide window where mid-thickness is still poor -- the wrist
+    flattens out and the carriage catches the belt (observed 2026-07-29 with ``gate_floor = 0``).
+
+    Optional travel gate (same shape as ``gripper_jaw_rail_clearance_shaping``): scales the payout
+    from ``travel_gate_floor`` to 1.0 as leading-edge travel goes ``start -> full``.  Approach hands
+    over a shallow pitch; Slide should deepen tip-down *while pushing*, not farm pitch at reset.
+    """
+    tip = gripper_wrist_carriage_tip_down_pitch_shaping(
+        env,
+        left_finger_cfg,
+        right_finger_cfg,
+        wrist_body_cfg,
+        push_axis_world=push_axis_world,
+        target_pitch_down_deg=target_pitch_down_deg,
+        max_pitch_down_deg=max_pitch_down_deg,
+    )
+    mid = straddle_tip_mid_thickness_shaping(
+        env,
+        tip_mid_std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        thickness_target_offset_m=thickness_target_offset_m,
+    )
+    start = float(gate_start)
+    full = float(gate_full)
+    if full <= start:
+        seat_gate = (mid >= start).to(dtype=tip.dtype)
+    else:
+        seat_gate = ((mid - start) / (full - start)).clamp(0.0, 1.0)
+    floor = min(max(float(gate_floor), 0.0), 1.0)
+    out = tip * (floor + (1.0 - floor) * seat_gate)
+
+    if (
+        travel_gate_start_m is not None
+        and travel_gate_full_m is not None
+        and travel_target_lead_y_env is not None
+    ):
+        lead_env, _, _ = _slide_leading_edge_travel_frac(
+            env,
+            pcb_cfg,
+            float(half_length_m),
+            float(travel_target_lead_y_env),
+            travel_axis_world,
+        )
+        a = torch.tensor(travel_axis_world, device=env.device, dtype=lead_env.dtype)
+        a = a / torch.norm(a).clamp_min(1e-9)
+        proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+        if hasattr(env, "_insert_start_lead_proj"):
+            travel_m = proj - env._insert_start_lead_proj
+        else:
+            travel_m = torch.zeros_like(proj)
+        t_start = float(travel_gate_start_m)
+        t_span = max(float(travel_gate_full_m) - t_start, 1e-9)
+        t_floor = float(travel_gate_floor)
+        travel_scale = t_floor + (1.0 - t_floor) * torch.clamp(
+            (travel_m - t_start) / t_span, min=0.0, max=1.0
+        )
+        out = out * travel_scale
+    return out
 
 
 def gripper_wrist_pitch_deg_signed_obs(
@@ -4193,8 +4339,14 @@ def straddle_tip_mid_thickness_shaping(
     wrist_body_cfg: SceneEntityCfg | None = None,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
 ) -> torch.Tensor:
-    """Pull each contact pad tip to the PCB mid-thickness plane (not the finger-body centre)."""
+    """Pull each contact pad tip to the PCB mid-thickness plane (not the finger-body centre).
+
+    ``thickness_target_offset_m`` shifts the attractor along the board's thickness axis (PCB body
+    +Z; world +Z when the board is flat).  Positive = above the mid-plane.  Slide uses a small
+    positive offset so the pads ride slightly above the 1 mm edge rather than straddling its centre.
+    """
     _, _, _, _, thick_l, thick_r = _straddle_width_target_tip_dists(
         env,
         pcb_cfg,
@@ -4208,9 +4360,10 @@ def straddle_tip_mid_thickness_shaping(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
     )
+    tgt = float(thickness_target_offset_m)
     sig = float(std) + 1e-9
-    left_q = 1.0 - torch.tanh(torch.abs(thick_l) / sig)
-    right_q = 1.0 - torch.tanh(torch.abs(thick_r) / sig)
+    left_q = 1.0 - torch.tanh(torch.abs(thick_l - tgt) / sig)
+    right_q = 1.0 - torch.tanh(torch.abs(thick_r - tgt) / sig)
     return 0.5 * (left_q + right_q)
 
 
@@ -4229,6 +4382,7 @@ def straddle_tip_mid_thickness_shaping_gated(
     closedness_std: float = 0.10,
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
 ) -> torch.Tensor:
     """Like :func:`straddle_tip_mid_thickness_shaping`, zero until jaws are near the trailing edge."""
     reward = straddle_tip_mid_thickness_shaping(
@@ -4244,6 +4398,7 @@ def straddle_tip_mid_thickness_shaping_gated(
         wrist_body_cfg=wrist_body_cfg,
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
+        thickness_target_offset_m=thickness_target_offset_m,
     )
     closedness = straddle_finger_target_closedness(
         env,
@@ -4538,6 +4693,8 @@ def approach_near_success_shaping_scale(
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """Scale in ``[min_scale, 1]`` that fades dense shaping as tight closedness nears success.
 
@@ -4551,6 +4708,12 @@ def approach_near_success_shaping_scale(
     is false while the pose is still pitch-ineligible: closedness alone can sit past ``fade_end``
     with the wrist too flat to ever trigger success, which would strand the policy holding position
     on 5% shaping with no way to bank the bonus.  Envs that fail the pitch gate keep full shaping.
+
+    ``fade_min_tip_mid``/``fade_tip_mid_std`` apply the identical exemption to the success
+    termination's mid-thickness gate.  Every conjunct of the success condition needs its own
+    exemption here, otherwise the fade punishes closedness progress that cannot yet be cashed in:
+    the policy's best response is to park closedness just under ``fade_start`` and trade the
+    remaining error between axes, which keeps closedness flat forever.
     """
     closedness_tight = straddle_finger_target_closedness(
         env,
@@ -4575,6 +4738,22 @@ def approach_near_success_shaping_scale(
     if min_tip_down_deg is not None:
         pitch_deg = gripper_wrist_pitch_deg_signed_obs(env, left_finger_cfg, right_finger_cfg, wrist_body_cfg)
         t = torch.where(pitch_deg <= -float(min_tip_down_deg), t, torch.zeros_like(t))
+    if fade_min_tip_mid is not None and fade_tip_mid_std is not None:
+        tip_mid = straddle_tip_mid_thickness_shaping(
+            env,
+            float(fade_tip_mid_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+        )
+        t = torch.where(tip_mid >= float(fade_min_tip_mid), t, torch.zeros_like(t))
     return 1.0 - t * (1.0 - lo)
 
 
@@ -4597,6 +4776,8 @@ def _apply_near_success_fade(
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     scale = approach_near_success_shaping_scale(
         env,
@@ -4615,6 +4796,8 @@ def _apply_near_success_fade(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
     return reward * scale
 
@@ -4637,6 +4820,8 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_finger_trailing_width_proximity` with near-success shaping fade."""
     reward = straddle_finger_trailing_width_proximity(
@@ -4671,6 +4856,8 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
 
 
@@ -4694,6 +4881,8 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_tip_mid_thickness_shaping_gated` with near-success shaping fade."""
     reward = straddle_tip_mid_thickness_shaping_gated(
@@ -4730,6 +4919,8 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
 
 
@@ -4754,6 +4945,8 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
     width_gap_target_left_m: float | None = None,
     width_gap_target_right_m: float | None = None,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_trailing_face_bounded_approach_reward` with near-success shaping fade."""
     reward = straddle_trailing_face_bounded_approach_reward(
@@ -4788,6 +4981,8 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
 
 
@@ -4813,6 +5008,8 @@ def pcb_between_gripper_fingers_fade_near_success(
     wrist_body_cfg: SceneEntityCfg | None = None,
     finger_offset_m: float = 0.020,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """:func:`pcb_between_gripper_fingers` with near-success shaping fade."""
     if gripper_joint_cfg is None:
@@ -4852,6 +5049,8 @@ def pcb_between_gripper_fingers_fade_near_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
 
 
@@ -4873,6 +5072,8 @@ def straddle_lateral_gap_shaping_fade_near_success(
     wrist_body_cfg: SceneEntityCfg | None = None,
     finger_offset_m: float = 0.020,
     min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_lateral_gap_shaping` with near-success shaping fade."""
     reward = straddle_lateral_gap_shaping(
@@ -4906,6 +5107,8 @@ def straddle_lateral_gap_shaping_fade_near_success(
         width_gap_target_left_m=width_gap_target_left_m,
         width_gap_target_right_m=width_gap_target_right_m,
         min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
     )
 
 
@@ -8098,6 +8301,183 @@ def pcb_push_axis_velocity_reward_gated(
     )
 
 
+def _apply_tip_mid_seated_push_gate(
+    env: ManagerBasedRLEnv,
+    reward: torch.Tensor,
+    min_tip_mid_for_push: float,
+    tip_mid_std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    clearance_reference_z_env: float | None = None,
+    clearance_gate_start_m: float | None = None,
+    clearance_gate_full_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
+) -> torch.Tensor:
+    """Zero push credit when pad tips leave the PCB mid-thickness band.
+
+    When the ``clearance_*`` geometry is supplied the credit is additionally scaled by a linear
+    ramp on jaw-body height over the rail plane, ``start -> full``.  Clearing the conveyor
+    supports is a physical PRECONDITION for pushing, but nothing in the reward said so: the push
+    terms paid the same whether the lane ahead was open or the carriage was jammed against a
+    rail, so a policy that stalled at 15 mm of clearance still collected push income and the only
+    thing asking it to climb was ``jaw_rail_clearance``, worth ~1/s over the band that matters.
+    Gating here rather than raising that weight keeps the fix out of the STATIC income ledger
+    documented on ``alive_penalty`` -- this multiplies a term that is already zero while idle.
+
+    The ramp is deliberately smooth and starts BELOW the height policies currently reach.  A hard
+    step (as used for the mid-thickness gate, whose threshold the handover pose clears by
+    construction) would zero all push credit at the current operating point and collapse the
+    phase back to freezing.
+    """
+    mid = straddle_tip_mid_thickness_shaping(
+        env,
+        float(tip_mid_std),
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        thickness_target_offset_m=thickness_target_offset_m,
+    )
+    gate = (mid >= float(min_tip_mid_for_push)).to(dtype=reward.dtype)
+    if (
+        clearance_reference_z_env is not None
+        and clearance_gate_start_m is not None
+        and clearance_gate_full_m is not None
+    ):
+        clearance = _jaw_rail_clearance_m(
+            env, left_finger_cfg, right_finger_cfg, clearance_reference_z_env
+        )
+        start = float(clearance_gate_start_m)
+        span = max(float(clearance_gate_full_m) - start, 1e-9)
+        gate = gate * torch.clamp((clearance - start) / span, min=0.0, max=1.0)
+    return reward * gate
+
+
+def pcb_leading_edge_push_axis_approach_progress_seated(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    max_step_m: float = 0.005,
+    min_tip_mid_for_push: float = 0.45,
+    tip_mid_std: float = 0.008,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    clearance_reference_z_env: float | None = None,
+    clearance_gate_start_m: float | None = None,
+    clearance_gate_full_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
+) -> torch.Tensor:
+    """Leading-edge +Y progress, zero while tips are off the mid-thickness plane."""
+    step = pcb_leading_edge_push_axis_approach_progress(
+        env, pcb_cfg, half_length_m, axis_world, max_step_m
+    )
+    if (
+        left_finger_cfg is None
+        or right_finger_cfg is None
+        or gripper_joint_cfg is None
+    ):
+        return step
+    return _apply_tip_mid_seated_push_gate(
+        env,
+        step,
+        min_tip_mid_for_push,
+        tip_mid_std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        clearance_reference_z_env=clearance_reference_z_env,
+        clearance_gate_start_m=clearance_gate_start_m,
+        clearance_gate_full_m=clearance_gate_full_m,
+        thickness_target_offset_m=thickness_target_offset_m,
+    )
+
+
+def pcb_push_axis_velocity_reward_seated(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    min_push_speed_m_s: float = 0.002,
+    ref_speed_m_s: float | None = None,
+    min_tip_mid_for_push: float = 0.45,
+    tip_mid_std: float = 0.008,
+    left_finger_cfg: SceneEntityCfg | None = None,
+    right_finger_cfg: SceneEntityCfg | None = None,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    half_length_m: float = 0.060,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    clearance_reference_z_env: float | None = None,
+    clearance_gate_start_m: float | None = None,
+    clearance_gate_full_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
+) -> torch.Tensor:
+    """+push-axis PCB velocity, zero while tips are off the mid-thickness plane."""
+    vel = pcb_push_axis_velocity_reward(
+        env,
+        pcb_cfg,
+        axis_world,
+        min_push_speed_m_s=min_push_speed_m_s,
+        ref_speed_m_s=ref_speed_m_s,
+    )
+    if (
+        left_finger_cfg is None
+        or right_finger_cfg is None
+        or gripper_joint_cfg is None
+    ):
+        return vel
+    return _apply_tip_mid_seated_push_gate(
+        env,
+        vel,
+        min_tip_mid_for_push,
+        tip_mid_std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        clearance_reference_z_env=clearance_reference_z_env,
+        clearance_gate_start_m=clearance_gate_start_m,
+        clearance_gate_full_m=clearance_gate_full_m,
+        thickness_target_offset_m=thickness_target_offset_m,
+    )
+
+
 def pcb_push_axis_progress_reward_gated(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -8225,6 +8605,307 @@ def pcb_leading_edge_z_lift_penalty(
     excess = torch.clamp(lead_z - ref_z - float(max_lift_m), min=0.0)
     cap = max(float(max_penalty_excess_m), 1e-9)
     excess = torch.clamp(excess, max=cap)
+    return torch.square(excess / cap)
+
+
+def pcb_edge_axis_parallel_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    half_width_m: float,
+    max_offset_m: float = 0.001,
+    max_penalty_excess_m: float = 0.012,
+    max_lift_m: float = 0.001,
+    max_penalty_lift_m: float = 0.008,
+    reference_z_env: float | None = None,
+    use_episode_start: bool = True,
+) -> torch.Tensor:
+    """Penalty when the PCB stops lying square and flat in the lane, as ``in-plane + lift``.
+
+    The board may start the episode tilted or rotated, but to enter the slot it has to end up
+    square with the lane AND still on the belt.  Both halves are read off the same four
+    mid-thickness corners, so the term states the geometric condition directly rather than as a
+    quaternion error, and it stays valid whichever way the board's body frame happens to be signed:
+
+    * **in-plane** -- each short edge's two corners must share a world **Y**, and each long edge's
+      two corners must share a world **X**.
+    * **lift** -- no corner may rise above the reference belt plane in world **+Z**.  Taking the max
+      over corners rather than the centre catches a single pried-up corner, not just bulk lift.
+
+    Each half is the excess past its dead band, capped and squared into ``[0, 1]``; the return is
+    their **sum**, so ``[0, 2]``.  Pair with a **negative** weight.
+
+    The dead bands are deliberately tight.  The long edge binds first in-plane: at
+    ``half_length_m = 0.12`` the 1 mm dead band is ~0.24 deg of yaw and the 12 mm cap is ~2.9 deg,
+    so the penalty is already saturated at an error that a loose 40 mm cap barely registered.
+    """
+    pcb = env.scene[pcb_cfg.name]
+    center = pcb.data.root_pos_w
+    dx = float(half_length_m) * pcb_body_axis_x_world(env, pcb_cfg)
+    dy = float(half_width_m) * pcb_body_axis_y_world(env, pcb_cfg)
+    corner_pp = center + dx + dy
+    corner_pm = center + dx - dy
+    corner_mp = center - dx + dy
+    corner_mm = center - dx - dy
+
+    short_edge_dev = torch.maximum(
+        torch.abs(corner_pp[:, 1] - corner_pm[:, 1]),
+        torch.abs(corner_mp[:, 1] - corner_mm[:, 1]),
+    )
+    long_edge_dev = torch.maximum(
+        torch.abs(corner_pp[:, 0] - corner_mp[:, 0]),
+        torch.abs(corner_pm[:, 0] - corner_mm[:, 0]),
+    )
+    dev = torch.maximum(short_edge_dev, long_edge_dev)
+    plane_cap = max(float(max_penalty_excess_m), 1e-9)
+    plane_excess = torch.clamp(dev - float(max_offset_m), min=0.0, max=plane_cap)
+    plane_term = torch.square(plane_excess / plane_cap)
+
+    corner_z_env = torch.stack(
+        (corner_pp[:, 2], corner_pm[:, 2], corner_mp[:, 2], corner_mm[:, 2]), dim=-1
+    ) - env.scene.env_origins[:, 2].unsqueeze(-1)
+    top_z = torch.amax(corner_z_env, dim=-1)
+    if use_episode_start and hasattr(env, "_insert_start_lead_z"):
+        ref_z = env._insert_start_lead_z
+    elif reference_z_env is not None:
+        ref_z = torch.full_like(top_z, float(reference_z_env))
+    else:
+        ref_z = top_z.detach()
+    lift_cap = max(float(max_penalty_lift_m), 1e-9)
+    lift_excess = torch.clamp(top_z - ref_z - float(max_lift_m), min=0.0, max=lift_cap)
+    lift_term = torch.square(lift_excess / lift_cap)
+
+    return plane_term + lift_term
+
+
+def _jaw_rail_clearance_m(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    reference_z_env: float,
+) -> torch.Tensor:
+    """Height of the LOWER jaw body above the rail plane, in metres.
+
+    ``min`` over the two jaws because the inherited jaw roll skews them by ~±9 mm about their
+    mean and it is the lower one that catches on the conveyor supports.
+    """
+    robot = env.scene[left_finger_cfg.name]
+    left_id = _resolve_first_body_id(robot, left_finger_cfg)
+    right_id = _resolve_first_body_id(robot, right_finger_cfg)
+    origin_z = env.scene.env_origins[:, 2]
+    left_z = robot.data.body_pos_w[:, left_id, 2] - origin_z
+    right_z = robot.data.body_pos_w[:, right_id, 2] - origin_z
+    return torch.minimum(left_z, right_z) - float(reference_z_env)
+
+
+def gripper_jaw_rail_clearance_shaping(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    reference_z_env: float,
+    target_clearance_m: float = 0.018,
+    pcb_cfg: SceneEntityCfg | None = None,
+    gripper_joint_cfg: SceneEntityCfg | None = None,
+    half_length_m: float | None = None,
+    seat_tip_mid_std: float | None = None,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    thickness_target_offset_m: float = 0.0,
+    travel_target_lead_y_env: float | None = None,
+    travel_axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+    travel_gate_start_m: float | None = None,
+    travel_gate_full_m: float | None = None,
+    travel_gate_floor: float = 0.25,
+) -> torch.Tensor:
+    """Reward the LOWER jaw body for riding clear above the conveyor's rail plane.
+
+    This states the slide's actual clearance requirement directly, instead of via wrist pitch.  Pitch
+    was the wrong proxy: measured from the Slide reset, commanding more tip-down moved the jaw bodies
+    from +10 mm above the board plane DOWN to -7 mm -- into the support rails -- because the OSC
+    rotates about the wrist, so pitching swings the whole carriage down rather than lifting it.  What
+    separates a clear lane from a jam is jaw-body HEIGHT: at +17.9 mm the nearest fixture ahead is the
+    magazine 331 mm away, at +10.0 mm it is a support rail 25 mm away.
+
+    ``min`` over the two jaws because the inherited jaw roll skews them by ~±9 mm about their mean and
+    it is the lower one that catches.  Linear ramp to full credit at ``target_clearance_m``; pair with
+    a **positive** weight.
+
+    Supplying the ``seat_tip_mid_std`` geometry multiplies the ramp by the pads' mid-thickness index,
+    which closes the term's one loophole.  With the tips on the board plane the clearance is fixed at
+    ``tip_offset * sin(pitch)``, so height and pitch are the same number -- but that identity only
+    holds while the pads stay on the plane.  When the carriage fouls the rail guide the braced tip
+    becomes the pivot, and rotating the jaw down then levers the body UP: the raw ramp pays for that,
+    and ``gripper_tip_under_pcb_penalty`` reads exactly zero until the tip is already under the board,
+    so nothing opposes the rotation until the damage is done.  The seating factor removes the payout
+    the instant the pads leave the plane, leaving the coordinated lift as the only way to earn it.
+
+    Optional travel gate (``travel_gate_*``): scales the payout from ``travel_gate_floor`` up to 1.0
+    as leading-edge travel goes from ``start`` to ``full``.  Approach hands over a shallow pitch;
+    Slide is meant to deepen clearance *while pushing*, not farm height at the reset pose.  The floor
+    keeps a weak early gradient so the arm starts lifting before the ~25-30 mm jam zone.
+    """
+    clearance = _jaw_rail_clearance_m(
+        env, left_finger_cfg, right_finger_cfg, reference_z_env
+    )
+    target = max(float(target_clearance_m), 1e-9)
+    ramp = torch.clamp(clearance / target, min=0.0, max=1.0)
+    if seat_tip_mid_std is not None and pcb_cfg is not None and gripper_joint_cfg is not None:
+        ramp = ramp * straddle_tip_mid_thickness_shaping(
+            env,
+            float(seat_tip_mid_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            float(half_length_m),
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+            thickness_target_offset_m=thickness_target_offset_m,
+        )
+    if (
+        travel_gate_start_m is not None
+        and travel_gate_full_m is not None
+        and travel_target_lead_y_env is not None
+        and pcb_cfg is not None
+        and half_length_m is not None
+    ):
+        lead_env, _, _ = _slide_leading_edge_travel_frac(
+            env,
+            pcb_cfg,
+            float(half_length_m),
+            float(travel_target_lead_y_env),
+            travel_axis_world,
+        )
+        a = torch.tensor(travel_axis_world, device=env.device, dtype=lead_env.dtype)
+        a = a / torch.norm(a).clamp_min(1e-9)
+        proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+        if hasattr(env, "_insert_start_lead_proj"):
+            travel_m = proj - env._insert_start_lead_proj
+        else:
+            travel_m = torch.zeros_like(proj)
+        start = float(travel_gate_start_m)
+        span = max(float(travel_gate_full_m) - start, 1e-9)
+        floor = float(travel_gate_floor)
+        travel_scale = floor + (1.0 - floor) * torch.clamp(
+            (travel_m - start) / span, min=0.0, max=1.0
+        )
+        ramp = ramp * travel_scale
+    return ramp
+
+
+def jaw_rail_clearance_mm_obs(
+    env: ManagerBasedRLEnv,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    reference_z_env: float,
+) -> torch.Tensor:
+    """Debug readout: lower-jaw height above the rail plane, in MILLIMETRES.
+
+    Pair with a 1e-10 weight so the logged ``Episode_Reward`` value divided by 1e-10 reads directly
+    in mm.  ``jaw_rail_clearance`` itself logs ``weight * ramp * seat``, which needs the seating
+    index from a second term to invert -- three quantities the run cannot separate after the fact.
+    """
+    return _jaw_rail_clearance_m(env, left_finger_cfg, right_finger_cfg, reference_z_env) * 1000.0
+
+
+def slide_leading_edge_travel_mm_obs(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    target_lead_y_env: float,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """Debug readout: leading-edge push-axis travel since the slide reset, in MILLIMETRES.
+
+    The push terms only ever log a *normalised* rate, so a run cannot tell "slow but arriving" from
+    "nowhere near the goal" -- the distinction that decides whether the milestones are reachable
+    inside ``episode_length_s`` at all.
+    """
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    a = torch.tensor(axis_world, device=env.device, dtype=lead_env.dtype)
+    a = a / torch.norm(a).clamp_min(1e-9)
+    proj = torch.sum(lead_env * a.unsqueeze(0), dim=-1)
+    if hasattr(env, "_insert_start_lead_proj"):
+        return (proj - env._insert_start_lead_proj) * 1000.0
+    return torch.zeros_like(proj)
+
+
+def slide_leading_edge_lane_drift_mm_obs(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    half_length_m: float,
+    axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
+) -> torch.Tensor:
+    """Debug readout: leading-edge lane (X) drift since the slide reset, in MILLIMETRES.
+
+    Signed, so the sign says which way the board is being steered.  This is the gate that silently
+    withholds ``slide_travel_milestone`` credit (see ``_slide_lead_pose_ok``), and a run where the
+    board travels far enough but the milestone stays zero is otherwise indistinguishable from one
+    where it never travelled.
+    """
+    lead_env = pcb_leading_short_edge_center_env(env, pcb_cfg, half_length_m, axis_world)
+    if hasattr(env, "_insert_start_lead_env"):
+        return (lead_env[:, 0] - env._insert_start_lead_env[:, 0]) * 1000.0
+    return torch.zeros_like(lead_env[:, 0])
+
+
+def gripper_tip_under_pcb_penalty(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    pcb_half_thickness_m: float = 0.0005,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    max_penalty_excess_m: float = 0.010,
+    thickness_target_offset_m: float = 0.0,
+) -> torch.Tensor:
+    """Penalty when a pad tip leaves the PCB's trailing-edge thickness band (over OR under).
+
+    Symmetric guard for mid-thickness seating.  The old one-sided ``under`` form left climbing *over*
+    the board unpunished: ``tip_under_penalty`` read exactly zero while the tip rode the top face,
+    push rewards kept paying, and the only attractor was the weak ``tip_mid_thickness`` shaping term.
+    Inflated contact offsets can also pop the tip up over the 1 mm edge during collision resolution,
+    which looks like adaptive contact but is just the physics shell riding the corner.
+
+    ``thick`` is the signed offset of each tip from the trailing-face centre along the board's
+    thickness axis.  With ``thickness_target_offset_m`` the allowed band is centred on that offset
+    (Slide's +5 mm "ride above the edge" target); ``relu(abs(thick - offset) - half)`` is how far a
+    tip has left the band on either side.
+
+    ``excess`` is squared and normalised to ``[0, 1]``.  Pair with a **negative** weight.
+    """
+    _, _, _, _, thick_l, thick_r = _straddle_width_target_tip_dists(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    half = float(pcb_half_thickness_m)
+    tgt = float(thickness_target_offset_m)
+    off_l = torch.clamp(torch.abs(thick_l - tgt) - half, min=0.0)
+    off_r = torch.clamp(torch.abs(thick_r - tgt) - half, min=0.0)
+    excess = torch.maximum(off_l, off_r)
+    cap = max(float(max_penalty_excess_m), 1e-9)
+    excess = torch.clamp(excess, min=0.0, max=cap)
     return torch.square(excess / cap)
 
 
@@ -8401,12 +9082,18 @@ def pcb_push_axis_velocity_reward(
     pcb_cfg: SceneEntityCfg,
     axis_world: tuple[float, float, float] = _DEFAULT_PUSH_AXIS_WORLD,
     min_push_speed_m_s: float = 0.002,
+    ref_speed_m_s: float | None = None,
 ) -> torch.Tensor:
     """Reward PCB root linear speed along the push axis (default world +Y).
 
     Returns ``v_push`` when ``v_push > min_push_speed_m_s``; otherwise 0.  No credit for
     −push, X, or Z motion.  Pair with :func:`pcb_push_axis_progress_reward` (state).
     Use a **positive** weight.
+
+    ``ref_speed_m_s`` normalises the result to ``clamp(v_push / ref, 0, 1)`` so the term is a
+    [0, 1] index like the rest of the reward set and its weight means what it looks like.  Left
+    at ``None`` the raw m/s value is returned, which makes any weight read several orders of
+    magnitude larger than it pays.
     """
     pcb = env.scene[pcb_cfg.name]
     v = pcb.data.root_lin_vel_w
@@ -8414,6 +9101,8 @@ def pcb_push_axis_velocity_reward(
     a = a / torch.norm(a).clamp_min(1e-9)
     v_push = torch.sum(v * a.unsqueeze(0), dim=-1)
     moving = v_push > float(min_push_speed_m_s)
+    if ref_speed_m_s is not None:
+        v_push = (v_push / (float(ref_speed_m_s) + 1e-9)).clamp(0.0, 1.0)
     return torch.where(moving, v_push, torch.zeros_like(v_push))
 
 

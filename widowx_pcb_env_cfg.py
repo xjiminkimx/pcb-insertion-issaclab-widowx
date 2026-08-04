@@ -36,6 +36,8 @@ from .mdp_custom import (
     pcb_leading_edge_insertion_proximity_reward,
     pcb_leading_edge_push_axis_approach_progress,
     pcb_push_axis_velocity_reward,
+    pcb_leading_edge_push_axis_approach_progress_seated,
+    pcb_push_axis_velocity_reward_seated,
     action_rate_l2,
     straddle_lateral_gap_shaping_fade_near_success,
     slide_success_bonus_reward,
@@ -44,6 +46,7 @@ from .mdp_custom import (
     gripper_jaw_tips_level_reward,
     gripper_wrist_carriage_tip_down_pitch_shaping,
     gripper_wrist_carriage_tip_down_pitch_shaping_gated,
+    gripper_wrist_carriage_tip_down_pitch_shaping_gated_on_tip_mid,
     gripper_wrist_pitch_deg_signed_obs,
     straddle_trailing_face_bounded_approach_reward_fade_near_success,
     straddle_finger_trailing_width_proximity_fade_near_success,
@@ -67,7 +70,12 @@ from .mdp_custom import (
     slide_pcb_yaw_xy_alignment_shaping,
     slide_pcb_yaw_sin_obs,
     pcb_yaw_abs_exceeds,
-    pcb_trailing_edge_lift_vs_leading_penalty,
+    pcb_edge_axis_parallel_penalty,
+    gripper_jaw_rail_clearance_shaping,
+    jaw_rail_clearance_mm_obs,
+    slide_leading_edge_travel_mm_obs,
+    slide_leading_edge_lane_drift_mm_obs,
+    gripper_tip_under_pcb_penalty,
     straddle_tip_mid_thickness_shaping,
     slide_finger_push_axis_delta_obs,
     store_slide_reset_ee_pose_w,
@@ -94,7 +102,7 @@ from .mdp_custom import (
 PCB_X = 240.0 * 0.001
 PCB_Y = 78.5 * 0.001
 PCB_Z = 0.001
-PCB_MASS_KG = 0.
+PCB_MASS_KG = 0.2
 _PCB_HALF_WIDTH_M = PCB_Y * 0.5
 _SHORT_EDGE_WIDTH_WEIGHT = 3.0
 ASSET_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -224,7 +232,7 @@ _PCB_POS_OFFSET_RANGES = {
 _PCB_YAW_OFFSET_RANGE = (-0.003, 0.00)
 _GRIPPER_OPEN_WIDTH_M = _APPROACH_OPEN_WIDTH_M
 # Distal offset from ``gripper_left``/``gripper_right`` body origin to contact pad tip (wrist→jaw).
-_GRIPPER_TIP_OFFSET_M = 0.06
+_GRIPPER_TIP_OFFSET_M = 0.065
 
 # ---------------------------------------------------------------------------
 # Conveyor + slot — independent of robot (prior Sim tuning; env_v7 USD at _MAG_POS above)
@@ -257,9 +265,14 @@ _ROBOT_MAX_DEPENETRATION_VELOCITY = 0.05
 # even engaged. Capped hard at 0.5 m/s: generous headroom over any intended push speed, but low
 # enough that a bad instantaneous force can no longer send the board flying across the scene.
 _PCB_MAX_LINEAR_VELOCITY_MPS = 0.1
-_PCB_CONTACT_OFFSET_M = 0.0001
-_PCB_REST_OFFSET_M = 0.0001
-_PCB_STATIC_FRICTION = 0.7   # FR4 PCB surface (was 4.0 — too high, prevented jaw from sliding past trailing edge)
+# Thin PCB (1 mm) vs finger pads: 0.1 mm contact band allowed tip tunneling; 1.0 mm helped but
+# gripper-tip / PCB pairs still penetrated under push load. 1.5 mm contact + 0.4 mm rest on BOTH
+# the cuboid and the robot spawn (symmetric -- robot rest was 0.0 before, which left all separation
+# on the PCB side only).  Keep contact <= ~1.5 mm: the board is only 1 mm thick and larger offsets
+# float contacts / desync reward geometry.
+_PCB_CONTACT_OFFSET_M = 0.0012
+_PCB_REST_OFFSET_M = 0.0004
+_PCB_STATIC_FRICTION = 1.0   # FR4 PCB surface (was 4.0 — too high, prevented jaw from sliding past trailing edge)
 _PCB_DYNAMIC_FRICTION = 0.5  # kinetic (was 3.2)
 _PCB_SOLVER_POS_ITERATIONS = 24
 _PCB_SOLVER_VEL_ITERATIONS = 12
@@ -303,10 +316,16 @@ _MAG_Y_FAR_FACE_ENV = 0.472    # magazine back wall — PCB leading edge seats j
 _HALF_LENGTH_M = PCB_X * 0.5
 
 # Per-control-step +Y travel that saturates the progress reward (reward = clamp(Δ,0,max)/max).
-# Lowered 0.005 -> 0.002: at 0.005 the reward only saturated at ~0.6 m/s, so a controlled ~0.05 m/s
-# slide earned <10% of the term.  0.002 saturates at ~0.25 m/s -> realistic slide speeds now get a
-# strong, well-graded push signal (weight 500).
-_SLIDE_PUSH_APPROACH_MAX_STEP_M = 0.002
+# 0.002 -> 0.0006 (2026-07-31).  The cap has to be set from the speed the task actually needs, not
+# from a speed the arm could theoretically reach: 0.31 m of travel inside the 5 s episode is
+# 0.062 m/s == 0.50 mm per 8 ms control step.  At a 2 mm cap that perfect push sits at index 0.248
+# forever, so the term paid 12.4/s out of a possible 50 and the policy never saw full credit for
+# doing the job right.  0.0006 saturates at 0.075 m/s, just above the required pace.
+_SLIDE_PUSH_APPROACH_MAX_STEP_M = 0.0006
+# Push speed that saturates ``push_axis_velocity``.  Without this the term returns raw m/s, so a
+# nominal 0.062 m/s slide scored 0.062 and weight 50 delivered 3.1/s -- invisible next to the
+# -25/s alive penalty, even though every neighbouring term is a [0,1] index.
+_SLIDE_PUSH_REF_SPEED_M_S = 0.062
 # Leading-edge Z lift above episode-start height before exponential penalty (slide phase).
 _SLIDE_LEAD_EDGE_MAX_LIFT_M = 0.004
 _SLIDE_LEAD_EDGE_MAX_PENALTY_EXCESS_M = 0.02
@@ -584,20 +603,88 @@ _ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS = (
 # the raised rx stiffness ceiling above so the policy both WANTS to pitch down (reward) and CAN
 # hold it against contact reaction forces (stiffness).
 #
-# 2026-07-27: this is now the angle at which the ramp SATURATES (full credit at or past it), not a
-# narrow peak, so "25 deg or steeper" is all rewarded equally -- set to the clearance minimum (25)
-# rather than a guessed optimum (was 30 with a 6 deg sigma, which measured 0.013 of full credit at
-# the actual reset posture -- see the shape note in the reward function).  ``MAX`` only guards
-# against degenerate near-vertical postures that would swing the pads off the trailing face.
+# 2026-07-29 (a): 25 -> 20 after play showed early tip-under / shovel and near-success tip
+# penetration of the PCB face.
+# 2026-07-29 (b): REVERTED 20 -> 25.  The carriage started catching the conveyor rail guide again.
+# Two things had changed together and both cut clearance:
+#   * At the finger geometry documented under ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` (60 mm tip
+#     offset, +/-8.75 mm inherited jaw roll), the low finger clears the rails by
+#     ``60 * sin(pitch) - 8.75`` mm: ~16.6 mm at 25 deg but only ~11.8 mm at 20 deg.  Approach also
+#     still targets 25 deg, so Slide was being replayed from a 25 deg pose into a reward that had
+#     no gradient left above 20 deg -- the pitch was free to decay into the thin margin.
+#   * The tip-down gate below could reach exactly 0, which removed the clearance incentive
+#     outright.  See ``gate_floor``.
+# Tip-under is now handled by ``tip_under_penalty`` (a direct penalty on the contact geometry)
+# rather than by starving the tip-down term, so the clearance angle can go back to its old value.
 _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
 _SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 35.0
+# Tip-down pays more after mid-thickness seating (closedness is already high on Approach→Slide
+# replay, so it cannot serve as the gate).  ``FLOOR`` is the share paid unconditionally — the
+# clearance posture must never become optional, or the jaw carriage drops onto the belt.
+_SLIDE_TIP_DOWN_MID_GATE_START = 0.45
+_SLIDE_TIP_DOWN_MID_GATE_FULL = 0.75
+_SLIDE_TIP_DOWN_MID_GATE_FLOOR = 0.5
+# Tighter mid-thickness σ than Approach so tip-under is corrected early in the push.
+_SLIDE_MID_THICKNESS_STD_M = 0.008
+# Slide tip attractor along PCB +Z above mid-thickness (shared by tip_mid, clearance seating,
+# seated-push gate, tip_under).  +2 mm rides the top of the 1 mm edge without a large climb from
+# the Approach mid-plane handoff; at σ = 8 mm that handoff scores tip_mid ≈ 0.76.
+_SLIDE_TIP_MID_Z_OFFSET_M = 0.002
+# Gate just under the mid-plane handoff index (~0.76): open at reset, cuts once tips sit ~4 mm
+# below the +2 mm target (index ≈ 0.54).  0.30 was sized for the abandoned +5 mm offset and still
+# paid push at tip ≈ −5 mm — far too loose here.
+# Tip_mid hard gate on push.  0.60 -> 0.55 (2026-08-03): after a pad/conveyor clash the policy
+# often backs up into a good tip-down pose whose tip_mid sits ~0.55-0.75; 0.60 left recovery
+# episodes with push stuck closed while jaw clearance was already high.
+_SLIDE_PUSH_MIN_TIP_MID = 0.55
+# Soft jaw-clearance ramp on push (2026-08-03).  Requirement (1): do not pay forward push at the
+# shallow Approach handoff before the tip-fixed jaw lift is in.  Requirement (2): once the arm
+# recovers into a deep clear pose (~24 mm+), push must fully reopen.  Soft — not a hard step —
+# so ~17 mm handoff is not frozen at exactly zero, but early shallow postures earn almost nothing.
+_SLIDE_PUSH_CLEARANCE_GATE_START_M = 0.014
+_SLIDE_PUSH_CLEARANCE_GATE_FULL_M = 0.024
+# Clearance *reward* deepens with travel: floor at reset, full by ~30 mm.
+_SLIDE_CLEARANCE_TRAVEL_GATE_START_M = 0.0
+_SLIDE_CLEARANCE_TRAVEL_GATE_FULL_M = 0.030
+_SLIDE_CLEARANCE_TRAVEL_GATE_FLOOR = 0.45
+# Tip-under: how far a pad tip may sink past the board's bottom face before the penalty saturates.
+#
+# 0.010 -> 0.020 (2026-07-29).  The penalty is ``(clamp(under, 0, cap) / cap)**2``, so BEYOND the cap
+# it is exactly flat and its gradient is exactly ZERO -- and the inherited handoff pose sits at
+# 11.7 mm under, i.e. already past a 10 mm cap on the very first step of every episode.  The term was
+# therefore a constant, and no weight on it could teach the policy to pull the tips out; that is why
+# re-weighting alone could not fix the digging-under behaviour.  20 mm keeps real gradient across the
+# whole range the pose actually visits while still saturating well before the ~43 mm depths a deep
+# tip-down command produces.  Widening the cap also softens the term at small depths (the square is
+# normalised by the cap), which the weight below compensates for.
+_SLIDE_TIP_UNDER_MAX_EXCESS_M = 0.020
+# Edge-parallel: the board may start tilted/rotated, but its short edges must end up spanning
+# world X (matched corner Y) and its long edges spanning world Y (matched corner X).  The long edge
+# binds first — over a 240 mm board 2 mm of corner spread is ~0.5 deg of yaw and 20 mm is ~4.8 deg,
+# so the term bites far earlier than the original (5 mm / 40 mm) setting.  The 1 mm dead band tried
+# on 2026-07-29 was below the noise floor of a sliding contact and fired constantly; the fix for
+# "too loose" is here, in the dead band, NOT in the term's weight (see the reward term's note).
+_SLIDE_EDGE_PARALLEL_TOLERANCE_M = 0.002
+_SLIDE_EDGE_PARALLEL_MAX_EXCESS_M = 0.020
+# Same term's lift half: no board corner may climb off the belt plane.  2 mm of dead band is just
+# contact wobble on a 1 mm board; 10 mm saturates.
+_SLIDE_EDGE_PARALLEL_MAX_LIFT_M = 0.002
+_SLIDE_EDGE_PARALLEL_MAX_LIFT_EXCESS_M = 0.010
 # Cumulative EE rotation box for Slide, per task axis (rx, ry, rz) in rad, measured FROM THE RESET
 # ORIENTATION (the replayed straddle pose, measured at -13 deg pitch by
 # ``scripts/diag_ee_box.py --slide``).  The base is un-rotated, so these are world axes:
 #
 #   rx  pitch about world X.  NEGATIVE = tip-DOWN (rotating the wrist->jaw vector, which points
-#       along +Y, about +X by -theta drops its Z).  -0.35 rad lets the wrist reach ~-33 deg total,
-#       covering the 25 deg clearance target with margin; +0.09 rad stops it flopping back up.
+#       along +Y, about +X by -theta drops its Z).  +0.09 rad stops it flopping back up.
+#
+#       The lower bound MUST stay inside what ``_SLIDE_EE_VERTICAL_HALF_RANGE_M`` can support, and
+#       -0.30 did not (2026-07-30).  With the pads on the board plane the carriage sits at
+#       ``_GRIPPER_TIP_OFFSET_M * sin(pitch)``, so the 15 deg handover starts it at 15.5 mm and the
+#       +/-10 mm vertical box tops out at 25.5 mm, i.e. pitch 25.2 deg.  -0.30 rad reaches 32.2 deg,
+#       where holding the tips on the plane would need 32.0 mm of carriage height -- 6.4 mm more than
+#       the box allows -- so past 25.2 deg the pads are forced under a 1 mm board no matter what the
+#       policy does, which is the shovel/board-lift seen in play.  -0.12 rad reaches 21.9 deg
+#       (22.4 mm of clearance, comfortably past the 18 mm target) with zero forced tip depth.
 #   ry  roll about the push axis.  Kept small: this is the axis that tilts the jaw rail so the two
 #       pads stop being level, and the replayed reset pose already carries ~10-13 deg of inherited
 #       roll error that must not grow.
@@ -608,6 +695,12 @@ _SLIDE_WRIST_MAX_PITCH_DOWN_DEG = 35.0
 # rotation_box`` note): 0.15 rad on every axis would forbid the tip-down entirely, and 0.35 rad on
 # every axis would let roll/yaw drift 20 deg.
 _SLIDE_ORIENTATION_DEV_LIMITS_PER_AXIS = (
+    # rx tip-down floor -0.20 -> -0.30 (2026-08-03).  The task signal is seated jaw lift
+    # (``jaw_rail_clearance`` × tip_mid), which with tips pinned is the same geometry as deeper
+    # tip-down: jaw ≈ tip_offset·sin(pitch).  Approach hands over ~15-17 deg; -0.30 rad (~17 deg)
+    # of further tip-down reaches ~32-34 deg if the vertical box can hold tip Z.  Earlier -0.30
+    # forced tip dive only because the vertical box was too tight; that box is opened below, and
+    # tip_mid seating / tip_under cut credit if tips leave the band.  ry/rz stay tight.
     (-0.30, 0.09),
     # ry (roll about the push axis).  Do NOT open this up to fix the jaw roll -- measured 2026-07-27,
     # commanding ry does not roll about the pad line, it lifts the whole EE ~33 mm and the pads let
@@ -616,8 +709,48 @@ _SLIDE_ORIENTATION_DEV_LIMITS_PER_AXIS = (
     (-0.10, 0.10),
     (-0.12, 0.12),
 )
+# Jaw-body height above the belt/rail plane that ``jaw_rail_clearance`` ramps to full credit at.
+# Measured (``scripts/diag_slide_obstacle.py``, from the Slide reset): at +17.9 mm the nearest fixture
+# ahead of the jaws is the magazine 331 mm away -- a clear lane the whole way -- while at +10.0 mm it
+# is a conveyor support rail only 25 mm ahead, which is the ~30-40 mm push stall seen in play.
+#
+# TARGET AND WEIGHT PULL IN OPPOSITE DIRECTIONS and only the weight sets the strength: the term is a
+# linear ramp, so its slope where the policy sits is ``weight * tip_mid / target`` -- raising the
+# target FLATTENS it.  The target's only job is to sit just past the reachable ceiling, so the ramp
+# stays un-saturated (a saturated ramp has zero gradient exactly where the policy needs one).
+#
+# 0.035 -> 0.024 (2026-08-01), from a 32-env sweep of what the arm can actually reach with the tips
+# still seated (``diag_slide_obstacle.py --stiff_cmd 1.0``, means over envs):
+#
+#   idle 1.6 s              pitch -20.6 deg   tip -10.6 mm   jaw 12.5 mm
+#   + max +Z lift           pitch -20.6 deg   tip  -0.9 mm   jaw 22.2 mm   <- ceiling
+#   + max +Z lift & tip-down  pitch -28.1 deg   tip -19.2 mm   jaw 12.1 mm
+#
+# Two things fall out.  The reachable ceiling is 22.2 mm, so 35 mm was 13 mm past it -- the ramp
+# topped out at 0.63 and the slope was 43% flatter than at 20 mm for nothing.  And the lever that
+# gets there is the VERTICAL box, not pitch: +Z lift alone brings the tips back from -10.6 mm to
+# -0.9 mm, while commanding tip-down buries them to -19.2 mm and drops the jaws too, because the
+# rotation pivots about the wrist rather than about the pad tips.
+#
+# 24 mm clears the 22.2 mm ceiling by enough that the term never saturates, and at the seated
+# operating point its slope (0.93 /s per mm) beats both 35 mm (0.63) and 20 mm, which saturates
+# outright.  Do not read this as a pitch request: with the tips pinned to the board's mid-thickness
+# plane the identity ``jaw = _GRIPPER_TIP_OFFSET_M * sin(pitch)`` makes 24 mm equal 21.7 deg, inside
+# the rx box, but the policy is meant to reach it by lifting, not by rotating.
+# 0.026 -> 0.028 (2026-08-03).  Play showed tip-fixed ~26 mm / tip-down still leaves a millimetre-
+# scale pad–conveyor clash that stalls travel at ~29 mm; ask for a bit more seated jaw height.
+_SLIDE_JAW_RAIL_CLEARANCE_TARGET_M = 0.028
 _SLIDE_EE_LATERAL_HALF_RANGE_M = 0.01
-_SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.01
+# ±15 -> ±30 mm (2026-08-03).  Primary Slide skill is tip-fixed jaw lift; with tips on the board
+# a move from ~17 deg to ~25 deg tip-down needs ~8 mm of wrist Z, and recovering sag / clearing
+# the pad–conveyor clash wants more.  ±15 mm left the vertical box as the binding constraint once
+# the +Z bias ate half the upward room.  ±30 mm is as open as is useful without letting the arm
+# climb clear off the board (tip_mid / tip_under still police that).
+_SLIDE_EE_VERTICAL_HALF_RANGE_M = 0.030
+# Slide-only: bias the absolute EE position-box anchor UP at reset (not the joint pose).
+# 5 -> 8 mm (2026-08-03): start the OSC pull already toward a higher jaw while tip_mid holds the
+# pads on the edge.  Still well inside the ±30 mm vertical box.
+_SLIDE_RESET_EE_Z_BIAS_M = 0.008
 _SLIDE_EE_PUSH_OFFSET_MIN_M = 0.0
 _SLIDE_EE_PUSH_OFFSET_MAX_M = 0.60
 # Max lead of the push SETPOINT over the pose the arm actually reached.  The box above bounds only
@@ -685,7 +818,9 @@ _SLIDE_APPROACH_LEAD_XYZ_ENV = (
     _PCB_CENTER_Z_ENV,
 )
 # One-shot travel milestones (fraction of episode-start → success leading-edge +Y).
-_SLIDE_TRAVEL_MILESTONE_FRACTIONS = (0.25, 0.5, 0.75, 0.875, 0.95)
+# First tier 0.25 -> 0.12 (2026-08-03): ~37 mm, just past the ~29 mm pad/conveyor stall, so a
+# policy that clears the clash and inches forward gets sparse credit before the old 78 mm bar.
+_SLIDE_TRAVEL_MILESTONE_FRACTIONS = (0.12, 0.25, 0.5, 0.75, 0.875, 0.95)
 # Milestone credit: lead X ±spawn drift; lead Z near belt-top centre height.
 _SLIDE_MILESTONE_MAX_LEAD_X_DRIFT_M = 0.02
 _SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M = 0.02
@@ -770,11 +905,24 @@ _APPROACH_PREDEEP_ALONG_GATE_M = 0.0
 # Symmetric approach — midpoint stays on trailing-edge centreline.
 _APPROACH_MIDPOINT_JAW_OFFSET_M = 0.0
 # Success: mean per-jaw ``1 - tanh(dist/std)`` must reach this closedness (in [0, 1]).
-_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.55
+_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.40
 # Success ALSO requires the tip mid-thickness index (straddle_tip_mid_thickness_shaping, in
 # [0, 1]) to reach this value — pads must sit near the PCB mid-thickness plane, not just be
 # laterally closed around the trailing edge.
-_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
+#
+# 0.3 -> 0.75 (2026-07-29).  This was THE handoff bug, and it silently invalidated the whole
+# ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` argument below.  The index is ``1 - tanh(|d|/σ)`` averaged
+# over both pads, so with σ = 12 mm a threshold of 0.3 admitted |d| up to σ·atanh(0.7) = 10.4 mm --
+# on a board that is 1 mm thick.  The pitch gate and this gate were therefore jointly satisfiable by
+# poses that met the pitch requirement by dropping the pads ~10 mm BELOW the board instead of by
+# raising the finger bodies above the rails, and all 500 collected terminal states are of that kind:
+# measured at the Slide reset, pad tips sit 12.2 / 12.7 mm under the mid-thickness plane and the
+# finger bodies only 10.0 / 8.6 mm over the board, where the required height is 60·sin(21°) = 22 mm.
+# Slide then inherits a pose whose pads are hooked under the board (lifting the EE carries the board
+# up with it) and whose carriage jams on the rails after ~25 mm of travel.
+# 0.75 gives σ·atanh(0.25) = 3.1 mm, a real edge straddle, and leaves σ alone so the dense shaping
+# keeps its far-field gradient (see ``_APPROACH_MID_THICKNESS_STD_M``).
+_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.60
 # Success ALSO requires the wrist->pad-tip line to be tipped at least this far below horizontal.
 #
 # This is the Slide phase's feasibility gate, imposed here because `collect_approach_states.py`
@@ -787,6 +935,19 @@ _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.3
 # 13 deg -- right on the boundary, which is why the slide jammed after 35 mm of a 312 mm push with
 # four joints at their torque limits.  18 deg puts the low finger ~10 mm clear; the shaping target
 # below asks for more so the gate is not the binding constraint.
+#
+# Value unchanged, but note that this argument only holds while the pads really are pinned to the
+# trailing edge -- it converts pitch into rail clearance through the 60 mm lever, and that lever is
+# anchored at the pad tips.  Until 2026-07-29 the mid-thickness gate above admitted 10.4 mm of pad
+# offset, so the lever was anchored nowhere and this gate bought pitch WITHOUT clearance.  Measured
+# confirmation of both halves (``scripts/diag_slide_obstacle.py``, from the Slide reset):
+#   * the 60 mm lever is real -- ``scripts/diag_gripper_tip_offset.py`` measures the jaw meshes
+#     reaching 69.6 mm forward of the pad-body origin, so ``_GRIPPER_TIP_OFFSET_M`` = 60 mm is
+#     accurate (if anything 10 mm conservative);
+#   * clearance tracks finger-body height, NOT pitch on its own: at +17.9 mm the nearest fixture
+#     ahead is the magazine 331 mm away (clear), at +10.0 mm it is the support rail 25 mm away
+#     (jams), and commanding MORE tip-down without raising the body drove the bodies to -7 mm,
+#     i.e. straight into the rails.
 _APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 17.5
 # Shaping target/ceiling for the same posture.  Aimed above the gate so the policy settles with
 # margin: 25 deg puts the mean finger body 25 mm over the rails, low finger ~16 mm.
@@ -796,8 +957,20 @@ _APPROACH_WRIST_MAX_PITCH_DOWN_DEG = 35.0
 # policy farmed a deep wrist pitch (``wrist_tip_down`` ~full credit) while ``closedness_tight``
 # plateaued at ~0.10-0.15 and success stayed ~0 for 260 epochs. Soft ramp: 0 at gate_start, 1 at
 # gate_full, using the same σ as the success termination.
-_APPROACH_TIP_DOWN_GATE_START = 0.20
-_APPROACH_TIP_DOWN_GATE_FULL = 0.40
+_APPROACH_TIP_DOWN_GATE_START = 0.30
+_APPROACH_TIP_DOWN_GATE_FULL = 0.45
+# Start of the second (mid-thickness) ramp on the same tip-down reward.  Below this the pads are far
+# enough off the board's thickness plane that pitch buys no rail clearance, so it pays nothing; full
+# credit arrives at ``_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD``.
+#
+# This MUST sit below the mid-thickness index the policy can actually reach, or the ramp never opens
+# and the wrist never pitches down at all.  At 0.35 it deadlocked: the policy converged at index
+# 0.264, the gate multiplied out to exactly 0.000 (measured ``wrist_tip_down`` index 0.050 of 1.0),
+# and pitch parked at -13.1 deg -- 1.9 deg short of the ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` gate
+# -- unchanged across 55 epochs while closedness and lateral alignment both converged.  0.20 opens
+# the ramp to ~18% at the converged index, enough for a gradient, and it keeps widening only as
+# mid-thickness improves.
+_APPROACH_TIP_DOWN_MID_GATE_START = 0.20
 # Dense shaping fade near success (tight closedness): full credit below fade_start, linearly
 # down to min_scale by fade_end.  Stops farming loose shaping for a full episode instead of
 # taking the one-shot success bonus / early terminate.
@@ -809,7 +982,9 @@ _APPROACH_TIP_DOWN_GATE_FULL = 0.40
 # place (this previously started at 0.40 while the threshold was 0.45-0.55, actively fighting
 # convergence). Starting the fade AT the threshold means dense shaping stays at full strength
 # all the way up to success; it only discounts states that somehow linger past the closedness
-# bar without terminating (e.g. the tip-mid-thickness gate not yet satisfied).
+# bar without terminating.  Every other conjunct of the success condition (pitch, mid-thickness)
+# is exempted inside ``approach_near_success_shaping_scale``, so such lingering is always a
+# genuine choice to hold position rather than an unreachable-success trap.
 _APPROACH_SHAPING_FADE_START = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD
 _APPROACH_SHAPING_FADE_END = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD + 0.15
 _APPROACH_SHAPING_FADE_MIN_SCALE = 0.05
@@ -867,6 +1042,13 @@ def _approach_near_success_fade_params(**extra) -> dict:
         # Must track the success termination's pitch gate, or shaping fades out on poses that can
         # never actually succeed.
         "min_tip_down_deg": _APPROACH_SUCCESS_MIN_TIP_DOWN_DEG,
+        # Same requirement for the mid-thickness conjunct.  Without it the fade punished closedness
+        # progress that could not be cashed in (mid-thickness index sat near 0.22 vs the 0.55 bar),
+        # and the policy answered by pinning closedness just under the fade start and shuffling the
+        # residual error between the lateral and along axes -- closedness stayed flat for 50+ epochs
+        # while every other geometric metric improved.
+        "fade_tip_mid_std": _APPROACH_MID_THICKNESS_STD_M,
+        "fade_min_tip_mid": _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
     }
     base.update(extra)
     return base
@@ -1112,6 +1294,48 @@ def _slide_ungated_velocity_params(**extra) -> dict:
     return base
 
 
+def _slide_seated_push_common_params(**extra) -> dict:
+    """Shared kwargs for tip_mid + jaw-clearance gated slide push rewards."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "half_length_m": _HALF_LENGTH_M,
+        "axis_world": PUSH_AXIS_WORLD,
+        "min_tip_mid_for_push": _SLIDE_PUSH_MIN_TIP_MID,
+        "tip_mid_std": _SLIDE_MID_THICKNESS_STD_M,
+        "thickness_target_offset_m": _SLIDE_TIP_MID_Z_OFFSET_M,
+        "clearance_reference_z_env": _SLIDE_BELT_CENTER_Z_ENV,
+        "clearance_gate_start_m": _SLIDE_PUSH_CLEARANCE_GATE_START_M,
+        "clearance_gate_full_m": _SLIDE_PUSH_CLEARANCE_GATE_FULL_M,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+        "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+        "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+        "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+        **_gripper_wrist_kwargs(),
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_seated_push_progress_params(**extra) -> dict:
+    """Kwargs for ``pcb_leading_edge_push_axis_approach_progress_seated``."""
+    return _slide_seated_push_common_params(
+        max_step_m=_SLIDE_PUSH_APPROACH_MAX_STEP_M,
+        **extra,
+    )
+
+
+def _slide_seated_push_velocity_params(**extra) -> dict:
+    """Kwargs for ``pcb_push_axis_velocity_reward_seated``."""
+    return _slide_seated_push_common_params(
+        min_push_speed_m_s=0.005,
+        ref_speed_m_s=_SLIDE_PUSH_REF_SPEED_M_S,
+        **extra,
+    )
+
+
 def _approach_monitor_params(**extra) -> dict:
     """Kwargs for per-step push monitoring (debug step / TensorBoard), not reward terms."""
     base = {
@@ -1191,6 +1415,68 @@ def _slide_straddle_hold_params(**extra) -> dict:
     return base
 
 
+def _slide_mid_thickness_params(**extra) -> dict:
+    """Kwargs for strong early tip mid-thickness seating during slide (tighter σ than Approach)."""
+    return _approach_finger_geometry_params(
+        std=_SLIDE_MID_THICKNESS_STD_M,
+        thickness_target_offset_m=_SLIDE_TIP_MID_Z_OFFSET_M,
+        **extra,
+    )
+
+
+def _slide_tip_down_gated_params(**extra) -> dict:
+    """Kwargs for tip-down gated on mid-thickness + travel (not closedness — already high at start)."""
+    base = {
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "wrist_body_cfg": _WRIST_BODY,
+        "pcb_cfg": _PCB_ENT,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "half_length_m": _HALF_LENGTH_M,
+        "tip_mid_std": _SLIDE_MID_THICKNESS_STD_M,
+        "thickness_target_offset_m": _SLIDE_TIP_MID_Z_OFFSET_M,
+        "push_axis_world": PUSH_AXIS_WORLD,
+        "target_pitch_down_deg": _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG,
+        "max_pitch_down_deg": _SLIDE_WRIST_MAX_PITCH_DOWN_DEG,
+        "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+        "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+        "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+        "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+        "gate_start": _SLIDE_TIP_DOWN_MID_GATE_START,
+        "gate_full": _SLIDE_TIP_DOWN_MID_GATE_FULL,
+        "gate_floor": _SLIDE_TIP_DOWN_MID_GATE_FLOOR,
+        # Same travel ramp as ``jaw_rail_clearance``: deepen tip-down while pushing.
+        "travel_target_lead_y_env": _SLIDE_SUCCESS_LEAD_Y_ENV,
+        "travel_axis_world": PUSH_AXIS_WORLD,
+        "travel_gate_start_m": _SLIDE_CLEARANCE_TRAVEL_GATE_START_M,
+        "travel_gate_full_m": _SLIDE_CLEARANCE_TRAVEL_GATE_FULL_M,
+        "travel_gate_floor": _SLIDE_CLEARANCE_TRAVEL_GATE_FLOOR,
+    }
+    base.update(extra)
+    return base
+
+
+def _slide_tip_under_params(**extra) -> dict:
+    """Kwargs for the direct pad-tip-under-the-board penalty during slide."""
+    base = {
+        "pcb_cfg": _PCB_ENT,
+        "left_finger_cfg": _LEFT_FINGER,
+        "right_finger_cfg": _RIGHT_FINGER,
+        "gripper_joint_cfg": _GRIPPER_JOINT,
+        "wrist_body_cfg": _WRIST_BODY,
+        "half_length_m": _HALF_LENGTH_M,
+        "pcb_half_thickness_m": PCB_Z * 0.5,
+        "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+        "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+        "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+        "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+        "max_penalty_excess_m": _SLIDE_TIP_UNDER_MAX_EXCESS_M,
+        "thickness_target_offset_m": _SLIDE_TIP_MID_Z_OFFSET_M,
+    }
+    base.update(extra)
+    return base
+
+
 
 def _approach_termination_params(**extra) -> dict:
     """Entity + geometry kwargs shared by straddle-success termination and bonus."""
@@ -1239,12 +1525,12 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
             ),
             collision_props=sim_utils.CollisionPropertiesCfg(
                 contact_offset=_PCB_CONTACT_OFFSET_M,
-                rest_offset=0.0,
+                rest_offset=_PCB_REST_OFFSET_M,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
-                solver_position_iteration_count=32,
-                solver_velocity_iteration_count=16,
+                solver_position_iteration_count=24,
+                solver_velocity_iteration_count=12,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(
@@ -1310,9 +1596,9 @@ class WidowXPcbSceneCfg(InteractiveSceneCfg):
         prim_path="{ENV_REGEX_NS}/Magazine",
         spawn=sim_utils.UsdFileCfg(
             # Generated by usd_model/env_v7/convert_to_usd.py from assembly_1.urdf.
-            # env_v7 vs env_v6 (superseded, no longer tracked): identical assembly, side
-            # rail-guides (Part_1_4/6.stl) thinned 15mm -> 4mm in CAD (2026-07-24) so the gripper
-            # jaw/carriage clears them mid-slide.  Materials/friction/offsets unchanged from v6 --
+            # env_v7 vs env_v6 (superseded, no longer tracked): side rail-guides (Part_1_4/6.stl)
+            # are omitted from the USD export (2026-07-31) so the gripper jaw/carriage cannot
+            # foul them mid-slide; horizontal guide rails (Part_1_7) remain.
             # see the env_v7/convert_to_usd.py docstring.
             # Materials: SteelMaterial / BeltMaterial / RailMaterial / StandMaterial.
             # Colliders: magazine + rails + belts = triangle mesh (none); stand = convexDecomposition.
@@ -1702,7 +1988,7 @@ class RewardsApproachCfg():
     tip_mid_thickness = RewardTermCfg(
         func=straddle_tip_mid_thickness_shaping_gated_fade_near_success,
         params=_approach_mid_thickness_gated_params(**_approach_near_success_fade_params()),
-        weight=150.0,
+        weight=200.0,
     )
 
     # Wide-sigma (10 cm) closing signal — lowered 200 -> 110. At 200 this dominated the overshoot
@@ -1807,8 +2093,18 @@ class RewardsApproachCfg():
             "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
             "gate_start": _APPROACH_TIP_DOWN_GATE_START,
             "gate_full": _APPROACH_TIP_DOWN_GATE_FULL,
+            # SECOND gate (2026-07-29): pitch also has to wait on the pads being at the board's
+            # mid-thickness plane, not just laterally closed around it.  Closedness is measured
+            # across the board's WIDTH and says nothing about the thickness axis, so the closedness
+            # gate alone still let pitch be bought by dropping the pads under the board -- the pose
+            # every collected terminal state is in.  Since this term only converts pitch into rail
+            # clearance via the 60 mm pad lever, paying it while the lever is unanchored is what
+            # produced clearance-free pitch.  Ramp reaches full credit at the success threshold.
+            "tip_mid_std": _APPROACH_MID_THICKNESS_STD_M,
+            "tip_mid_gate_start": _APPROACH_TIP_DOWN_MID_GATE_START,
+            "tip_mid_gate_full": _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
         },
-        weight=40.0,
+        weight=30.0,
     )
     # Prefer ``Curriculum/approach_gripper_debug/pitch_deg_*`` for the real angle.  This near-zero
     # Episode_Reward term stays only so the reward manager still evaluates the obs helper; the
@@ -1867,7 +2163,41 @@ class RewardsSlideCfg:
     # -20/-25 if the policy still freezes") and its warning is now covered by ``failure_penalty``
     # below: with idling net-negative, ending the episode early becomes the cheap escape, so
     # dropping/skewing the board has to cost more than the idling loss it avoids.
-    alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-25.0)
+    #
+    # 2026-07-29 re-audit, same ledger, after straddle_hold / lateral_gap / pcb_yaw_alignment were
+    # switched off and tip_mid_thickness was raised to 35.  Per second of a frozen, well-seated
+    # pose:  tip_mid_thickness 35.0 + wrist_tip_down 8.0 + goal_lead_proximity 0.8 = 43.8 income
+    # against 25 of alive penalty, i.e. **+18.8/s for standing perfectly still** (~+94 over the 5 s
+    # episode, matching the observed ~140 return).  Meanwhile a slide that covers the full 0.31 m in
+    # 5 s earns only push_axis_velocity 3.1 + leading_edge_push_progress 5.0 ~= 9/s, and the two
+    # motion-contingent penalties (tip_under -50, pcb_edge_parallel -40) charge up to -130/s for the
+    # privilege.  Freezing was optimal by a wide margin, so the policy froze.
+    # The weight here is NOT the fix -- the income side was: tip_mid_thickness 35 -> 12 and both
+    # penalties cut to -15 / -10, which puts idling back at ~-4/s and a real push at ~+5/s.
+    # Any future term added to this phase must be checked against this same ledger.
+    #
+    # -25 -> -22 (2026-07-31).  Barely moved, and deliberately so: this weight cancels out of the
+    # push-vs-freeze comparison (it is paid in both branches), so it cannot fix a phase where
+    # freezing wins and it costs nothing to keep high.  Its only job is to hold the idle branch
+    # strictly negative.  Frozen static income measured 17.5/s and its ceiling is ~21.7/s
+    # (tip_mid 8 + jaw_rail_clearance 8 + pcb_yaw_alignment 5 + the goal proximity available
+    # without moving), so anything above -22 lets a well-posed statue turn a profit again -- the
+    # failure this run reproduced.  Sizing the push income against the penalty ceilings is what
+    # actually fixes the phase; see the push terms below.
+    # -22 -> -32 (2026-07-31), tracking ``jaw_rail_clearance`` 8 -> 25.  This weight cancels out of
+    # the push-vs-freeze comparison (it is paid in both branches), so it cannot make pushing more
+    # attractive and costs nothing to raise; its only job is to keep the idle branch negative.  New
+    # static ceiling is 8 (tip_mid) + 5 (yaw) + 25 (jaw clearance) + ~0.7 (goal) = 38.7/s, and every
+    # one of those is collectable at once by an arm that simply holds the handover pose, so the
+    # penalty has to clear the whole sum: -41 leaves a perfectly-posed statue at about -2/s.
+    # Suicide stays deterred: freezing loses ~11 over the episode while ``failure_penalty``
+    # charges 80.
+    #
+    # -41 -> -52 (2026-08-03) for tip_down 10; -52 -> -42 (same day) after dropping tip_down again.
+    # Primary static ceiling is now tip_mid 12 + jaw_rail_clearance 25 = 37/s; -42 leaves a
+    # perfectly seated statue at about -5/s.  Seating on clearance keeps most of that unfarmable
+    # without tip contact, but the ledger still has to clear the theoretical max.
+    alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-42.0)
 
     # Early-failure penalty (2026-07-27), the counterweight to the raised alive penalty above.
     # Fires once, on the step a non-timeout, non-success termination triggers.  Rewards are scaled
@@ -1883,53 +2213,122 @@ class RewardsSlideCfg:
 
     # Static straddle-quality shaping trimmed 10 -> 4: still points the grip at the trailing
     # edge, but no longer a large guaranteed payout for standing still.
-    straddle_hold = RewardTermCfg(
-        func=straddle_finger_trailing_width_proximity,
-        params=_slide_straddle_hold_params(),
-        weight=10.0,
-    )
+    # straddle_hold = RewardTermCfg(
+    #     func=straddle_finger_trailing_width_proximity,
+    #     params=_slide_straddle_hold_params(),
+    #     weight=10.0,
+    # )
 
-    lateral_gap = RewardTermCfg(
-        func=straddle_lateral_gap_shaping,
-        params=_approach_lateral_gap_params(),
-        weight=4.0,
-    )
+    # lateral_gap = RewardTermCfg(
+    #     func=straddle_lateral_gap_shaping,
+    #     params=_approach_lateral_gap_params(),
+    #     weight=4.0,
+    # )
 
-    # Keep pad tips on the trailing-edge mid-thickness plane during the push.  Tip-down for
-    # carriage/rail clearance is correct, but without this the pads can slide *under* the 1 mm
-    # board and shovel the trailing edge up (seen in play ~ep90).  Same geometry as Approach.
+    # Keep pad tips on the trailing-edge mid-thickness plane during the push.
+    #
+    # 35 -> 8 (2026-07-29).  This is pure STATIC income: a frozen, well-seated pose collects the
+    # full weight every second forever, so at 35 it alone out-earned the -25 alive penalty and made
+    # standing still net-POSITIVE (+18.8/s measured against the term list below) -- the policy
+    # stopped sliding and farmed it.  It was only raised to 35 to fight tip-under; that job now
+    # belongs to ``tip_under_penalty``, so it can go back to being a seating gradient rather than
+    # the largest term in the phase.  Re-audit the static total (see ``alive_penalty``) before
+    # raising this again.
+    #
+    # It also has to exist for ``jaw_rail_clearance`` to be safe.  That term pays for jaw HEIGHT and
+    # ``tip_under_penalty`` is one-sided (zero once the tips are above the board), so without a
+    # two-sided attractor on the mid-thickness plane the cheapest way to collect clearance is to lift
+    # the pads clean off the edge and stop pushing at all.  The penalty was made symmetric on
+    # 2026-07-31; push terms below are also gated on ``_SLIDE_PUSH_MIN_TIP_MID``.
+    # 5 (pcb_yaw_alignment) + 8 (jaw_rail_clearance) + 8 (here) ~= 21/s against -25/s of alive
+    # penalty, so freezing stays net-negative at about -4/s.
     tip_mid_thickness = RewardTermCfg(
         func=straddle_tip_mid_thickness_shaping,
-        params=_approach_mid_thickness_params(),
-        weight=15.0,
+        params=_slide_mid_thickness_params(),
+        weight=12.0,
     )
 
-    # Shovel / tip-under: trailing edge higher than leading edge.  Complements tip_mid above --
-    # tip_mid is a soft attractor to the mid-plane; this is an explicit penalty once the board
-    # is already being pried up.  max_lift 3 mm ignores tiny contact wobble.
-    pcb_trailing_lift_penalty = RewardTermCfg(
-        func=pcb_trailing_edge_lift_vs_leading_penalty,
+    # Shovel / tip-off-edge (symmetric), scored on the contact geometry instead of on the board
+    # attitude it eventually produces.  Was one-sided (under only), which left climbing *over* the
+    # board unpunished while ungated push rewards kept paying -- the "tip rides the top face" failure
+    # in play.  Now ``relu(abs(thick) - half)`` fires for either side of the 1 mm band.
+    #
+    # -50 -> -15 (2026-07-29).  Like ``pcb_edge_parallel_penalty`` below this is a MOTION-CONTINGENT
+    # penalty: exactly 0 while the arm is frozen, positive only once it engages the board.  Sized
+    # against the ~9/s a real slide earns (see ``alive_penalty``), -50 meant the first millimetre of
+    # motion cost several times what completing the whole push pays.  -15 still makes a fully
+    # buried tip (-15/s) worse than any push income, but leaves shallow contact slip affordable.
+    #
+    # -15 -> -40, paired with ``_SLIDE_TIP_UNDER_MAX_EXCESS_M`` 10 -> 20 mm (2026-07-29).  Doubling the
+    # cap halves the term's value at every depth (it is normalised by the cap), so the weight has to
+    # roughly quadruple to keep the same pressure at the depths that matter.  The resulting ladder,
+    # against the ~9/s a completed push earns: 2 mm under costs 0.2/s (ignorable contact slip), 5 mm
+    # 2.0/s, 10 mm 9.0/s, 20 mm and beyond 40/s.  The point of the re-scaling is gradient, not
+    # severity -- see the constant's note for why the old cap made this term a constant.
+    #
+    # -40 -> -12 (2026-07-31).  The ledger that justified -40 assumed ~9/s of push income; the
+    # income side is now rescaled to ~100/s (see the push terms), but -40 had meanwhile become
+    # part of a -100/s motion-penalty ceiling that made freezing optimal by 35/s.  A penalty that
+    # can outvote the entire reward for completing the task is a stop signal, not a shaping term.
+    tip_under_penalty = RewardTermCfg(
+        func=gripper_tip_under_pcb_penalty,
+        params=_slide_tip_under_params(),
+        weight=-20.0,
+    )
+
+    # Square and flat in the lane, as one summed term (range [0, 2]):
+    #   in-plane — the two corners of each short edge share a world Y, the two corners of each long
+    #              edge share a world X;
+    #   lift     — no corner rises above the belt plane it started on.
+    # Initial tilt / rotation is free inside the dead bands, but both dead bands are tight (see the
+    # constants) so the board has to converge to square-and-flat well before the slot mouth.
+    #
+    # -40 -> -30 (2026-07-29).  DEAD BAND AND WEIGHT ARE SEPARATE KNOBS and only the weight was
+    # wrong: how *early* the term bites is the dead band, how much it can *outvote* is the weight.
+    # At -40 the saturated term was -80/s against ~9/s of push income, so any board motion -- which
+    # always carries some transient yaw -- was punished an order of magnitude harder than reaching
+    # the slot pays, and freezing became optimal.  At -10 a normal 1-2 deg working yaw costs
+    # 0.3-0.9/s (negligible) while gross misalignment past ~4.8 deg still saturates at -20/s.
+    #
+    # -30 -> -8 (2026-07-31).  The paragraph above argues for -10 but the value shipped as -30,
+    # which put the saturated term at -60/s: the single largest term in the phase, bigger than the
+    # alive penalty and 4x the entire continuous push income.  The board has to move for the task
+    # to succeed and moving a free body always produces some yaw/lift transient, so this was
+    # charging the most for the one behaviour the phase exists to produce.
+    pcb_edge_parallel_penalty = RewardTermCfg(
+        func=pcb_edge_axis_parallel_penalty,
         params={
             "pcb_cfg": _PCB_ENT,
             "half_length_m": _HALF_LENGTH_M,
-            "max_lift_m": 0.003,
-            "max_penalty_excess_m": 0.015,
-            "axis_world": PUSH_AXIS_WORLD,
+            "half_width_m": _PCB_HALF_WIDTH_M,
+            "max_offset_m": _SLIDE_EDGE_PARALLEL_TOLERANCE_M,
+            "max_penalty_excess_m": _SLIDE_EDGE_PARALLEL_MAX_EXCESS_M,
+            "max_lift_m": _SLIDE_EDGE_PARALLEL_MAX_LIFT_M,
+            "max_penalty_lift_m": _SLIDE_EDGE_PARALLEL_MAX_LIFT_EXCESS_M,
+            "reference_z_env": _SLIDE_BELT_CENTER_Z_ENV,
         },
-        weight=-40.0,
+        weight=-20.0,
     )
 
-    # Ungated: credit any +Y leading-edge progress / push-axis speed (no closedness gate).
+    # Push credit only while tips stay on the mid-thickness plane (``_SLIDE_PUSH_MIN_TIP_MID``).
+    # Push is gated on tip_mid (hard) AND jaw clearance (soft ramp 14→24 mm).  Shallow handoff
+    # postures therefore earn almost no forward credit — posture first — while a recovered
+    # tip-fixed deep-clear pose (~24 mm+) fully reopens push (play 2026-08-03).
     leading_edge_push_progress = RewardTermCfg(
-        func=pcb_leading_edge_push_axis_approach_progress,
-        params=_slide_ungated_push_progress_params(),
+        func=pcb_leading_edge_push_axis_approach_progress_seated,
+        params=_slide_seated_push_progress_params(),
         weight=50.0,
     )
     push_axis_velocity = RewardTermCfg(
-        func=pcb_push_axis_velocity_reward,
-        params=_slide_ungated_velocity_params(),
+        func=pcb_push_axis_velocity_reward_seated,
+        params=_slide_seated_push_velocity_params(),
         weight=50.0,
     )
+    # 50 -> 2000 (2026-07-31).  Each tier is latched and fires on a single step, so the weight is
+    # divided by 625 steps before it reaches the return: all five tiers at 50 were worth 0.4/s in
+    # total, which is not a staged credit ladder across 310 mm, it is nothing.  2000 makes the full
+    # ladder 3.2/s -- still modest next to the continuous push terms, but now actually visible as
+    # intermediate credit for a policy that cannot yet reach the slot.
     slide_travel_milestone = RewardTermCfg(
         func=slide_leading_edge_travel_milestone_bonus,
         params={
@@ -1942,57 +2341,82 @@ class RewardsSlideCfg:
             "belt_center_z_env": _SLIDE_BELT_CENTER_Z_ENV,
             "max_lead_z_drift_m": _SLIDE_MILESTONE_MAX_LEAD_Z_DRIFT_M,
         },
-        weight=50.0,
+        weight=2000.0,
     )
     # Absolute distance-to-goal reward: pays every step just for BEING near the goal, so it was
     # a large static farm.  The +Y gradient toward the goal is already covered by the delta-based
     # leading_edge_push_progress (500) and the milestone bonuses, so this is cut 50 -> 10 and
     # kept only as a mild terminal-approach shaping.
-    goal_lead_proximity = RewardTermCfg(
-        func=pcb_leading_edge_insertion_proximity_reward,
-        params={
-            "pcb_cfg": _PCB_ENT,
-            "half_length_m": _HALF_LENGTH_M,
-            "target_lead_xyz_env": _SLIDE_GOAL_LEAD_XYZ_ENV,
-            "sigma_m": 0.12,
-        },
-        weight=10.0,
-    )
-    pcb_yaw_alignment = RewardTermCfg(
-        func=slide_pcb_yaw_xy_alignment_shaping,
-        params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
-        weight=5.0,
-    )
+    # goal_lead_proximity = RewardTermCfg(
+    #     func=pcb_leading_edge_insertion_proximity_reward,
+    #     params={
+    #         "pcb_cfg": _PCB_ENT,
+    #         "half_length_m": _HALF_LENGTH_M,
+    #         "target_lead_xyz_env": _SLIDE_GOAL_LEAD_XYZ_ENV,
+    #         "sigma_m": 0.12,
+    #     },
+    #     weight=10.0,
+    # )
+    # pcb_yaw_alignment = RewardTermCfg(
+    #     func=slide_pcb_yaw_xy_alignment_shaping,
+    #     params={"pcb_cfg": _PCB_ENT, "axis_world": PUSH_AXIS_WORLD},
+    #     weight=5.0,
+    # )
 
-    # Wrist->jaw TIP-DOWN pitch shaping (2026-07-23): without an explicit incentive, the policy has
-    # no reason to spend any of its rx authority pitching the wrist down, so the jaw carriage kept
-    # snagging the rail guide mid-slide. SIGNED shaping (``gripper_wrist_carriage_tip_down_pitch_
-    # shaping``) rewards ONLY jaw-below-wrist — the previous unsigned version scored a tip-UP wrist
-    # identically to tip-down, so the policy converged to a near-flat/tip-up posture instead (see
-    # chat 2026-07-23 clearance discussion). Biases toward ``_SLIDE_WRIST_TARGET_PITCH_DOWN_DEG``
-    # clearance (paired with the raised rx stiffness ceiling in
-    # ``_ARM_TASK_SLIDE_STIFFNESS_LIMITS_PER_AXIS`` so the policy can actually hold it under contact
-    # load). Weight kept modest (similar to lateral_gap/pcb_yaw_alignment) so it nudges posture
-    # without competing with the push rewards.
-    #
-    # WEIGHT 30 -> 8 (2026-07-27), to KEEP that intended balance after the shaping was fixed: with
-    # the old narrow peak the term evaluated to only 0.07-0.2 at the poses Slide actually visits, so
-    # weight 30 paid ~2-6/s; the monotone ramp saturates near 1.0 there instead, and measured with
-    # zero actions (``scripts/diag_ee_box.py --slide``) weight 30 paid 23.6/s -- 5x lateral_gap
-    # (3.6/s) and pcb_yaw_alignment (5.0/s), and enough static income on its own to make "freeze and
-    # survive" beat pushing again (the exact failure ``alive_penalty`` exists to prevent). 8 puts it
-    # back at ~6/s, in the same band as the other posture terms.
-    wrist_tip_down = RewardTermCfg(
-        func=gripper_wrist_carriage_tip_down_pitch_shaping,
+    # tip-down reward OFF (2026-08-03).  The skill that matters is tip-fixed jaw lift, which
+    # ``jaw_rail_clearance`` × tip_mid seating already scores directly.  A parallel tip-down term
+    # overlapped that geometry when seated and could still pull toward pitch-without-lift when
+    # seating was soft.  Keep ``_slide_tip_down_gated_params`` / the gated func for diagnostics;
+    # re-enable only if TB shows jaw height rising while pitch stays flat at the handoff.
+    # wrist_tip_down = RewardTermCfg(
+    #     func=gripper_wrist_carriage_tip_down_pitch_shaping_gated_on_tip_mid,
+    #     params=_slide_tip_down_gated_params(),
+    #     weight=10.0,
+    # )
+
+    # PRIMARY Slide posture signal: tip-fixed jaw lift.  Scores lower-jaw height above the rail
+    # plane, multiplied by tip_mid seating so levering the carriage up off a braced/buried tip
+    # pays nothing.  With tips pinned this is the same geometry as deeper tip-down
+    # (clearance ≈ tip_offset·sin(pitch)), but the scored variable is height — the quantity that
+    # actually clears pad–conveyor interference.  Travel gate deepens the pull while pushing.
+    jaw_rail_clearance = RewardTermCfg(
+        func=gripper_jaw_rail_clearance_shaping,
         params={
             "left_finger_cfg": _LEFT_FINGER,
             "right_finger_cfg": _RIGHT_FINGER,
+            "reference_z_env": _SLIDE_BELT_CENTER_Z_ENV,
+            "target_clearance_m": _SLIDE_JAW_RAIL_CLEARANCE_TARGET_M,
+            # Seating factor (2026-07-30).  Clearance is only worth paying for while the pads are
+            # still near the (Slide) tip-mid target; see the function's note for why the raw
+            # height ramp rewards levering the carriage up off a braced tip.
+            "pcb_cfg": _PCB_ENT,
+            "gripper_joint_cfg": _GRIPPER_JOINT,
+            "half_length_m": _HALF_LENGTH_M,
             "wrist_body_cfg": _WRIST_BODY,
-            "push_axis_world": PUSH_AXIS_WORLD,
-            "target_pitch_down_deg": _SLIDE_WRIST_TARGET_PITCH_DOWN_DEG,
-            "max_pitch_down_deg": _SLIDE_WRIST_MAX_PITCH_DOWN_DEG,
+            "finger_offset_m": _APPROACH_FINGER_OFFSET_M,
+            "tip_offset_m": _GRIPPER_TIP_OFFSET_M,
+            "width_gap_target_left_m": _APPROACH_GAP_LEFT_M,
+            "width_gap_target_right_m": _APPROACH_GAP_RIGHT_M,
+            "seat_tip_mid_std": _SLIDE_MID_THICKNESS_STD_M,
+            "thickness_target_offset_m": _SLIDE_TIP_MID_Z_OFFSET_M,
+            # Travel gate (2026-08-02): deepen clearance while pushing, not at the reset pose.
+            "travel_target_lead_y_env": _SLIDE_SUCCESS_LEAD_Y_ENV,
+            "travel_axis_world": PUSH_AXIS_WORLD,
+            "travel_gate_start_m": _SLIDE_CLEARANCE_TRAVEL_GATE_START_M,
+            "travel_gate_full_m": _SLIDE_CLEARANCE_TRAVEL_GATE_FULL_M,
+            "travel_gate_floor": _SLIDE_CLEARANCE_TRAVEL_GATE_FLOOR,
         },
-        weight=8.0,
+        # 8 -> 25 (2026-07-31).  The weight, not the ramp target, is what sets how hard this pulls
+        # (see the constant's note), and at 8 the whole term was 8/s against ~100/s of push income
+        # -- 0.8/s at the sagged pose the policy actually converges to, which is why two runs sat at
+        # 15 mm of jaw height and never climbed.
+        #
+        # This is safer to raise than a plain posture term because the seating factor makes it
+        # largely UNFARMABLE while idle: collecting it needs the jaws high AND the pad tips still on
+        # the board's mid-thickness plane, and an arm holding that pose is an arm that could push.
+        # At the measured idle sag it self-limits to 0.8/s.  The full 25/s is still charged against
+        # the idle ledger on ``alive_penalty``, which moves with it.
+        weight=25.0,
     )
     # Debug-only (near-zero weight): logs the SIGNED achieved pitch in degrees to TensorBoard.
     wrist_pitch_deg_debug = RewardTermCfg(
@@ -2001,6 +2425,41 @@ class RewardsSlideCfg:
             "left_finger_cfg": _LEFT_FINGER,
             "right_finger_cfg": _RIGHT_FINGER,
             "wrist_body_cfg": _WRIST_BODY,
+        },
+        weight=1e-10,
+    )
+
+    # Debug-only raw geometry, in millimetres (divide the logged value by 1e-10 to read it).
+    # Added 2026-08-02 after a run had to be diagnosed by algebra: ``jaw_rail_clearance`` logs
+    # ``weight * ramp * seat`` and the push terms log normalised rates, so neither the actual jaw
+    # height nor the distance the board covered could be read off the run directly.  Between them
+    # these three separate the three failure modes that look identical in the shaped terms -- jaws
+    # too low, board not moving, and board moving but out of the milestone's lane gate.
+    jaw_clearance_mm_debug = RewardTermCfg(
+        func=jaw_rail_clearance_mm_obs,
+        params={
+            "left_finger_cfg": _LEFT_FINGER,
+            "right_finger_cfg": _RIGHT_FINGER,
+            "reference_z_env": _SLIDE_BELT_CENTER_Z_ENV,
+        },
+        weight=1e-10,
+    )
+    board_travel_mm_debug = RewardTermCfg(
+        func=slide_leading_edge_travel_mm_obs,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "target_lead_y_env": _SLIDE_SUCCESS_LEAD_Y_ENV,
+            "axis_world": PUSH_AXIS_WORLD,
+        },
+        weight=1e-10,
+    )
+    board_lane_drift_mm_debug = RewardTermCfg(
+        func=slide_leading_edge_lane_drift_mm_obs,
+        params={
+            "pcb_cfg": _PCB_ENT,
+            "half_length_m": _HALF_LENGTH_M,
+            "axis_world": PUSH_AXIS_WORLD,
         },
         weight=1e-10,
     )
@@ -2069,14 +2528,6 @@ class EventCfgApproach:
             "store_target": False,
         },
     )
-    # # Play-only console print (accumulation via ``approach_gripper_debug_monitor`` reward term).
-    # approach_gripper_debug_print = EventTermCfg(
-    #     func=approach_gripper_debug_step,
-    #     mode="interval",
-    #     is_global_time=True,
-    #     interval_range_s=(0.0, 0.0),
-    #     params={**_approach_gripper_debug_step_params(), "accumulate": False},
-    # )
 
 
 @configclass
@@ -2123,7 +2574,10 @@ class EventCfgSlide:
     store_slide_reset_ee_pose = EventTermCfg(
         func=store_slide_reset_ee_pose_w,
         mode="reset",
-        params={"action_name": "arm_action"},
+        params={
+            "action_name": "arm_action",
+            "ee_z_bias_m": _SLIDE_RESET_EE_Z_BIAS_M,
+        },
     )
     hold_gripper_every_step = EventTermCfg(
         func=hold_gripper_open,
@@ -2289,7 +2743,22 @@ class WidowXPcbSlideEnvCfg(_WidowXPcbEnvCfgBase):
 
     def __post_init__(self):
         super().__post_init__()
-        self.episode_length_s = 5.0
+        # 3.0 -> 8.0 s (2026-08-02).  THE SLIDE WAS NOT COMPLETABLE IN 3 s.  Measured at reset, the
+        # leading edge starts at +150 mm and ``_SLIDE_SUCCESS_LEAD_Y_ENV`` is +462 mm, so the board
+        # has to cover 312 mm -- 104 mm/s sustained for the whole episode.  ``push_axis_velocity``
+        # pays full credit at ``_SLIDE_PUSH_REF_SPEED_M_S`` = 62 mm/s, which covers only 186 mm in
+        # 3 s: a policy saturating the phase's own speed reward for every step of the episode still
+        # finishes at 60% and never triggers ``slide_success``.  The top three
+        # ``_SLIDE_TRAVEL_MILESTONE_FRACTIONS`` tiers (75/87.5/95%) were likewise unreachable.
+        #
+        # That left the postural terms as the only collectable income, which is exactly what the
+        # runs did: they converged to the Approach handover pose (jaw 16.5 mm, pitch -16.8 deg) with
+        # travel ~8 mm/s, and ``slide_travel_milestone``/``slide_success_bonus`` logged a structural
+        # zero while ``losses/entropy`` climbed -- the signature of a flat advantage, not of a
+        # mis-weighted term.  8 s needs 39 mm/s (63% of the reference speed) and puts all five tiers
+        # in reach.  It also restores the horizon the reward ledger on ``alive_penalty`` and
+        # ``failure_penalty`` was sized against.
+        self.episode_length_s = 8.0
         _rb_x, _rb_y, _ = _ROBOT_BASE_POS
         self.viewer.eye = (_rb_x + 0.82, _rb_y + 0.08, _RAIL_CENTER_Z_ENV + 0.28)
         self.viewer.lookat = (_CONVEYOR_CENTER_X_ENV, 0.28, _RAIL_CENTER_Z_ENV)
