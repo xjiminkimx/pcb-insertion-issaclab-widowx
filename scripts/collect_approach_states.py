@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect successful Approach-phase (straddle) terminal states for Slide training.
+"""Collect successful Approach-phase (straddle) terminal states for Insert training.
 
 Usage (from workspace root)::
 

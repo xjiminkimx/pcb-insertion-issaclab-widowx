@@ -135,11 +135,7 @@ WidowXPcbApproachPPOCfg = {
     },
 }
 
-# Deprecated aliases (pre-approach rename).
-WidowXPcbPushPPOCfg = WidowXPcbApproachPPOCfg
-WidowXPcbStraddlePPOCfg = WidowXPcbApproachPPOCfg
-
-WidowXPcbSlidePPOCfg = {
+WidowXPcbInsertPPOCfg = {
     **WidowXPcbPPOBaseCfg,
     "params": {
         **WidowXPcbPPOBaseCfg["params"],
@@ -162,21 +158,21 @@ WidowXPcbSlidePPOCfg = {
         },
         "config": {
             **WidowXPcbPPOBaseCfg["params"]["config"],
-            "name": "widowx_pcb_slide",
+            "name": "widowx_pcb_insert",
             "full_experiment_name": ".",
             "reward_shaper": {"scale_value": 1.0},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 120,
+            "max_epochs": 180,
             "horizon_length": 256,
             "mini_epochs": 8,
             # 0.99 -> 0.995 (2026-08-02).  Control runs at 125 Hz here (step_dt 0.008 s), half the
             # rate the stock 0.99 is usually quoted for, so the effective lookahead was
             # ``dt/(1-gamma)`` = 0.8 s -- shorter than a single push stroke.  The phase's payoff
-            # structure is back-loaded (travel milestones, then ``slide_success_bonus``), so credit
+            # structure is back-loaded (travel milestones, then ``insert_success_bonus``), so credit
             # for starting a push has to survive several seconds of discounting to reach the steps
             # that decide it.  0.995 doubles the lookahead to 1.6 s, sized against the 8 s episode
-            # the slide cfg now runs.
+            # the Insert cfg now runs.
             "gamma": 0.995,
         },
     },

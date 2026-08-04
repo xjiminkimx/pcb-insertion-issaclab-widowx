@@ -27,7 +27,7 @@ WIDOWX_RL_RUNS = (
     ("Approach (legacy)", "widowx_pcb_push/summaries"),
     ("Grasp", "widowx_pcb_grasp/summaries"),
     ("Grasp gripper test", "widowx_pcb_grasp_gripper_test/summaries"),
-    ("Slide", "widowx_pcb_slide/summaries"),
+    ("Insert", "widowx_pcb_insert/summaries"),
     ("Insert", "widowx_pcb_insert/summaries"),
 )
 
@@ -105,7 +105,7 @@ def _find_widowx_summary_dirs(logdir: str) -> list[tuple[str, str]]:
 def _print_cwd_hint() -> None:
     if not _is_widowx_package_cwd():
         return
-    print("[HINT] Train with scripts/train_approach.sh / train_slide.sh / train_insert.sh")
+    print("[HINT] Train with scripts/train_approach.sh / train_insert.sh / train_insert.sh")
     print("       so logs land in ./logs/rl_games/ (this workspace).")
     print()
 
@@ -157,7 +157,7 @@ def main() -> int:
     print("      - widowx_pcb_approach (phase 1 — trailing-edge straddle)")
     print("      - widowx_pcb_push       (legacy log dir for approach)")
     print("      - widowx_pcb_grasp    (legacy grasp phase)")
-    print("      - widowx_pcb_slide    (phase 2 — slide to slot mouth)")
+    print("      - widowx_pcb_insert    (phase 2 — insert to slot mouth)")
     print("      - widowx_pcb_insert   (phase 3 — SDF insert)")
     print()
     print("[TIP] Approach monitoring (Episode/Curriculum/approach_gripper_debug/*):")
@@ -167,10 +167,10 @@ def main() -> int:
     print("      - dist_l_mm_mean / dist_r_mm_mean   — pad→±20 mm target distance")
     print("      - pitch_deg_mean / pitch_deg_live / pitch_deg_ep_min — wrist tip-down (neg=down)")
     print("      - push_gate_open_frac / push_gate_open_live")
-    print("      - success_frac                             — slide_success box step fraction")
+    print("      - success_frac                             — insert_success box step fraction")
     print("      - straddle_achieved_frac                   — closedness≥threshold step fraction")
     print("      - Episode/Episode_Termination/approach_success — true Approach success rate")
-    print("      - travel_frac_ep_max / travel_frac_end     — slide +Y progress (0→1)")
+    print("      - travel_frac_ep_max / travel_frac_end     — insert +Y progress (0→1)")
     print("      - milestone_bonus_ep                       — tiers hit per episode (0–5)")
     print("      - milestone_tier_*_hit_frac                — per-tier hit rate")
     print("      - milestone_pose_ok_frac                   — in-lane X/Z while sliding")

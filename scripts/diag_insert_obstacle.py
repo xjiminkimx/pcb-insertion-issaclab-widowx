@@ -1,4 +1,4 @@
-"""Name the fixture part each gripper-side body will run into during the slide.
+"""Name the fixture part each gripper-side body will run into during the insert.
 
 The board itself is not what jams: the pads sit at the 1 mm board plane, but the carriage and wrist
 ride 7-35 mm ABOVE it, and that is the band the conveyor's end structure lives in.  An earlier scan
@@ -9,8 +9,8 @@ that body's own X and Z footprint, and reports the nearest one ahead of it along
 i.e. the part it is about to hit and how much room is left.
 
 Run:
-    python -u scripts/diag_slide_obstacle.py --headless
-    python -u scripts/diag_slide_obstacle.py --headless --pitch_cmd -1   # hold max tip-down first
+    python -u scripts/diag_insert_obstacle.py --headless
+    python -u scripts/diag_insert_obstacle.py --headless --pitch_cmd -1   # hold max tip-down first
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ parser.add_argument("--num_envs", type=int, default=2)
 parser.add_argument(
     "--approach",
     action="store_true",
-    help="Measure the Approach env instead of Slide, to check what wrist pitch the Approach "
-    "orientation box actually allows -- Slide inherits whatever posture Approach hands over.",
+    help="Measure the Approach env instead of Insert, to check what wrist pitch the Approach "
+    "orientation box actually allows -- Insert inherits whatever posture Approach hands over.",
 )
 parser.add_argument(
     "--rot_cmd",
@@ -47,7 +47,7 @@ parser.add_argument(
     "--ry_box",
     type=float,
     default=None,
-    help="Widen the Slide roll (ry) cumulative bound to +/- this many rad.  The reset pose carries "
+    help="Widen the Insert roll (ry) cumulative bound to +/- this many rad.  The reset pose carries "
     "~13 deg of inherited jaw roll and the shipped +/-0.10 rad box cannot undo it.",
 )
 parser.add_argument(
@@ -183,7 +183,7 @@ def _tip_thickness_mm(env) -> tuple[float, float]:
 
 
 def main() -> None:
-    env_cfg = cfg.WidowXPcbApproachEnvCfg() if args.approach else cfg.WidowXPcbSlideEnvCfg()
+    env_cfg = cfg.WidowXPcbApproachEnvCfg() if args.approach else cfg.WidowXPcbInsertEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.physx.gpu_collision_stack_size = 2**26
     env_cfg.sim.physx.gpu_max_rigid_contact_count = 2**20

@@ -3,7 +3,7 @@
 Every straddle reward locates the contact point as ``pad_midpoint + _GRIPPER_TIP_OFFSET_M * fwd``,
 where ``fwd`` is the unit vector from ``link_6`` toward the jaw pad midpoint (see
 ``gripper_jaw_pad_tips_world`` / ``_gripper_tip_offset_direction_w`` in mdp_custom.py).  That 60 mm
-is a hand-entered constant, and it is load-bearing: at the ~21 deg tip-down pose the Slide phase
+is a hand-entered constant, and it is load-bearing: at the ~21 deg tip-down pose the Insert phase
 inherits, the assumed lever alone accounts for the full ~12 mm of "pad tip is under the board" that
 ``gripper_tip_under_pcb_penalty`` reports.  If the real pads are shorter, the rewards are scoring a
 phantom point in free space.
@@ -26,7 +26,7 @@ parser.add_argument("--num_envs", type=int, default=2)
 parser.add_argument(
     "--approach",
     action="store_true",
-    help="Measure in the Approach env instead of Slide (the geometry is identical; this only "
+    help="Measure in the Approach env instead of Insert (the geometry is identical; this only "
     "changes the pose the projection is reported at).",
 )
 parser.add_argument("--settle", type=int, default=60, help="Steps to settle before measuring.")
@@ -78,7 +78,7 @@ def _mesh_points_in_body_frame(prim: Usd.Prim, body_prim: Usd.Prim) -> torch.Ten
 
 
 def main() -> None:
-    env_cfg = cfg.WidowXPcbApproachEnvCfg() if args.approach else cfg.WidowXPcbSlideEnvCfg()
+    env_cfg = cfg.WidowXPcbApproachEnvCfg() if args.approach else cfg.WidowXPcbInsertEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     env_cfg.sim.physx.gpu_collision_stack_size = 2**26
     env_cfg.sim.physx.gpu_max_rigid_contact_count = 2**20

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Train Slide phase (policy chaining from Approach).
+# Train Insert phase (policy chaining from Approach).
 # Prerequisites:
 #   1. Train Approach: bash scripts/train_approach.sh --num_envs 2048 --headless
 #   2. Collect approach terminal states: bash scripts/collect_approach_states.sh
 #   3. Run this script
 #
-# Max epochs: agents/rl_games_ppo_cfg.py → WidowXPcbSlidePPOCfg max_epochs
-# TensorBoard + checkpoints: logs/rl_games/widowx_pcb_slide/
+# Max epochs: agents/rl_games_ppo_cfg.py → WidowXPcbInsertPPOCfg max_epochs
+# TensorBoard + checkpoints: logs/rl_games/widowx_pcb_insert/
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,14 +25,14 @@ for arg in "$@"; do
   fi
 done
 
-SLIDE_LOG_DIR="${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_slide"
+INSERT_LOG_DIR="${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_insert"
 if [[ "${CLEAN_ALL}" -eq 1 ]]; then
-  if [[ -d "${SLIDE_LOG_DIR}" ]]; then
-    echo "[INFO] Removing previous slide logs: ${SLIDE_LOG_DIR}"
-    rm -rf "${SLIDE_LOG_DIR}"
+  if [[ -d "${INSERT_LOG_DIR}" ]]; then
+    echo "[INFO] Removing previous insert logs: ${INSERT_LOG_DIR}"
+    rm -rf "${INSERT_LOG_DIR}"
   fi
 elif [[ "${CLEAN_TENSORBOARD}" -eq 1 ]]; then
-  SUMMARIES_DIR="${SLIDE_LOG_DIR}/summaries"
+  SUMMARIES_DIR="${INSERT_LOG_DIR}/summaries"
   if [[ -d "${SUMMARIES_DIR}" ]]; then
     echo "[INFO] Clearing TensorBoard summaries (checkpoints kept): ${SUMMARIES_DIR}"
     rm -rf "${SUMMARIES_DIR}"
@@ -78,12 +78,12 @@ else
   PYTHON="python3"
 fi
 
-echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_slide/"
+echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_insert/"
 echo "[INFO] Approach states: ${STATES_PATH}"
 echo "[INFO] Python:         ${PYTHON}"
 
 "${PYTHON}" "${TRAIN_PY}" \
-  --task Isaac-WidowX-PCB-Slide-v0 \
+  --task Isaac-WidowX-PCB-Insert-v0 \
   "hydra.run.dir=/tmp/widowx_pcb_hydra" \
   "hydra.output_subdir=null" \
   "${TRAIN_ARGS[@]}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Collect approach-phase (straddle) terminal states for Slide training.
+# Collect approach-phase (straddle) terminal states for Insert training.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

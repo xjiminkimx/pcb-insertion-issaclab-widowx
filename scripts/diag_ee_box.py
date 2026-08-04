@@ -2,7 +2,7 @@
 
 The arm sinks ~70 mm per episode with ZERO actions.  ``task_position_box_enabled`` was switched on to
 bound that, but the sag did not change even with a 10 mm box -- so either the clamp never runs, or its
-anchor (``env._slide_reset_ee_pos_w``, written by the ``store_reset_ee_pose`` reset event) is not the
+anchor (``env._insert_reset_ee_pos_w``, written by the ``store_reset_ee_pose`` reset event) is not the
 home pose.  This traces both: call count, the anchor, and the vertical offset before/after clamping.
 
 Run:
@@ -53,9 +53,9 @@ parser.add_argument(
     "task rotation axis does what and where the orientation box stops it.",
 )
 parser.add_argument(
-    "--slide",
+    "--insert",
     action="store_true",
-    help="Instrument the SLIDE phase instead of Approach, and also report the wrist->jaw tip-down "
+    help="Instrument the Insert phase instead of Approach, and also report the wrist->jaw tip-down "
     "pitch and the ``wrist_tip_down`` reward each sample (checks the pitch shaping is not a dead "
     "zone at the replayed straddle reset pose).",
 )
@@ -196,7 +196,7 @@ def _reset_anchor_probe(env, term, action) -> None:
         # env.step() already reset the finished envs, so this reads the post-reset state.
         term._compute_ee_pose()
         live = term._ee_pose_w[0, :3]
-        anchor = env._slide_reset_ee_pos_w[0]
+        anchor = env._insert_reset_ee_pos_w[0]
         err_mm = float((live - anchor).norm()) * 1000.0
         print(
             f"  {ep:3d} | {pitch_end:+11.2f} | {_wrist_pitch_deg_env(env, 0):+13.2f} |"
@@ -205,7 +205,7 @@ def _reset_anchor_probe(env, term, action) -> None:
 
 
 def main() -> None:
-    env_cfg = cfg.WidowXPcbSlideEnvCfg() if args.slide else cfg.WidowXPcbApproachEnvCfg()
+    env_cfg = cfg.WidowXPcbInsertEnvCfg() if args.insert else cfg.WidowXPcbApproachEnvCfg()
     env_cfg.scene.num_envs = args.num_envs
     if args.episodes > 0 and args.episode_s is None:
         args.episode_s = 1.0
@@ -245,14 +245,14 @@ def main() -> None:
     print(f"[cfg ] vertical_half_range_m     = {getattr(term.cfg, 'vertical_half_range_m', None)}")
     print(f"[term] _pose_rel_idx             = {term._pose_rel_idx}")
     print(f"[term] _task_vertical_axis_w     = {term._task_vertical_axis_w}")
-    print(f"[env ] has _slide_reset_ee_pos_w = {hasattr(env, '_slide_reset_ee_pos_w')}")
-    if hasattr(env, "_slide_reset_ee_pos_w"):
-        print(f"[env ] anchor p0 (env 0)         = {env._slide_reset_ee_pos_w[0].tolist()}")
+    print(f"[env ] has _insert_reset_ee_pos_w = {hasattr(env, '_insert_reset_ee_pos_w')}")
+    if hasattr(env, "_insert_reset_ee_pos_w"):
+        print(f"[env ] anchor p0 (env 0)         = {env._insert_reset_ee_pos_w[0].tolist()}")
     term._compute_ee_pose()
     print(f"[term] live EE pose  (env 0)     = {term._ee_pose_w[0, :3].tolist()}")
 
-    if args.slide:
-        # Does the home pose's orientation error survive into the replayed straddle states?  Slide
+    if args.insert:
+        # Does the home pose's orientation error survive into the replayed straddle states?  Insert
         # never reads ``_ROBOT_HOME_JOINT_POS``, but the Approach policy that produced these states
         # started from it and could only correct ~8.6 deg of it (the orientation box), so any jaw
         # roll baked into the home pose is inherited here.  Same metrics as
@@ -262,7 +262,7 @@ def main() -> None:
         ri = robot.body_names.index("gripper_right")
         jaw = robot.data.body_pos_w[:, ri] - robot.data.body_pos_w[:, li]
         jaw = jaw / jaw.norm(dim=-1, keepdim=True).clamp_min(1e-9)
-        print("\n[slide reset geometry, per env]  (home pose measures |jaw.X|=0.974 |jaw_z|=0.137)")
+        print("\n[insert reset geometry, per env]  (home pose measures |jaw.X|=0.974 |jaw_z|=0.137)")
         for e in range(env.num_envs):
             print(
                 f"    env {e}: |jaw.X|={float(jaw[e, 0].abs()):.3f}  |jaw_z|={float(jaw[e, 2].abs()):.3f}"
@@ -278,14 +278,14 @@ def main() -> None:
         idx = term._pose_rel_idx
         term._compute_ee_pose()
         z_cur = float(term._ee_pose_w[0, 2])
-        z0 = float(env._slide_reset_ee_pos_w[0, 2]) if hasattr(env, "_slide_reset_ee_pos_w") else float("nan")
+        z0 = float(env._insert_reset_ee_pos_w[0, 2]) if hasattr(env, "_insert_reset_ee_pos_w") else float("nan")
         original()
         dz_cmd = float(term._processed_actions[0, idx + 2])
         push_w = term._task_push_axis_w
         # Commanded push offset (inside the box) vs the one the arm actually achieved.  A gap here
         # means the OSC target has left the reachable workspace and the arm is being dragged.
         push_cmd = float((term._cum_pos_w[0] * push_w).sum())
-        push_act = float(((term._ee_pose_w[0, :3] - env._slide_reset_ee_pos_w[0]) * push_w).sum())
+        push_act = float(((term._ee_pose_w[0, :3] - env._insert_reset_ee_pos_w[0]) * push_w).sum())
         # EE travel is not board travel: if the pads ride up over the 1 mm edge the arm keeps
         # advancing while the PCB stays put, which looks like progress in every EE-side metric.
         pcb_y = float((env.scene["pcb"].data.root_pos_w[0] * push_w).sum())
@@ -299,7 +299,7 @@ def main() -> None:
                 z0,
                 z_cur,
                 dz_cmd,
-                _wrist_pitch_deg_env(env) if args.slide else float("nan"),
+                _wrist_pitch_deg_env(env) if args.insert else float("nan"),
                 float(term._cum_rot_vec[0, 0]),
                 push_cmd,
                 push_act,
@@ -309,7 +309,7 @@ def main() -> None:
 
     term._clamp_pose_rel_to_reset_position_box = wrapped
 
-    if args.slide:
+    if args.insert:
         _print_clearance(env, "at reset")
 
     action = torch.zeros(env.num_envs, env.action_manager.total_action_dim, device=env.device)
@@ -346,7 +346,7 @@ def main() -> None:
             f"  {i:4d} | {(z_cur - z0) * 1000:+9.1f} | {pitch:+11.2f} | {p_cmd * 1000:+13.1f} |"
             f" {p_act * 1000:+12.1f} | {(p_cmd - p_act) * 1000:+8.1f} | {pcb * 1000:+15.1f}"
         )
-    if args.slide:
+    if args.insert:
         _print_clearance(env, "after")
         print(
             f"[stall] PCB stopped at env Y = {stats['pcb_y_abs']:+.4f}"
@@ -354,7 +354,7 @@ def main() -> None:
         )
         _print_stall_report(env)
         rew = env.reward_manager._episode_sums
-        print("\n[slide] episode reward sums (env 0), most negative/positive first:")
+        print("\n[insert] episode reward sums (env 0), most negative/positive first:")
         for name, val in sorted(rew.items(), key=lambda kv: float(kv[1][0])):
             print(f"    {name:34s} {float(val[0]):+12.3f}")
     env.close()
