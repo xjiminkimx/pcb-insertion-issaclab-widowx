@@ -3824,6 +3824,61 @@ def reset_robot_joints_to_values(
     robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
     # Refresh link poses so a following reset term reads current FK (same reset cycle, no physics step yet).
     robot.update(0.0)
+
+
+def reset_robot_joints_to_values_randomized(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg,
+    joint_positions: dict[str, float],
+    joint_offset_ranges: dict[str, tuple[float, float]] | None = None,
+    default_offset_range: tuple[float, float] = (-0.1, 0.1),
+    velocity_scale: float = 0.0,
+    use_current_joint_pos: bool = False,
+) -> None:
+    """Set listed joints to nominal values plus per-joint uniform offsets (domain randomization).
+
+    ``joint_offset_ranges`` maps joint name → ``(lo, hi)`` offset added on top of the nominal value in
+    ``joint_positions``.  Joints omitted from the dict use ``default_offset_range``.  Offsets are clamped
+    to soft joint limits after application.
+    """
+    robot = env.scene[asset_cfg.name]
+    n = len(env_ids)
+    device = env.device
+    dtype = robot.data.joint_pos.dtype
+
+    if use_current_joint_pos:
+        joint_pos = robot.data.joint_pos[env_ids].clone()
+    else:
+        joint_pos = robot.data.default_joint_pos[env_ids].clone()
+    joint_vel = robot.data.default_joint_vel[env_ids].clone() * velocity_scale
+
+    name_to_idx = {name: i for i, name in enumerate(robot.joint_names)}
+    ranges = joint_offset_ranges or {}
+
+    for name, val in joint_positions.items():
+        idx = name_to_idx[name]
+        lo, hi = ranges.get(name, default_offset_range)
+        if abs(lo) > 1e-12 or abs(hi) > 1e-12:
+            offset = torch.empty(n, device=device, dtype=dtype).uniform_(float(lo), float(hi))
+            joint_pos[:, idx] = float(val) + offset
+        else:
+            joint_pos[:, idx] = float(val)
+
+    lim = robot.data.soft_joint_pos_limits[env_ids]
+    joint_pos = joint_pos.clamp(lim[..., 0], lim[..., 1])
+    vlim = robot.data.soft_joint_vel_limits[env_ids]
+    joint_vel = joint_vel.clamp(-vlim, vlim)
+    robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+    robot.update(0.0)
+    # Per-env hold target for OSC null-space PD (must match the written reset pose, not nominal home).
+    if not hasattr(env, "_insert_reset_joint_pos"):
+        env._insert_reset_joint_pos = torch.zeros(
+            (env.num_envs, robot.num_joints), device=env.device, dtype=joint_pos.dtype
+        )
+    env._insert_reset_joint_pos[env_ids] = joint_pos.clone()
+
+
 def _store_insert_progress_baselines(
     env: ManagerBasedRLEnv,
     env_ids: torch.Tensor,

@@ -55,6 +55,7 @@ from .mdp_custom import (
     pcb_to_target_error_obs,
     pcb_insertion_orientation_obs,
     reset_robot_joints_to_values,
+    reset_robot_joints_to_values_randomized,
     insert_success,
     insert_success_debug_step,
     insert_pcb_yaw_sin_obs,
@@ -867,6 +868,10 @@ _APPROACH_MID_THICKNESS_MIN_CLOSEDNESS = 0.3
 # Penalize large arm joint drift from home (discourages floor collapse before reach).
 _ARM_HOME_DEVIATION_STD_RAD = 0.40
 _ARM_HOME_JOINT_POS = {k: v for k, v in _ROBOT_HOME_JOINT_POS.items() if k.startswith("joint_")}
+# Approach reset: uniform offsets (rad) around ``_ROBOT_HOME_JOINT_POS`` per arm joint; gripper stays nominal
+# (``hold_gripper_on_reset`` commands open width immediately after).
+_APPROACH_HOME_JOINT_OFFSET_RANGES = {name: (-0.1, 0.1) for name in _ARM_HOME_JOINT_POS}
+_APPROACH_HOME_JOINT_OFFSET_RANGES["left_carriage_joint"] = (0.0, 0.0)
 _APPROACH_JAW_SPAN_SIGMA_M = 0.004
 _APPROACH_OPEN_TOLERANCE_M = 0.003
 _APPROACH_GAP_TOLERANCE_M = 0.005
@@ -1573,14 +1578,13 @@ class ActionsCfgApproach:
         # (2026-07-24 droop fix). All 6 axes are now impedance-controlled; this patches the OSC's
         # per-axis K clamp so pitch stays much softer than the other axes without being fully free.
         motion_stiffness_limits_per_axis=_ARM_TASK_STIFFNESS_LIMITS_PER_AXIS,
-        # Soft joint PD toward the side-base home.  Safe now that the position box rewrites
-        # pose_rel into an absolute-from-reset target (zero action = spring to home, not
-        # "desired = current"); see ``_APPROACH_HOME_JOINT_HOLD_KP`` comment.  Do NOT free any
-        # motion axis to "fix" droop -- an uncontrolled axis has literally zero restoring torque.
-        use_home_joint_posture_hold=True,
-        home_joint_pos=_ROBOT_HOME_JOINT_POS,
-        home_joint_posture_hold_stiffness=_APPROACH_HOME_JOINT_HOLD_KP,
-        home_joint_posture_hold_damping=_APPROACH_HOME_JOINT_HOLD_KD,
+        # Soft joint PD toward the reset joint pose (including domain-rand offsets).  Must NOT use
+        # fixed ``home_joint_pos`` when reset randomizes joints — that fights the OSC EE box
+        # anchored at the randomized FK pose and can destabilize physics (NaN rewards).
+        use_home_joint_posture_hold=False,
+        use_buffer_joint_posture_hold=True,
+        joint_posture_hold_stiffness=_APPROACH_HOME_JOINT_HOLD_KP,
+        joint_posture_hold_damping=_APPROACH_HOME_JOINT_HOLD_KD,
         task_orientation_box_enabled=True,
         orientation_max_dev_rad=_ARM_TASK_ORIENTATION_MAX_DEV_RAD,
         orientation_dev_limits_per_axis=_APPROACH_ORIENTATION_DEV_LIMITS_PER_AXIS,
@@ -2106,7 +2110,7 @@ class RewardsInsertCfg:
 
 @configclass
 class EventCfgApproach:
-    """Phase 1 reset: randomized PCB pose on conveyor, gripper held open, arm at fixed home."""
+    """Phase 1 reset: randomized PCB pose on conveyor, gripper held open, arm near home (+/-0.1 rad/joint)."""
 
     reset_pcb_on_conveyor = EventTermCfg(
         func=reset_pcb_on_guide_rails_randomized,
@@ -2123,11 +2127,12 @@ class EventCfgApproach:
         },
     )
     reset_robot_home = EventTermCfg(
-        func=reset_robot_joints_to_values,
+        func=reset_robot_joints_to_values_randomized,
         mode="reset",
         params={
             "asset_cfg": _ROBOT_ENT,
             "joint_positions": _ROBOT_HOME_JOINT_POS,
+            "joint_offset_ranges": _APPROACH_HOME_JOINT_OFFSET_RANGES,
             "velocity_scale": 0.0,
         },
     )
