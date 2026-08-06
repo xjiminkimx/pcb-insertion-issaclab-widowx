@@ -214,7 +214,10 @@ _ROBOT_HOME_JOINT_POS = {
 _PCB_POS_OFFSET_RANGES = {
     "x": (-0.002, 0.002),
 }
-_PCB_YAW_OFFSET_RANGE = (-0.003, 0.00)
+# World +Z yaw at Approach reset.  Corner flare ≈ (PCB_X/2)·|sin θ| ≈ 0.12·|θ| for small θ;
+# ±0.015 rad (~±0.86°) → ~1.8 mm — inside the env_v7 thinned rail-guide clearance (15→4 mm)
+# when stacked with the ±2 mm X offset.  Was (-0.003, 0.0); keep an eye on rail catches if raised further.
+_PCB_YAW_OFFSET_RANGE = (-0.015, 0.015)
 _GRIPPER_OPEN_WIDTH_M = _APPROACH_OPEN_WIDTH_M
 # Distal offset from ``gripper_left``/``gripper_right`` body origin to contact pad tip (wrist→jaw).
 _GRIPPER_TIP_OFFSET_M = 0.065
@@ -295,7 +298,7 @@ _PCB_TERMINATE_MIN_HEIGHT_ENV = _CONVEYOR_SURFACE_Z - 0.025
 # _MAG_CENTER_X_ENV = 0.277      # magazine bbox centre X (env-local); lane X is _CONVEYOR_CENTER_X_ENV
 # _MAG_CENTER_Y_ENV = 0.350      # magazine geometric centre Y (env-local)
 _MAG_Y_NEAR_FACE_ENV = 0.207   # slot entry plane toward conveyor — leading edge enters here (Sim-measured)
-_MAG_Y_FAR_FACE_ENV = 0.472    # magazine back wall — PCB leading edge seats just before here
+_MAG_Y_FAR_FACE_ENV = 0.482    # magazine back wall — PCB leading edge seats just before here
 
 # Leading-edge targets at far / near magazine faces (lane X, not magazine bbox centre X).
 _HALF_LENGTH_M = PCB_X * 0.5

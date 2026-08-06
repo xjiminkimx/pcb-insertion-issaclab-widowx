@@ -125,6 +125,18 @@ else
   patch_checkpoint_args PLAY_ARGS
 fi
 
+# Isaac Lab play.py only resamples when CLI ``--seed -1``.
+has_seed=false
+for arg in "${PLAY_ARGS[@]}"; do
+  if [[ "${arg}" == "--seed" ]]; then
+    has_seed=true
+    break
+  fi
+done
+if [[ "${has_seed}" == false ]]; then
+  PLAY_ARGS=(--seed -1 "${PLAY_ARGS[@]}")
+fi
+
 echo "[INFO] Checkpoint dir: ${CKPT_DIR}/"
 echo "[INFO] Python:         ${PYTHON}"
 exec "${PYTHON}" "${PLAY_PY}" \

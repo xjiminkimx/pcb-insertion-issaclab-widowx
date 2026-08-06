@@ -78,6 +78,18 @@ else
   PYTHON="python3"
 fi
 
+# Isaac Lab train.py only resamples when CLI ``--seed -1``; agent cfg alone is not enough.
+has_seed=false
+for arg in "${TRAIN_ARGS[@]}"; do
+  if [[ "${arg}" == "--seed" ]]; then
+    has_seed=true
+    break
+  fi
+done
+if [[ "${has_seed}" == false ]]; then
+  TRAIN_ARGS=(--seed -1 "${TRAIN_ARGS[@]}")
+fi
+
 echo "[INFO] Workspace logs: ${WORKSPACE_DIR}/logs/rl_games/widowx_pcb_insert/"
 echo "[INFO] Approach states: ${STATES_PATH}"
 echo "[INFO] Python:         ${PYTHON}"

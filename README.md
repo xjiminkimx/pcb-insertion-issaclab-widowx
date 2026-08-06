@@ -57,6 +57,7 @@ train_approach.sh  ->  collect_approach_states.sh  ->  train_insert.sh
 | `usd_model/usd_robot/wxai/` | WidowX follower USD. |
 | `scripts/train_approach.sh` / `play_approach.sh` | Phase 1 train / play. |
 | `scripts/train_insert.sh` / `play_insert.sh` | Phase 2 train / play. |
+| `scripts/play_chain.sh` / `play_chain.py` | Live Approach→Insert chain play (optional success gates). |
 | `scripts/collect_approach_states.py` / `.sh` | Roll out an Approach checkpoint and store terminal states. |
 | `scripts/diag_side_base_home_pose.py` | FK search / inspection of the reset posture and base placement. |
 | `scripts/diag_ee_box.py` | Instruments the EE translation / rotation boxes; measures droop, wrist pitch, clearance. |
@@ -111,8 +112,8 @@ failing when `exp(log_std)` underflows.
 
 ## Evaluate / play
 
-**Important:** Isaac Lab `play.py` resolves `logs/rl_games/...` relative to **cwd** — run from this
-package root.
+**Important:** Isaac Lab `play.py` and the chain script resolve `logs/rl_games/...` relative to
+**cwd** — run from this package root.
 
 ```bash
 cd /path/to/widowx_pcb
@@ -120,8 +121,59 @@ bash scripts/play_approach.sh --num_envs 1
 bash scripts/play_insert.sh --num_envs 16
 ```
 
-Without `--checkpoint`, play loads the best `nn/<name>.pth`; `--use_last_checkpoint` picks the latest
-epoch file; `--real-time` gives wall-clock playback.
+Without `--checkpoint`, `play_approach` / `play_insert` load the best `nn/<name>.pth`;
+`--use_last_checkpoint` picks the latest epoch file; `--real-time` gives wall-clock playback.
+
+### Live chain play (`play_chain`)
+
+`scripts/play_chain.sh` runs **Approach → Insert in one session** with a live straddle handover
+(no `collect_approach_states` step). On Approach success it freezes that pose into a one-row
+buffer, reconfigures the same SimulationContext to Insert managers, and continues with the Insert
+policy. Closing one gym env and `gym.make`-ing the other in the same Kit process hangs, so the
+script keeps a single env and only swaps MDP managers.
+
+**Example** (GUI + Insert debug prints + half-speed video + looser Approach gates):
+
+```bash
+bash scripts/play_chain.sh --gui --debug \
+  --approach_checkpoint logs/rl_games/widowx_pcb_approach/weight_saved/widowx_pcb_approach.pth \
+  --insert_checkpoint logs/rl_games/widowx_pcb_insert/weight_saved/widowx_pcb_insert_05mm_dent.pth \
+  --video --closedness 0.3 --min_tip_down_deg 14
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--approach_checkpoint` | `weight_saved/` then `nn/` `widowx_pcb_approach.pth` | Approach policy |
+| `--insert_checkpoint` | `weight_saved/` then `nn/` `widowx_pcb_insert.pth` | Insert policy |
+| `--gui` | off (headless) | Show Isaac Sim viewport |
+| `--video` | off | Record full chain as one **0.5×** mp4 (`num_envs=1`, cameras on) |
+| `--video_dir` | `logs/rl_games/widowx_pcb_chain/videos/play` | Output directory for mp4 |
+| `--closedness Q` | training (`0.40`) | Approach success closedness ≥ Q |
+| `--min_tip_down_deg DEG` | training (`17.5`) | Tip-down pitch ≤ −DEG |
+| `--tip_mid Q` | training (`0.60`) | Tip mid-thickness index ≥ Q |
+| `--no_pitch_gate` / `--no_tip_mid_gate` | off | Drop that Approach success conjunct |
+| `--debug` | off | Print Insert leading-edge vs success-box each `--print_every` steps |
+| `--episodes N` | `1` | How many full Approach→Insert chains |
+
+Video notes:
+
+- Playback fps = `1 / (2 · step_dt)` ≈ **62.5** → wall-clock is half of sim time.
+- Camera is the elevated corner view (`eye=(0.87, 0.88, 0.60)`, `lookat=(0.25, 0.35, 0.26)`,
+  `1920×1080`) — diagonal baseplate with robot left / magazine right.
+- Output filename: `chain_ep<N>_<timestamp>_halfspeed.mp4`.
+
+Other useful invocations:
+
+```bash
+# Training success gates, GUI only:
+bash scripts/play_chain.sh --gui
+
+# Headless half-speed recording with defaults:
+bash scripts/play_chain.sh --video --headless
+
+# Drop pitch gate for demos that never quite tip down enough:
+bash scripts/play_chain.sh --gui --no_pitch_gate --debug
+```
 
 ---
 
