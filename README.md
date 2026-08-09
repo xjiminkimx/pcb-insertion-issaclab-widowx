@@ -58,6 +58,7 @@ train_approach.sh  ->  collect_approach_states.sh  ->  train_insert.sh
 | `scripts/train_approach.sh` / `play_approach.sh` | Phase 1 train / play. |
 | `scripts/train_insert.sh` / `play_insert.sh` | Phase 2 train / play. |
 | `scripts/play_chain.sh` / `play_chain.py` | Live Approach→Insert chain play (optional success gates). |
+| `scripts/eval_success.sh` / `eval_success.py` | Success-rate eval for Approach / Insert / Chain. |
 | `scripts/collect_approach_states.py` / `.sh` | Roll out an Approach checkpoint and store terminal states. |
 | `scripts/diag_side_base_home_pose.py` | FK search / inspection of the reset posture and base placement. |
 | `scripts/diag_ee_box.py` | Instruments the EE translation / rotation boxes; measures droop, wrist pitch, clearance. |
@@ -114,6 +115,32 @@ failing when `exp(log_std)` underflows.
 
 **Important:** Isaac Lab `play.py` and the chain script resolve `logs/rl_games/...` relative to
 **cwd** — run from this package root.
+
+### Success-rate evaluation (`eval_success`)
+
+```bash
+cd /path/to/widowx_pcb
+
+# Parallel Approach / Insert (deterministic actions)
+bash scripts/eval_success.sh approach --num_episodes 200 --num_envs 256 --headless
+bash scripts/eval_success.sh insert   --num_episodes 200 --num_envs 256 --headless
+
+# Live Approach→Insert chain (sequential, num_envs=1)
+bash scripts/eval_success.sh chain --num_episodes 50 --headless
+
+# All three, then JSON under logs/rl_games/eval/
+bash scripts/eval_success.sh all --num_episodes 100 --num_envs 256 --headless
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `mode` | required | `approach` / `insert` / `chain` (shell also accepts `all`) |
+| `--num_episodes` | `100` | Completed episodes (or full chains) to score |
+| `--num_envs` | `64` | Parallel envs for approach/insert (`chain` forces 1) |
+| `--checkpoint` | `weight_saved/` then `nn/` | Single-phase checkpoint |
+| `--approach_checkpoint` / `--insert_checkpoint` | same defaults | Chain (or phase) checkpoints |
+| `--out` | `logs/rl_games/eval/<mode>_*.json` | JSON summary path |
+| `--seed` | `-1` | Fresh seed each run (printed for reproducibility) |
 
 ```bash
 cd /path/to/widowx_pcb

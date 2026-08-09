@@ -388,6 +388,8 @@ def _apply_approach_success_overrides(env_cfg: cfg.WidowXPcbApproachEnvCfg) -> d
             "closedness_threshold",
             "tip_mid_thickness_std",
             "tip_mid_thickness_threshold",
+            "jaw_level_std",
+            "jaw_level_threshold",
             "min_tip_down_deg",
         ):
             if k in params:

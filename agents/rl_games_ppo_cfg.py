@@ -7,7 +7,7 @@ _apply_rl_games_logstd_safety_patch()
 WidowXPcbPPOBaseCfg = {
     "params": {
         # -1 → Isaac Lab train/play resample a fresh seed each run (see train.py ``--seed -1``).
-        "seed": -1,
+        "seed": 1,
         
         "algo": {
             "name": "a2c_continuous"
@@ -164,7 +164,7 @@ WidowXPcbInsertPPOCfg = {
             "reward_shaper": {"scale_value": 1.0},
             "use_diagnostics": False,
             "entropy_coef": 1e-2,
-            "max_epochs": 180,
+            "max_epochs": 300,
             "horizon_length": 256,
             "mini_epochs": 8,
             # 0.99 -> 0.995 (2026-08-02).  Control runs at 125 Hz here (step_dt 0.008 s), half the

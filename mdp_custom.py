@@ -5,6 +5,7 @@ Observation helpers, push/insert shaping, regularization, rail reset, and drop d
 Approach and Insert are separate registered envs; each uses its own reward config with no in-episode phase gating.
 """
 from __future__ import annotations
+import math
 import torch
 import numpy as np
 import isaaclab.utils.math as math_utils
@@ -1408,6 +1409,11 @@ def _finger_thickness_offsets(
     return w_left, w_right
 _EE_TRAILING_EDGE_PREV_DIST_L: torch.Tensor | None = None
 _EE_TRAILING_EDGE_PREV_DIST_R: torch.Tensor | None = None
+def time_out_penalty_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """1.0 on the step an episode ends by ``time_out`` (Isaac's ``is_terminated_term`` skips timeouts)."""
+    return env.termination_manager.time_outs.to(dtype=torch.float32)
+
+
 def approach_success_bonus_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -1425,6 +1431,8 @@ def approach_success_bonus_reward(
     tip_mid_thickness_std: float | None = None,
     tip_mid_thickness_threshold: float = 0.5,
     min_tip_down_deg: float | None = None,
+    jaw_level_std: float | None = None,
+    jaw_level_threshold: float = 0.5,
     state_attr: str = "_approach_success_bonus_paid",
 ) -> torch.Tensor:
     """One-shot bonus (1.0) the first time :func:`approach_finger_target_success` is achieved."""
@@ -1454,6 +1462,8 @@ def approach_success_bonus_reward(
         tip_mid_thickness_std=tip_mid_thickness_std,
         tip_mid_thickness_threshold=tip_mid_thickness_threshold,
         min_tip_down_deg=min_tip_down_deg,
+        jaw_level_std=jaw_level_std,
+        jaw_level_threshold=jaw_level_threshold,
     )
     newly = achieved & (~paid)
     paid[:] = paid | achieved
@@ -2175,48 +2185,53 @@ def approach_gripper_debug_curriculum(
                     milestone_out[f"milestone_tier_{i}_hit_frac"] = float(hits[:, i].mean().item())
         _insert_milestone_debug_clear(ids)
 
+    def _f(t: torch.Tensor) -> float:
+        """Finite float for TensorBoard (NaN/Inf → 0; stops x2num spam)."""
+        x = float(torch.nan_to_num(t, nan=0.0, posinf=0.0, neginf=0.0).item())
+        return x if math.isfinite(x) else 0.0
+
     return {
         # Short aliases (README / dashboards) plus explicit *_mean / *_live keys.
-        "closedness": float(closedness_mean.item()),
-        "closedness_tight": float(closedness_tight_mean.item()),
-        "closedness_peak": float(closedness_ep_max.item()),
+        "closedness": _f(closedness_mean),
+        "closedness_tight": _f(closedness_tight_mean),
+        "closedness_peak": _f(closedness_ep_max),
         # Proximity σ — same as ``finger_proximity`` reward (rises during approach).
-        "closedness_mean": float(closedness_mean.item()),
-        "closedness_live": float(closedness_live.item()),
-        "closedness_ep_max": float(closedness_ep_max.item()),
+        "closedness_mean": _f(closedness_mean),
+        "closedness_live": _f(closedness_live),
+        "closedness_ep_max": _f(closedness_ep_max),
         # Tight success σ (20 mm) — stricter placement at ±20 mm width targets.
-        "closedness_tight_mean": float(closedness_tight_mean.item()),
-        "closedness_tight_live": float(closedness_tight_live.item()),
-        "dist_l_mm_mean": float(dist_l_mm_mean.item()),
-        "dist_r_mm_mean": float(dist_r_mm_mean.item()),
-        "dist_l_mm_live": float(dist_l_mm_live.item()),
-        "dist_r_mm_live": float(dist_r_mm_live.item()),
-        "success_frac": float(success_frac.item()),
-        "straddle_achieved_frac": float(straddle_achieved_frac.item()),
-        "gap_left_m_mean": float(gap_left_mean.item()),
-        "gap_right_m_mean": float(gap_right_mean.item()),
-        "gap_left_m_live": float(gap_left_live.item()),
-        "gap_right_m_live": float(gap_right_live.item()),
-        "push_progress_mean": float(push_progress_mean.item()),
-        "push_progress_live": float(push_progress_live.item()),
-        "push_gate_open_frac": float(push_gate_open_frac.item()),
-        "push_gate_open_live": float(push_gate_open_live.item()),
-        "lead_y_env_mean": float(lead_y_mean.item()),
-        "lead_y_env_live": float(lead_y_live.item()),
-        "lead_vy_mean": float(lead_vy_mean.item()),
-        "lead_vy_live": float(lead_vy_live.item()),
-        "between_fingers_q_mean": float(between_q_mean.item()),
-        "between_fingers_q_live": float(between_q_live.item()),
+        "closedness_tight_mean": _f(closedness_tight_mean),
+        "closedness_tight_live": _f(closedness_tight_live),
+        "dist_l_mm_mean": _f(dist_l_mm_mean),
+        "dist_r_mm_mean": _f(dist_r_mm_mean),
+        "dist_l_mm_live": _f(dist_l_mm_live),
+        "dist_r_mm_live": _f(dist_r_mm_live),
+        "success_frac": _f(success_frac),
+        "straddle_achieved_frac": _f(straddle_achieved_frac),
+        "gap_left_m_mean": _f(gap_left_mean),
+        "gap_right_m_mean": _f(gap_right_mean),
+        "gap_left_m_live": _f(gap_left_live),
+        "gap_right_m_live": _f(gap_right_live),
+        "push_progress_mean": _f(push_progress_mean),
+        "push_progress_live": _f(push_progress_live),
+        "push_gate_open_frac": _f(push_gate_open_frac),
+        "push_gate_open_live": _f(push_gate_open_live),
+        "lead_y_env_mean": _f(lead_y_mean),
+        "lead_y_env_live": _f(lead_y_live),
+        "lead_vy_mean": _f(lead_vy_mean),
+        "lead_vy_live": _f(lead_vy_live),
+        "between_fingers_q_mean": _f(between_q_mean),
+        "between_fingers_q_live": _f(between_q_live),
         # Signed wrist->pad-tip pitch in degrees (negative = tip-down).  Use these, NOT the
         # ``Episode_Reward/wrist_pitch_deg_debug`` term (weight 1e-10 zeroes it out in TB).
-        "pitch_deg_mean": float(pitch_deg_mean.item()),
-        "pitch_deg_live": float(pitch_deg_live.item()),
-        "pitch_deg_ep_min": float(pitch_deg_ep_min.item()),
-        "vic_stiffness_mean": float(vic_stiffness_mean.item()),
-        "vic_stiffness_live": float(vic_stiffness_live.item()),
-        "vic_damping_mean": float(vic_damping_mean.item()),
-        "vic_damping_live": float(vic_damping_live.item()),
-        **milestone_out,
+        "pitch_deg_mean": _f(pitch_deg_mean),
+        "pitch_deg_live": _f(pitch_deg_live),
+        "pitch_deg_ep_min": _f(pitch_deg_ep_min),
+        "vic_stiffness_mean": _f(vic_stiffness_mean),
+        "vic_stiffness_live": _f(vic_stiffness_live),
+        "vic_damping_mean": _f(vic_damping_mean),
+        "vic_damping_live": _f(vic_damping_live),
+        **{k: (0.0 if not math.isfinite(float(v)) else float(v)) for k, v in milestone_out.items()},
     }
 def _trailing_edge_finger_pcb_width_gaps(
     env: ManagerBasedRLEnv,
@@ -2512,6 +2527,9 @@ def straddle_tip_mid_thickness_shaping(
     ``thickness_target_offset_m`` shifts the attractor along the board's thickness axis (PCB body
     +Z; world +Z when the board is flat).  Positive = above the mid-plane.  Insert uses a small
     positive offset so the pads ride slightly above the 1 mm edge rather than straddling its centre.
+
+    Returns ``min(q_left, q_right)`` so one tip on-plane and one hooked under/over cannot farm the
+    index (mean aggregation previously allowed that one-sided seating / roll-collapse mode).
     """
     _, _, _, _, thick_l, thick_r = _straddle_width_target_tip_dists(
         env,
@@ -2530,7 +2548,43 @@ def straddle_tip_mid_thickness_shaping(
     sig = float(std) + 1e-9
     left_q = 1.0 - torch.tanh(torch.abs(thick_l - tgt) / sig)
     right_q = 1.0 - torch.tanh(torch.abs(thick_r - tgt) / sig)
-    return 0.5 * (left_q + right_q)
+    return torch.minimum(left_q, right_q)
+
+
+def straddle_jaw_level_shaping(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+) -> torch.Tensor:
+    """Anti-roll index in ``[0, 1]``: pads level along PCB thickness (``1 - tanh(|t_l - t_r|/σ)``).
+
+    Pitch tips both pads the same way; roll splits them across the board faces.  This term pays for
+    matching left/right thickness coordinates so a single-tip catch cannot walk ``ry``.
+    """
+    _, _, _, _, thick_l, thick_r = _straddle_width_target_tip_dists(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    sig = float(std) + 1e-9
+    return 1.0 - torch.tanh(torch.abs(thick_l - thick_r) / sig)
 def straddle_tip_mid_thickness_shaping_gated(
     env: ManagerBasedRLEnv,
     std: float,
@@ -2639,22 +2693,21 @@ def approach_finger_target_success(
     tip_mid_thickness_std: float | None = None,
     tip_mid_thickness_threshold: float = 0.5,
     min_tip_down_deg: float | None = None,
+    jaw_level_std: float | None = None,
+    jaw_level_threshold: float = 0.5,
 ) -> torch.Tensor:
-    """Episode success when finger-target closedness AND tip mid-thickness index both clear their thresholds.
+    """Episode success when closedness, tip mid-thickness, pitch, and (optional) jaw-level clear.
 
     ``closedness`` (:func:`straddle_finger_target_closedness`) must be ``>= closedness_threshold``.
     If ``tip_mid_thickness_std`` is given, the tip mid-thickness index
-    (:func:`straddle_tip_mid_thickness_shaping`, also in ``[0, 1]``) must additionally be
-    ``>= tip_mid_thickness_threshold``.  Leaving ``tip_mid_thickness_std=None`` reproduces the old
-    closedness-only behaviour.
+    (:func:`straddle_tip_mid_thickness_shaping` = ``min`` of per-jaw scores, also in ``[0, 1]``)
+    must additionally be ``>= tip_mid_thickness_threshold``.
 
-    ``min_tip_down_deg`` additionally requires the wrist->pad-tip line to be pitched at least that
-    far below horizontal.  This is a Insert feasibility gate, not an Approach objective: this
-    termination is what ``scripts/collect_approach_states.py`` filters on, so whatever posture is
-    admitted here becomes the entire starting distribution of the Insert phase.  With the pad tips
-    pinned to the trailing edge, the finger bodies clear the board-support rails by roughly
-    ``tip_offset_m * sin(pitch)``, so a shallow terminal pose leaves the lower finger inside the rail
-    and the slide jams a few centimetres in no matter what the Insert policy does.
+    ``min_tip_down_deg`` requires the wrist->pad-tip line tipped at least that far below horizontal
+    (Insert feasibility / rail clearance).
+
+    ``jaw_level_std`` / ``jaw_level_threshold`` reject one-tip-on-top / rolled straddles where the
+    two pads sit on opposite faces of the board (:func:`straddle_jaw_level_shaping`).
     """
     closedness = straddle_finger_target_closedness(
         env,
@@ -2690,6 +2743,22 @@ def approach_finger_target_success(
     if min_tip_down_deg is not None:
         pitch_deg = gripper_wrist_pitch_deg_signed_obs(env, left_finger_cfg, right_finger_cfg, wrist_body_cfg)
         achieved = achieved & (pitch_deg <= -float(min_tip_down_deg))
+    if jaw_level_std is not None:
+        jaw_level = straddle_jaw_level_shaping(
+            env,
+            float(jaw_level_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+        )
+        achieved = achieved & (jaw_level >= float(jaw_level_threshold))
     return achieved
 def straddle_finger_trailing_width_proximity(
     env: ManagerBasedRLEnv,
@@ -2739,6 +2808,8 @@ def approach_near_success_shaping_scale(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
 ) -> torch.Tensor:
     """Scale in ``[min_scale, 1]`` that fades dense shaping as tight closedness nears success.
 
@@ -2747,17 +2818,8 @@ def approach_near_success_shaping_scale(
     linearly falls to ``min_scale``, so lingering near-success no longer farms more return than
     terminating with the success bonus (the collapse mode seen around epoch 10 → 100).
 
-    ``min_tip_down_deg`` must mirror the success termination's pitch gate whenever that gate is in
-    use.  The fade only makes sense once staying put is genuinely worse than terminating, and that
-    is false while the pose is still pitch-ineligible: closedness alone can sit past ``fade_end``
-    with the wrist too flat to ever trigger success, which would strand the policy holding position
-    on 5% shaping with no way to bank the bonus.  Envs that fail the pitch gate keep full shaping.
-
-    ``fade_min_tip_mid``/``fade_tip_mid_std`` apply the identical exemption to the success
-    termination's mid-thickness gate.  Every conjunct of the success condition needs its own
-    exemption here, otherwise the fade punishes closedness progress that cannot yet be cashed in:
-    the policy's best response is to park closedness just under ``fade_start`` and trade the
-    remaining error between axes, which keeps closedness flat forever.
+    ``min_tip_down_deg`` / ``fade_min_tip_mid`` / ``fade_min_jaw_level`` exempt the fade until every
+    success conjunct is reachable, otherwise the policy parks under ``fade_start`` forever.
     """
     closedness_tight = straddle_finger_target_closedness(
         env,
@@ -2798,7 +2860,25 @@ def approach_near_success_shaping_scale(
             width_gap_target_right_m=width_gap_target_right_m,
         )
         t = torch.where(tip_mid >= float(fade_min_tip_mid), t, torch.zeros_like(t))
+    if fade_min_jaw_level is not None and fade_jaw_level_std is not None:
+        jaw_level = straddle_jaw_level_shaping(
+            env,
+            float(fade_jaw_level_std),
+            pcb_cfg,
+            left_finger_cfg,
+            right_finger_cfg,
+            gripper_joint_cfg,
+            half_length_m,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+        )
+        t = torch.where(jaw_level >= float(fade_min_jaw_level), t, torch.zeros_like(t))
     return 1.0 - t * (1.0 - lo)
+
+
 def _apply_near_success_fade(
     env: ManagerBasedRLEnv,
     reward: torch.Tensor,
@@ -2820,6 +2900,8 @@ def _apply_near_success_fade(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
 ) -> torch.Tensor:
     scale = approach_near_success_shaping_scale(
         env,
@@ -2840,6 +2922,8 @@ def _apply_near_success_fade(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
     return reward * scale
 def straddle_finger_trailing_width_proximity_fade_near_success(
@@ -2862,6 +2946,8 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_finger_trailing_width_proximity` with near-success shaping fade."""
     reward = straddle_finger_trailing_width_proximity(
@@ -2898,6 +2984,8 @@ def straddle_finger_trailing_width_proximity_fade_near_success(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
 def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
     env: ManagerBasedRLEnv,
@@ -2921,6 +3009,8 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_tip_mid_thickness_shaping_gated` with near-success shaping fade."""
     reward = straddle_tip_mid_thickness_shaping_gated(
@@ -2959,7 +3049,140 @@ def straddle_tip_mid_thickness_shaping_gated_fade_near_success(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
+
+
+def _scale_reward_by_closedness_progress(
+    env: ManagerBasedRLEnv,
+    reward: torch.Tensor,
+    *,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    closedness_std: float,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    gate_start: float = 0.10,
+    gate_full: float = 0.35,
+) -> torch.Tensor:
+    """Soft-gate secondary shaping on tight closedness so it cannot pay while tips sit several cm out.
+
+    0 below ``gate_start``, linear to 1 at ``gate_full``.  Used for lateral / jaw / between terms that
+    previously farmed high scores with correct along-Y but large width-gap error.
+    """
+    closedness = straddle_finger_target_closedness(
+        env,
+        float(closedness_std),
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    start = float(gate_start)
+    full = float(gate_full)
+    if full <= start:
+        gate = (closedness >= start).to(dtype=reward.dtype)
+    else:
+        gate = ((closedness - start) / (full - start)).clamp(0.0, 1.0)
+    return reward * gate
+
+
+def straddle_jaw_level_shaping_fade_near_success(
+    env: ManagerBasedRLEnv,
+    std: float,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    success_std: float,
+    fade_start: float = 0.40,
+    fade_end: float = 0.50,
+    min_scale: float = 0.05,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    min_tip_down_deg: float | None = None,
+    fade_tip_mid_std: float | None = None,
+    fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
+    progress_gate_start: float | None = 0.10,
+    progress_gate_full: float | None = 0.35,
+) -> torch.Tensor:
+    """:func:`straddle_jaw_level_shaping` with closedness progress gate + near-success fade."""
+    reward = straddle_jaw_level_shaping(
+        env,
+        std,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    if progress_gate_start is not None and progress_gate_full is not None:
+        reward = _scale_reward_by_closedness_progress(
+            env,
+            reward,
+            pcb_cfg=pcb_cfg,
+            left_finger_cfg=left_finger_cfg,
+            right_finger_cfg=right_finger_cfg,
+            gripper_joint_cfg=gripper_joint_cfg,
+            half_length_m=half_length_m,
+            closedness_std=success_std,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+            gate_start=float(progress_gate_start),
+            gate_full=float(progress_gate_full),
+        )
+    return _apply_near_success_fade(
+        env,
+        reward,
+        pcb_cfg=pcb_cfg,
+        left_finger_cfg=left_finger_cfg,
+        right_finger_cfg=right_finger_cfg,
+        gripper_joint_cfg=gripper_joint_cfg,
+        half_length_m=half_length_m,
+        success_std=success_std,
+        fade_start=fade_start,
+        fade_end=fade_end,
+        min_scale=min_scale,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        min_tip_down_deg=min_tip_down_deg,
+        fade_tip_mid_std=fade_tip_mid_std,
+        fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
+    )
+
+
 def straddle_trailing_face_bounded_approach_reward_fade_near_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -2983,6 +3206,8 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
 ) -> torch.Tensor:
     """:func:`straddle_trailing_face_bounded_approach_reward` with near-success shaping fade."""
     reward = straddle_trailing_face_bounded_approach_reward(
@@ -3019,6 +3244,8 @@ def straddle_trailing_face_bounded_approach_reward_fade_near_success(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
 def pcb_between_gripper_fingers_fade_near_success(
     env: ManagerBasedRLEnv,
@@ -3044,8 +3271,12 @@ def pcb_between_gripper_fingers_fade_near_success(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
+    progress_gate_start: float | None = 0.10,
+    progress_gate_full: float | None = 0.35,
 ) -> torch.Tensor:
-    """:func:`pcb_between_gripper_fingers` with near-success shaping fade."""
+    """:func:`pcb_between_gripper_fingers` with closedness progress gate + near-success fade."""
     if gripper_joint_cfg is None:
         raise ValueError("gripper_joint_cfg is required for near-success fade (tight closedness).")
     reward = pcb_between_gripper_fingers(
@@ -3065,6 +3296,24 @@ def pcb_between_gripper_fingers_fade_near_success(
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
+    if progress_gate_start is not None and progress_gate_full is not None:
+        reward = _scale_reward_by_closedness_progress(
+            env,
+            reward,
+            pcb_cfg=pcb_cfg,
+            left_finger_cfg=left_finger_cfg,
+            right_finger_cfg=right_finger_cfg,
+            gripper_joint_cfg=gripper_joint_cfg,
+            half_length_m=half_length_m,
+            closedness_std=success_std,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+            gate_start=float(progress_gate_start),
+            gate_full=float(progress_gate_full),
+        )
     return _apply_near_success_fade(
         env,
         reward,
@@ -3085,7 +3334,11 @@ def pcb_between_gripper_fingers_fade_near_success(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
+
+
 def straddle_lateral_gap_shaping_fade_near_success(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -3106,8 +3359,12 @@ def straddle_lateral_gap_shaping_fade_near_success(
     min_tip_down_deg: float | None = None,
     fade_tip_mid_std: float | None = None,
     fade_min_tip_mid: float | None = None,
+    fade_jaw_level_std: float | None = None,
+    fade_min_jaw_level: float | None = None,
+    progress_gate_start: float | None = 0.10,
+    progress_gate_full: float | None = 0.35,
 ) -> torch.Tensor:
-    """:func:`straddle_lateral_gap_shaping` with near-success shaping fade."""
+    """:func:`straddle_lateral_gap_shaping` with closedness progress gate + near-success fade."""
     reward = straddle_lateral_gap_shaping(
         env,
         pcb_cfg,
@@ -3121,6 +3378,24 @@ def straddle_lateral_gap_shaping_fade_near_success(
         tip_offset_m=tip_offset_m,
         wrist_body_cfg=wrist_body_cfg,
     )
+    if progress_gate_start is not None and progress_gate_full is not None:
+        reward = _scale_reward_by_closedness_progress(
+            env,
+            reward,
+            pcb_cfg=pcb_cfg,
+            left_finger_cfg=left_finger_cfg,
+            right_finger_cfg=right_finger_cfg,
+            gripper_joint_cfg=gripper_joint_cfg,
+            half_length_m=half_length_m,
+            closedness_std=success_std,
+            finger_offset_m=finger_offset_m,
+            tip_offset_m=tip_offset_m,
+            wrist_body_cfg=wrist_body_cfg,
+            width_gap_target_left_m=width_gap_target_left_m,
+            width_gap_target_right_m=width_gap_target_right_m,
+            gate_start=float(progress_gate_start),
+            gate_full=float(progress_gate_full),
+        )
     return _apply_near_success_fade(
         env,
         reward,
@@ -3141,6 +3416,8 @@ def straddle_lateral_gap_shaping_fade_near_success(
         min_tip_down_deg=min_tip_down_deg,
         fade_tip_mid_std=fade_tip_mid_std,
         fade_min_tip_mid=fade_min_tip_mid,
+        fade_jaw_level_std=fade_jaw_level_std,
+        fade_min_jaw_level=fade_min_jaw_level,
     )
 def gripper_midpoint_pcb_center_height(
     env: ManagerBasedRLEnv,
@@ -3749,6 +4026,28 @@ def pcb_root_height_below_env_minimum(
     pcb = env.scene[pcb_cfg.name]
     h = pcb.data.root_pos_w[:, 2] - env.scene.env_origins[:, 2]
     return h < min_height_env
+
+
+def scene_state_nonfinite(
+    env: ManagerBasedRLEnv,
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    pcb_cfg: SceneEntityCfg = SceneEntityCfg("pcb"),
+) -> torch.Tensor:
+    """Terminate envs whose robot/PCB state has NaN/Inf (PhysX contact blow-up).
+
+    Without this, non-finite joint/root state keeps producing NaN rewards/obs that can poison
+    rl_games ``RunningMeanStd`` and mean episode scores (``rew_nan.pth``).
+    """
+    robot = env.scene[robot_cfg.name]
+    pcb = env.scene[pcb_cfg.name]
+    bad = ~torch.isfinite(robot.data.joint_pos).all(dim=-1)
+    bad |= ~torch.isfinite(robot.data.joint_vel).all(dim=-1)
+    bad |= ~torch.isfinite(pcb.data.root_pos_w).all(dim=-1)
+    bad |= ~torch.isfinite(pcb.data.root_quat_w).all(dim=-1)
+    bad |= ~torch.isfinite(pcb.data.root_lin_vel_w).all(dim=-1)
+    return bad
+
+
 def pcb_thickness_axis_tilt_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -4946,6 +5245,63 @@ def insert_leading_edge_lane_drift_mm_obs(
     if hasattr(env, "_insert_start_lead_env"):
         return (lead_env[:, 0] - env._insert_start_lead_env[:, 0]) * 1000.0
     return torch.zeros_like(lead_env[:, 0])
+def gripper_tip_band_penalty_gated(
+    env: ManagerBasedRLEnv,
+    pcb_cfg: SceneEntityCfg,
+    left_finger_cfg: SceneEntityCfg,
+    right_finger_cfg: SceneEntityCfg,
+    gripper_joint_cfg: SceneEntityCfg,
+    half_length_m: float,
+    closedness_std: float,
+    min_closedness: float = 0.25,
+    pcb_half_thickness_m: float = 0.0002,
+    finger_offset_m: float = 0.020,
+    tip_offset_m: float = 0.0,
+    wrist_body_cfg: SceneEntityCfg | None = None,
+    width_gap_target_left_m: float | None = None,
+    width_gap_target_right_m: float | None = None,
+    max_penalty_excess_m: float = 0.008,
+    thickness_target_offset_m: float = 0.0,
+) -> torch.Tensor:
+    """``gripper_tip_under_pcb_penalty`` zeroed until tight closedness clears ``min_closedness``.
+
+    Far from the edge the thickness coordinate is noisy; gating avoids farming/avoiding a phantom
+    band.  Near contact it punishes tips riding the PCB top face or hooked under it.
+    """
+    penalty = gripper_tip_under_pcb_penalty(
+        env,
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        pcb_half_thickness_m=pcb_half_thickness_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+        max_penalty_excess_m=max_penalty_excess_m,
+        thickness_target_offset_m=thickness_target_offset_m,
+    )
+    closedness = straddle_finger_target_closedness(
+        env,
+        float(closedness_std),
+        pcb_cfg,
+        left_finger_cfg,
+        right_finger_cfg,
+        gripper_joint_cfg,
+        half_length_m,
+        finger_offset_m=finger_offset_m,
+        tip_offset_m=tip_offset_m,
+        wrist_body_cfg=wrist_body_cfg,
+        width_gap_target_left_m=width_gap_target_left_m,
+        width_gap_target_right_m=width_gap_target_right_m,
+    )
+    gate = (closedness >= float(min_closedness)).to(dtype=penalty.dtype)
+    return penalty * gate
+
+
 def gripper_tip_under_pcb_penalty(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,
@@ -4998,6 +5354,8 @@ def gripper_tip_under_pcb_penalty(
     cap = max(float(max_penalty_excess_m), 1e-9)
     excess = torch.clamp(excess, min=0.0, max=cap)
     return torch.square(excess / cap)
+
+
 def pcb_push_axis_velocity_reward(
     env: ManagerBasedRLEnv,
     pcb_cfg: SceneEntityCfg,

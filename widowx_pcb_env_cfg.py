@@ -36,16 +36,19 @@ from .mdp_custom import (
     pcb_leading_edge_push_axis_approach_progress_seated,
     pcb_push_axis_velocity_reward_seated,
     action_rate_l2,
+    straddle_lateral_gap_shaping,
     straddle_lateral_gap_shaping_fade_near_success,
     insert_success_bonus_reward,
     insert_leading_edge_travel_milestone_bonus,
     straddle_tip_mid_thickness_shaping_gated_fade_near_success,
+    straddle_jaw_level_shaping_fade_near_success,
     gripper_wrist_carriage_tip_down_pitch_shaping_gated,
     gripper_wrist_pitch_deg_signed_obs,
     straddle_trailing_face_bounded_approach_reward_fade_near_success,
     straddle_finger_trailing_width_proximity_fade_near_success,
     approach_finger_target_success,
     approach_success_bonus_reward,
+    time_out_penalty_reward,
     pcb_forward_push_displacement_indicator,
     pcb_between_gripper_fingers_fade_near_success,
     reset_pcb_on_guide_rails_randomized,
@@ -65,11 +68,13 @@ from .mdp_custom import (
     insert_leading_edge_travel_mm_obs,
     insert_leading_edge_lane_drift_mm_obs,
     gripper_tip_under_pcb_penalty,
+    gripper_tip_band_penalty_gated,
     straddle_tip_mid_thickness_shaping,
     insert_finger_push_axis_delta_obs,
     store_insert_reset_ee_pose_w,
     WidowXTaskSpaceImpedanceActionCfg,
     pcb_root_height_below_env_minimum,
+    scene_state_nonfinite,
     pcb_tilt_beyond_limit,
     pcb_long_axis_vertical_component_exceeds,
     gripper_mid_thickness_offset_obs,
@@ -157,7 +162,7 @@ PUSH_AXIS_WORLD = (0.0, 1.0, 0.0)
 # NOTE: verify in Sim that this placement doesn't clip the conveyor/magazine housing meshes; the
 # standoff (0.256 m from lane X) sits between the old side placement's 0.226 m and the 0.32 m that
 # was sketched here before, so clipping is not expected -- nudge X if it does.
-_ROBOT_BASE_POS = (-0.25, -0.25, 0.0025)
+_ROBOT_BASE_POS = (-0.23, -0.25, 0.0025)
 # Identity (no yaw): arm faces world +X, i.e. across the belt whose travel/push axis is world +Y,
 # so the arm approaches the PCB from the SIDE at 90 deg to the belt.  Keeping this identity is what
 # makes base-local task axes equal world axes (tx = lateral +X, ty = push +Y, tz = vertical +Z).
@@ -279,7 +284,7 @@ _PCB_FRONT_EDGE_GAP_M = 0.030      # front edge (toward +Y) this far before slot
 # body +X (long) || world +Y; centre on conveyor, bottom on belt top
 _PCB_INIT_POS = (
     _CONVEYOR_CENTER_X_ENV,
-    0.06 - _PCB_FRONT_EDGE_GAP_M,
+    0.07 - _PCB_FRONT_EDGE_GAP_M,
     _PCB_CENTER_Z_ENV,
 )
 
@@ -416,7 +421,7 @@ _ARM_TASK_STIFFNESS_LIMITS_PER_AXIS = (
     (200.0, 800.0),   # ty — approach / push toward trailing edge (was 300-1500)
     (600.0, 1600.0),  # tz — vertical; still firm vs gravity, but ceiling cut 2000->1600
     (400.0, 1200.0),  # rx — pitch hold (was 500-1500)
-    (200.0, 800.0),   # ry — roll about push axis (was 300-1500)
+    (400.0, 1200.0),   # ry — roll about push axis (was 300-1500)
     (100.0, 800.0),   # rz — yaw align (was 100-1500)
 )
 # Shared OSC ``motion_stiffness_limits_task`` envelope (must span BOTH Approach and Insert per-axis
@@ -467,7 +472,9 @@ _ARM_TASK_ORIENTATION_MAX_DEV_RAD = 0.15  # 0.15 rad = 8.6 deg (NOT 15 deg -- ol
 # room to reach the 25 deg shaping target with margin.  The tip-UP side stays at 0.15.
 _APPROACH_ORIENTATION_DEV_LIMITS_PER_AXIS = (
     (-0.50, 0.15),  # rx — pitch, tip-down is negative
-    (-0.15, 0.15),  # ry — roll about the push axis
+    # ry: ±0.15 → catch/roll collapse; ±0.06 blocked leveling; ±0.12 still let roll grow after
+    # one-tip contact.  ±0.08 (~±4.6°) caps runaway roll while leaving a little undo room.
+    (-0.08, 0.08),  # ry — roll about the push axis
     (-0.15, 0.15),  # rz — yaw about vertical
 )
 # TRANSLATION "쳐짐" (arm sinking): with ``pose_rel`` the OSC target is ``current + delta`` every
@@ -850,9 +857,12 @@ _ALONG_HEIGHT_GATE_STD_M = 0.06
 _APPROACH_GAP_LEFT_M = 0.015
 _APPROACH_GAP_RIGHT_M = 0.015
 _APPROACH_FINGER_OFFSET_M = 0.015
-# Approach shaping (finger_proximity): wide σ so gradient is active from ~10–15 cm behind edge.
+# Far-field along / debug monitors only.  Dense ``finger_proximity`` + tip_mid gates use
+# ``_APPROACH_SUCCESS_STD_M`` so shaping cannot saturate while success closedness stays low
+# (2026-08-06: reward↑ / success↓ was driven by σ=0.10 proximity farming).
 _APPROACH_PROXIMITY_STD_M = 0.10
 # Success / termination closedness σ at the trailing-edge ±width targets.
+# Also used by Approach dense ``finger_proximity`` and tip_mid closedness gates.
 _APPROACH_SUCCESS_STD_M = 0.035
 _APPROACH_WIDTH_GAP_SIGMA_M = _APPROACH_SUCCESS_STD_M
 # Far-field along (+Y) approach to trailing face (per-jaw, one-sided).
@@ -866,8 +876,23 @@ _APPROACH_MID_THICKNESS_STD_M = 0.012
 # both tips together, roll splits them across the top/bottom faces).  ~4 mm sigma so a ~1 mm
 # mismatch still pays well but a full roll (tips straddling the whole thickness) collapses to ~0.
 _APPROACH_JAW_LEVEL_STD_M = 0.004
-# Z-only mid-thickness shaping is gated until coarse trailing-edge proximity is achieved.
-_APPROACH_MID_THICKNESS_MIN_CLOSEDNESS = 0.3
+# Success / fade conjunct: both pads must share thickness height (anti one-tip-on-top roll).
+# σ=4 mm → 0.50 admits |Δthick| ≲ 2.2 mm; rolled straddles collapse below this.
+_APPROACH_SUCCESS_JAW_LEVEL_THRESHOLD = 0.50
+# Tip thickness band for Approach (half-width around mid-plane).  PCB half-thickness is 0.5 mm;
+# using 0.2 mm means tips riding the top face (~+0.5 mm) always pay excess.  Gated so far-field
+# thickness noise does not dominate before tips are near the edge.
+_APPROACH_TIP_BAND_HALF_M = 0.0002
+_APPROACH_TIP_BAND_MAX_EXCESS_M = 0.002
+# Only near contact — far-field thickness error must not overwhelm approach shaping.
+_APPROACH_TIP_BAND_MIN_CLOSEDNESS = 0.35
+# Z-only mid-thickness shaping unlocks once tight-σ closedness clears this bar (same σ as success).
+# Raised 0.25 → 0.32 (2026-08-07): tips were parking several cm out while tip_mid still paid.
+_APPROACH_MID_THICKNESS_MIN_CLOSEDNESS = 0.32
+# Secondary shaping (lateral / jaw / between) soft-gate on the same tight closedness.  Below
+# ``_APPROACH_SECONDARY_GATE_START`` they pay nothing; full credit only after tips have closed in.
+_APPROACH_SECONDARY_GATE_START = 0.12
+_APPROACH_SECONDARY_GATE_FULL = 0.35
 # Penalize large arm joint drift from home (discourages floor collapse before reach).
 _ARM_HOME_DEVIATION_STD_RAD = 0.40
 _ARM_HOME_JOINT_POS = {k: v for k, v in _ROBOT_HOME_JOINT_POS.items() if k.startswith("joint_")}
@@ -875,6 +900,9 @@ _ARM_HOME_JOINT_POS = {k: v for k, v in _ROBOT_HOME_JOINT_POS.items() if k.start
 # (``hold_gripper_on_reset`` commands open width immediately after).
 _APPROACH_HOME_JOINT_OFFSET_RANGES = {name: (-0.1, 0.1) for name in _ARM_HOME_JOINT_POS}
 _APPROACH_HOME_JOINT_OFFSET_RANGES["left_carriage_joint"] = (0.0, 0.0)
+# Wrist roll: ±0.1 rad (~±5.7°) injected severe EE roll at reset that the orientation box
+# cannot undo (it anchors to reset). Keep light domain randomization only.
+_APPROACH_HOME_JOINT_OFFSET_RANGES["joint_4"] = (-0.08, 0.08)
 _APPROACH_JAW_SPAN_SIGMA_M = 0.004
 _APPROACH_OPEN_TOLERANCE_M = 0.003
 _APPROACH_GAP_TOLERANCE_M = 0.005
@@ -883,10 +911,10 @@ _APPROACH_PREDEEP_ALONG_GATE_M = 0.0
 # Symmetric approach — midpoint stays on trailing-edge centreline.
 _APPROACH_MIDPOINT_JAW_OFFSET_M = 0.0
 # Success: mean per-jaw ``1 - tanh(dist/std)`` must reach this closedness (in [0, 1]).
-_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.40
-# Success ALSO requires the tip mid-thickness index (straddle_tip_mid_thickness_shaping, in
-# [0, 1]) to reach this value — pads must sit near the PCB mid-thickness plane, not just be
-# laterally closed around the trailing edge.
+_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.45
+# Success ALSO requires the tip mid-thickness index (straddle_tip_mid_thickness_shaping =
+# min of per-jaw scores, in [0, 1]) to reach this value — BOTH pads must sit near the PCB
+# mid-thickness plane, not just be laterally closed around the trailing edge.
 #
 # 0.3 -> 0.75 (2026-07-29).  This was THE handoff bug, and it silently invalidated the whole
 # ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` argument below.  The index is ``1 - tanh(|d|/σ)`` averaged
@@ -898,9 +926,9 @@ _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD = 0.40
 # finger bodies only 10.0 / 8.6 mm over the board, where the required height is 60·sin(21°) = 22 mm.
 # Insert then inherits a pose whose pads are hooked under the board (lifting the EE carries the board
 # up with it) and whose carriage jams on the rails after ~25 mm of travel.
-# 0.75 gives σ·atanh(0.25) = 3.1 mm, a real edge straddle, and leaves σ alone so the dense shaping
-# keeps its far-field gradient (see ``_APPROACH_MID_THICKNESS_STD_M``).
-_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.60
+# Dense tip_mid shaping keeps σ=12 mm for far-field gradient.  Success bar 0.75 ⇒ |d| ≲ 3.1 mm
+# (σ·atanh(0.25)); top-face riding (~0.5 mm) still passes tip_mid — jaw_level + tip_band cover that.
+_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD = 0.75
 # Success ALSO requires the wrist->pad-tip line to be tipped at least this far below horizontal.
 #
 # This is the Insert phase's feasibility gate, imposed here because `collect_approach_states.py`
@@ -931,41 +959,20 @@ _APPROACH_SUCCESS_MIN_TIP_DOWN_DEG = 17.5
 # margin: 25 deg puts the mean finger body 25 mm over the rails, low finger ~16 mm.
 _APPROACH_WRIST_TARGET_PITCH_DOWN_DEG = 25.0
 _APPROACH_WRIST_MAX_PITCH_DOWN_DEG = 35.0
-# Tip-down reward only unlocks after tight closedness has started climbing.  Without this gate the
-# policy farmed a deep wrist pitch (``wrist_tip_down`` ~full credit) while ``closedness_tight``
-# plateaued at ~0.10-0.15 and success stayed ~0 for 260 epochs. Soft ramp: 0 at gate_start, 1 at
-# gate_full, using the same σ as the success termination.
-_APPROACH_TIP_DOWN_GATE_START = 0.30
-_APPROACH_TIP_DOWN_GATE_FULL = 0.45
+# Tip-down unlocks only after tips have started closing (same σ as success).  Raised with the
+# secondary-gate pass so pitch cannot pay while tips still sit several cm out.
+_APPROACH_TIP_DOWN_GATE_START = 0.25
+_APPROACH_TIP_DOWN_GATE_FULL = 0.40
 # Start of the second (mid-thickness) ramp on the same tip-down reward.  Below this the pads are far
 # enough off the board's thickness plane that pitch buys no rail clearance, so it pays nothing; full
 # credit arrives at ``_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD``.
-#
-# This MUST sit below the mid-thickness index the policy can actually reach, or the ramp never opens
-# and the wrist never pitches down at all.  At 0.35 it deadlocked: the policy converged at index
-# 0.264, the gate multiplied out to exactly 0.000 (measured ``wrist_tip_down`` index 0.050 of 1.0),
-# and pitch parked at -13.1 deg -- 1.9 deg short of the ``_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG`` gate
-# -- unchanged across 55 epochs while closedness and lateral alignment both converged.  0.20 opens
-# the ramp to ~18% at the converged index, enough for a gradient, and it keeps widening only as
-# mid-thickness improves.
 _APPROACH_TIP_DOWN_MID_GATE_START = 0.20
-# Dense shaping fade near success (tight closedness): full credit below fade_start, linearly
-# down to min_scale by fade_end.  Stops farming loose shaping for a full episode instead of
-# taking the one-shot success bonus / early terminate.
-#
-# IMPORTANT: fade_start MUST be >= _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD. The env terminates
-# the same step ``approach_success`` fires, so a policy can never "camp" AT or above the
-# threshold across multiple steps -- the only farmable region is BELOW it. Fading dense reward
-# below the threshold weakens the exact gradient needed to cross into success in the first
-# place (this previously started at 0.40 while the threshold was 0.45-0.55, actively fighting
-# convergence). Starting the fade AT the threshold means dense shaping stays at full strength
-# all the way up to success; it only discounts states that somehow linger past the closedness
-# bar without terminating.  Every other conjunct of the success condition (pitch, mid-thickness)
-# is exempted inside ``approach_near_success_shaping_scale``, so such lingering is always a
-# genuine choice to hold position rather than an unreachable-success trap.
-_APPROACH_SHAPING_FADE_START = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD
-_APPROACH_SHAPING_FADE_END = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD + 0.15
-_APPROACH_SHAPING_FADE_MIN_SCALE = 0.05
+# Dense shaping fade on tight closedness.  Starts BELOW the success bar so camping at
+# closedness_tight≈0.3–0.4 (full dense credit, never terminating) stops paying; pitch / tip_mid
+# conjuncts still exempt the fade via ``approach_near_success_shaping_scale`` when they fail.
+_APPROACH_SHAPING_FADE_START = 0.30
+_APPROACH_SHAPING_FADE_END = _APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD
+_APPROACH_SHAPING_FADE_MIN_SCALE = 0.02
 
 # Shared geometry kwargs for straddle checks and phase transitions.
 _APPROACH_CHECK_KWARGS = {
@@ -1027,9 +1034,22 @@ def _approach_near_success_fade_params(**extra) -> dict:
         # while every other geometric metric improved.
         "fade_tip_mid_std": _APPROACH_MID_THICKNESS_STD_M,
         "fade_min_tip_mid": _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
+        # Same for jaw-level: do not fade dense shaping while one tip rides the top and the other
+        # hangs under (roll), or the policy farms closedness under an uncashable fade.
+        "fade_jaw_level_std": _APPROACH_JAW_LEVEL_STD_M,
+        "fade_min_jaw_level": _APPROACH_SUCCESS_JAW_LEVEL_THRESHOLD,
     }
     base.update(extra)
     return base
+
+
+def _approach_secondary_progress_gate_params(**extra) -> dict:
+    """Kwargs that zero-out secondary shaping until tight closedness starts climbing."""
+    return _approach_near_success_fade_params(
+        progress_gate_start=_APPROACH_SECONDARY_GATE_START,
+        progress_gate_full=_APPROACH_SECONDARY_GATE_FULL,
+        **extra,
+    )
 
 
 def _approach_lateral_gap_params(**extra) -> dict:
@@ -1123,17 +1143,31 @@ def _approach_finger_target_params(**extra) -> dict:
 
 
 def _approach_finger_proximity_params(**extra) -> dict:
-    """Kwargs for per-jaw ±offset trailing-edge width proximity (wide ``std``)."""
-    return _approach_finger_geometry_params(std=_APPROACH_PROXIMITY_STD_M, **extra)
+    """Kwargs for per-jaw trailing-edge proximity — same tight σ as success closedness."""
+    return _approach_finger_geometry_params(std=_APPROACH_SUCCESS_STD_M, **extra)
 
 
 def _approach_success_params(**extra) -> dict:
-    """Kwargs for straddle success — closedness ≥ threshold AND tip mid-thickness index ≥ threshold."""
+    """Kwargs for straddle success — closedness + tip_mid + jaw_level + tip-down pitch."""
     return _approach_finger_target_params(
         closedness_threshold=_APPROACH_SUCCESS_CLOSEDNESS_THRESHOLD,
         tip_mid_thickness_std=_APPROACH_MID_THICKNESS_STD_M,
         tip_mid_thickness_threshold=_APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
+        jaw_level_std=_APPROACH_JAW_LEVEL_STD_M,
+        jaw_level_threshold=_APPROACH_SUCCESS_JAW_LEVEL_THRESHOLD,
         min_tip_down_deg=_APPROACH_SUCCESS_MIN_TIP_DOWN_DEG,
+        **extra,
+    )
+
+
+def _approach_tip_band_params(**extra) -> dict:
+    """Kwargs for gated tip thickness-band penalty (tips on PCB top / hooked under)."""
+    return _approach_finger_geometry_params(
+        closedness_std=_APPROACH_SUCCESS_STD_M,
+        min_closedness=_APPROACH_TIP_BAND_MIN_CLOSEDNESS,
+        pcb_half_thickness_m=_APPROACH_TIP_BAND_HALF_M,
+        max_penalty_excess_m=_APPROACH_TIP_BAND_MAX_EXCESS_M,
+        thickness_target_offset_m=0.0,
         **extra,
     )
 
@@ -1144,13 +1178,18 @@ def _approach_mid_thickness_params(**extra) -> dict:
 
 
 def _approach_mid_thickness_gated_params(**extra) -> dict:
-    """Kwargs for gated mid-thickness shaping (active after coarse trailing-edge proximity)."""
+    """Kwargs for gated mid-thickness shaping (unlocks on tight-σ closedness, not loose proximity)."""
     base = _approach_mid_thickness_params(
         min_closedness=_APPROACH_MID_THICKNESS_MIN_CLOSEDNESS,
-        closedness_std=_APPROACH_PROXIMITY_STD_M,
+        closedness_std=_APPROACH_SUCCESS_STD_M,
     )
     base.update(extra)
     return base
+
+
+def _approach_jaw_level_params(**extra) -> dict:
+    """Kwargs for anti-roll jaw-level shaping (pad tip thickness match)."""
+    return _approach_finger_geometry_params(std=_APPROACH_JAW_LEVEL_STD_M, **extra)
 
 
 def _approach_along_approach_params(**extra) -> dict:
@@ -1884,38 +1923,63 @@ class ObservationsCfgInsert:
 
 @configclass
 class RewardsApproachCfg():
-    """Phase 1 (Approach): trailing-edge approach only — no +Y insert credit."""
+    """Phase 1 (Approach): trailing-edge approach only — no +Y insert credit.
+
+    2026-08-07 (tips stall several cm out): ``finger_proximity`` is the only ungated dense
+    closedness driver.  Along / lateral / jaw / between are progress-gated so they cannot farm
+    a correct-Y / wrong-gap pose; tip_mid / tip_down stay behind a higher closedness bar.
+    """
+
+    # Per-step cost so full-horizon dense farming loses to early success (see 2026-08-06 TB).
+    alive_penalty = RewardTermCfg(func=mdp.is_alive, weight=-40.0)
 
     action_rate_penalty = RewardTermCfg(func=action_rate_l2, weight=-0.002)
 
+    # Far-field along attractor only — keep low so "correct Y, tips still cm out" cannot dominate.
     trailing_face_approach = RewardTermCfg(
         func=straddle_trailing_face_bounded_approach_reward_fade_near_success,
         params=_approach_along_approach_params(**_approach_near_success_fade_params()),
-        weight=150.0,
+        weight=50.0,
+    )
+
+    # Primary dense objective (= success closedness index, tight σ).
+    finger_proximity = RewardTermCfg(
+        func=straddle_finger_trailing_width_proximity_fade_near_success,
+        params=_approach_finger_proximity_params(**_approach_near_success_fade_params()),
+        weight=250.0,
     )
 
     tip_mid_thickness = RewardTermCfg(
         func=straddle_tip_mid_thickness_shaping_gated_fade_near_success,
         params=_approach_mid_thickness_gated_params(**_approach_near_success_fade_params()),
-        weight=200.0,
+        weight=80.0,
     )
 
-    finger_proximity = RewardTermCfg(
-        func=straddle_finger_trailing_width_proximity_fade_near_success,
-        params=_approach_finger_proximity_params(**_approach_near_success_fade_params()),
-        weight=150.0,
+    jaw_level = RewardTermCfg(
+        func=straddle_jaw_level_shaping_fade_near_success,
+        params=_approach_jaw_level_params(**_approach_secondary_progress_gate_params()),
+        # Raised 40 → 80: roll / one-tip-on-top was still common at higher success rates.
+        weight=80.0,
+    )
+
+    # Soft near-contact cost when a tip leaves the mid-plane band (top-ride / under-hook).
+    # Hard reject is the tip_mid success bar (0.96); this is the dense gradient into that bar.
+    tip_band_penalty = RewardTermCfg(
+        func=gripper_tip_band_penalty_gated,
+        params=_approach_tip_band_params(),
+        weight=-120.0,
     )
 
     between_fingers = RewardTermCfg(
         func=pcb_between_gripper_fingers_fade_near_success,
-        params=_approach_between_fingers_params(**_approach_near_success_fade_params()),
-        weight=60.0,
+        params=_approach_between_fingers_params(**_approach_secondary_progress_gate_params()),
+        weight=30.0,
     )
 
     lateral_gap = RewardTermCfg(
         func=straddle_lateral_gap_shaping_fade_near_success,
-        params=_approach_lateral_gap_params(**_approach_near_success_fade_params()),
-        weight=120.0,
+        params=_approach_lateral_gap_params(**_approach_secondary_progress_gate_params()),
+        weight=40.0,
     )
 
     pcb_forward_push_penalty = RewardTermCfg(
@@ -1951,7 +2015,8 @@ class RewardsApproachCfg():
             "tip_mid_gate_start": _APPROACH_TIP_DOWN_MID_GATE_START,
             "tip_mid_gate_full": _APPROACH_SUCCESS_TIP_MID_THICKNESS_THRESHOLD,
         },
-        weight=30.0,
+        # Below proximity so pitch cannot replace closing the last centimetres.
+        weight=80.0,
     )
     wrist_pitch_deg_debug = RewardTermCfg(
         func=gripper_wrist_pitch_deg_signed_obs,
@@ -1966,7 +2031,13 @@ class RewardsApproachCfg():
     approach_success_bonus = RewardTermCfg(
         func=approach_success_bonus_reward,
         params=_approach_termination_params(),
-        weight=20000.0,
+        weight=30000.0,
+    )
+
+    # One-shot cost when the 3 s horizon ends without success (``is_terminated_term`` ignores timeouts).
+    time_out_penalty = RewardTermCfg(
+        func=time_out_penalty_reward,
+        weight=-25000.0,
     )
 
     approach_gripper_debug_monitor = RewardTermCfg(
@@ -1992,6 +2063,13 @@ class RewardsInsertCfg:
         func=straddle_tip_mid_thickness_shaping,
         params=_insert_mid_thickness_params(),
         weight=12.0,
+    )
+
+    # Keep tips laterally centered on the trailing edge (same geometry as Approach; no fade gate).
+    lateral_gap = RewardTermCfg(
+        func=straddle_lateral_gap_shaping,
+        params=_approach_lateral_gap_params(),
+        weight=6.0,
     )
 
     tip_under_penalty = RewardTermCfg(
@@ -2249,7 +2327,12 @@ class TerminationsSharedCfg:
     """Safety terminations shared by all variants."""
 
     time_out = TerminationTermCfg(func=mdp.time_out, time_out=True)
-    
+    # PhysX contact blow-ups → NaN joint/root state; reset instead of poisoning PPO stats.
+    nonfinite_state = TerminationTermCfg(
+        func=scene_state_nonfinite,
+        params={"robot_cfg": SceneEntityCfg("robot"), "pcb_cfg": _PCB_ENT},
+    )
+
 
 @configclass
 class TerminationsApproachCfg(TerminationsSharedCfg):
